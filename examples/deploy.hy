@@ -6,7 +6,7 @@
 
 use fmt
 use http
-use json                 // http exports decode too, so json:: disambiguates
+use json // http exports decode too, so json:: disambiguates
 
 REGIONS := ["eu", "us", "ap"]
 
@@ -22,7 +22,7 @@ fn warm(name, img)
 end
 
 manifest := json::decode(read_file("deploy.json"))
-img := manifest.image        // same as manifest[.image]
+img := manifest.image // same as manifest[.image]
 
 for name in REGIONS
 	print("target " + name + " -> " + img)

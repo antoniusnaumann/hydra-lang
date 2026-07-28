@@ -8,6 +8,7 @@ pub mod ast;
 pub mod check;
 pub mod compile;
 pub mod errors;
+pub mod format;
 pub mod lexer;
 pub mod parser;
 pub mod scope;
