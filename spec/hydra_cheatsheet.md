@@ -1,0 +1,215 @@
+# Hydra — cheat sheet
+
+Interpreted, dynamically typed, green-threaded, with parallelism in the syntax.
+Companion to the implementation spec.
+
+---
+
+## Lexical
+
+| Item | Form | Notes |
+|---|---|---|
+| Comment | `// to end of line` | |
+| Declaration | `x := 1` | Introduces the name; on an existing name it shadows |
+| Assignment | `x = 2` | Crashes if the name does not exist |
+| Namespace | `json::decode` | Breaks an import clash |
+| Deep equality | `a == b` | Identity first, then structural walk |
+| Identity | `a === b`, `a !== b` | By identity |
+| Reference | `f(&a)`, `{ .b : &a }` | Opt out of copying |
+| Concatenation | `"hi " + name` | No interpolation |
+| Trail separator | `\|\|` | Inside `parallel` / `race` blocks only |
+| Bitwise | `\| & ^ ~ << >> >>>` | 32-bit, JS semantics; `\|\|` lexes first |
+| Logic | `and`, `or`, `not` | Words, so `!` and `&` stay free |
+| Private | `_leading_underscore` | Never exported, never reachable via `::` |
+| Label | `as name` | On a loop or block, for labelled `break` |
+| Indentation | Tabs | **Cosmetic.** Blocks close with `end` |
+| Statement end | Newline | No semicolons |
+
+**Compound keywords** contain a space and lex as one token:
+`else if`, `parallel for`, `parallel while`, `race for`, `race while`.
+Never split them across a line or a `||`.
+
+---
+
+## Values
+
+```hydra
+num    := 3.0                    // 64-bit float, 32-bit for bitwise ops
+text   := "hi " + name
+list   := [5, 17]
+dict   := { .a : 5, ."x-id" : 17 }   // keys are symbols, quotable
+symbol := .null
+```
+
+- **Symbols** (`.null`, `.false`, `.ok`) are bare tags. A leading dot opens a
+  symbol; a dot after an expression is a key lookup.
+- **There is no struct type** — `d.a` is sugar for `d[.a]`, so a computed key is
+  just `d[k]`.
+- `==` **deep-compares** (cycle-safe, via a visited-pair set); `===` compares
+  by reference.
+- **Truthiness:** `.null` and `.false` are falsy. Everything else is truthy —
+  including `0`, `""`, `[]`.
+- **Everything copies.** Assignment, parameter passing, and insertion into a
+  list or dict all deep-copy (implemented copy-on-write).
+- `&lvalue` passes a reference instead — `f(&a)`, `{ .b : &a }`, `b := &a`.
+  Only variables, dict keys and list elements can be referenced.
+- `===` currently reports COW storage, so an untouched copy still compares
+  identical to its source. It is not a reliable aliasing test.
+- Reading a missing key **crashes**; writing one creates it.
+- `."content-type"` is a symbol that isn't a valid identifier.
+
+---
+
+## Functions
+
+```hydra
+fn warm(name, img)
+	h := lease(name)
+	if not healthy(h)
+		return .failed
+	end
+	return h
+end
+
+single := fn(a, b) a + b        // single-expression closure, no end
+
+multi := fn(c)                  // body starts on the next line
+	x := c * c
+	return x - c
+end
+```
+
+Closures capture by reference.
+
+---
+
+## Control flow
+
+```hydra
+if cond
+	...
+else if other
+	...
+else
+	...
+end
+
+for elem in list as scan
+	continue
+	break scan
+end
+
+while cond
+	...
+end
+```
+
+---
+
+## Errors
+
+No exceptions, no catch. Failure is a value, by convention a symbol:
+
+```hydra
+h := lease(name)
+if h == .failed
+	rollback()
+end
+```
+
+A crash kills the program — unless it happens in a dead trail, where it is
+isolated to that trail (reported on stderr, fatal under strict mode).
+
+---
+
+## Modules
+
+```hydra
+use fmt
+use http
+use json          // both export `decode`
+
+decode(body)        // json's — most recent `use` wins
+http::decode(body)  // explicit
+```
+
+`use` **executes** a file's toplevel once, but **rebinds** its names every time —
+so unqualified lookup always matches source order, even for transitive imports.
+
+---
+
+## Concurrency
+
+Trails are **green threads** sharing the parent **scope**. Writes to a parent
+binding are **last-write-wins**; nothing is guaranteed atomic. Data itself is
+copied per trail — shared mutable state exists only where a `&` put it.
+
+```hydra
+parallel
+	eu = warm("eu", img) || us = warm("us", img) || ap = warm("ap", img)
+	smoke(eu)            || smoke(us)            || smoke(ap)
+end
+```
+
+- Each column is a **trail**. **Rows are cosmetic** — no barrier between them.
+- `parallel` joins at `end`; `race` ends at the first completion.
+- Every row carries the **same number of separators**; empty cells stay empty
+  but keep their `||`. The block's `end` is the line with no separators.
+- A trail reads and writes the parent scope, but `:=` inside a trail is
+  **trail-local** and gone at the join.
+- `break` ends the current trail; `break label` targets a loop; `return` inside
+  a trail is **forbidden**.
+- A trail may hold full blocks (`if`, `for`) spanning rows in its column.
+  A nested `parallel` must go inside a called function.
+
+```hydra
+parallel for r in REGIONS      race for r in REGIONS
+	warm(r, img)                   probe(r)
+end                            end
+```
+
+### Cancellation
+
+1. A cancelled trail is **never interrupted** — its in-flight call runs to the
+   end, and so does everything that call invokes.
+2. The **result is discarded**; the pending assignment never happens.
+3. No further statement of that trail runs.
+
+Cancellation is **value-level, not effect-level** — a loser cannot write to the
+scope, but it can still finish charging the card. It **propagates**: everything
+inside a dead trail is dead. Trails are **not guaranteed to start**, so a racing
+trail may never run at all.
+
+```hydra
+fn charge(card)
+	tok := authorize(card)
+	if not alive()
+		void(tok)              // undo what the runtime cannot
+		return .cancelled
+	end
+	return capture(tok)
+end
+```
+
+`alive()` is dynamic — any function can ask, at any depth, with no token
+threading, and it returns `.true` outside a trail.
+
+---
+
+## Tooling
+
+- **Formatter** — owns column padding; canonical form; idempotent.
+- **`check`** — reports only what is *guaranteed* to crash. Best catch: reading
+  a trail-local `:=` after the block.
+- **Strict mode** — makes isolated dead-trail crashes fatal under test.
+
+---
+
+## Conventions
+
+- The stdlib is not the implementor's to invent. `alive()` is the only language
+  primitive; everything else in these examples is a placeholder.
+
+- Declare shared variables **above** a parallel block, assign with `=` inside it.
+- Record a race winner yourself, as the trail's last statement.
+- `ALL_CAPS` for toplevel values assigned once.

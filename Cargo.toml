@@ -1,0 +1,20 @@
+[package]
+name = "hydra-lang"
+version = "0.1.0"
+edition = "2021"
+description = "Reference implementation of the Hydra language: interpreter, check and formatter"
+default-run = "hydra"
+
+# No dependencies, deliberately: everything the spec asks for is in std.
+[dependencies]
+
+[lib]
+name = "hydra"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hydra"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
