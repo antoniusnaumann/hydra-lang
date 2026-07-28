@@ -697,6 +697,12 @@ impl Compiler {
                     let root = Root::Name(Rc::from(name.as_str()));
                     return self.emit_segments(root, segs);
                 }
+                Expr::Namespace { module, name, pos } if module.is_empty() => {
+                    return self.err(
+                        format!("`::{name}` is a builtin, not a variable, so it cannot be assigned to or referenced"),
+                        *pos,
+                    )
+                }
                 Expr::Namespace { module, name, .. } => {
                     let root = Root::Ns {
                         module: Rc::from(module.as_str()),

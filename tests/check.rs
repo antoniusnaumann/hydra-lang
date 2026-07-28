@@ -337,3 +337,21 @@ fn an_unresolvable_module_also_silences_the_builtin_signatures() {
     let report = check(src);
     assert!(report.errors().next().is_none(), "{:?}", report.codes());
 }
+
+#[test]
+fn a_module_export_that_shadows_a_builtin_is_worth_a_second_look() {
+    // The same failure mode as two modules exporting one name (§11): it still
+    // returns *something*, so it reaches production.
+    let src = "use shadows\nx := push(\"host\", \"img\")\n";
+    assert!(warnings(src).contains(&"shadowed-builtin"), "{:?}", warnings(src));
+    assert!(check(src).errors().next().is_none());
+    // Qualifying says which one is meant, and the builtin's signature is known
+    // even here, so the missing `&` is still caught.
+    assert_eq!(codes("use shadows\nrows := []\nx := ::push(rows, 1)\n"), vec!["missing-reference"]);
+    assert_eq!(codes("use shadows\nrows := []\nx := ::push(&rows, 1)\n"), Vec::<&str>::new());
+}
+
+#[test]
+fn a_qualified_builtin_that_does_not_exist() {
+    assert_eq!(codes("x := ::nope()\n"), vec!["unknown-builtin"]);
+}

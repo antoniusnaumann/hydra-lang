@@ -15,9 +15,15 @@ Same tags as the handoff: **[D]** decided, **[P]** proposed, **[O]** open.
 every file without a `use`, and they are *not* reachable through `::` — there is
 no module for them to belong to.
 
-**[P]** They are looked up **after the scope chain**, so a program may shadow
-one: `print := fn(x) … end` wins for the rest of that scope, exactly as §6's
-outward walk implies. That keeps them from being reserved words.
+**[P]** They are looked up **after the scope chain and after imports**, so a
+program or a module may shadow one: `print := fn(x) … end` wins for the rest of
+that scope, exactly as §6's outward walk implies. That keeps them from being
+reserved words.
+
+**[D]** `::name` reaches the builtin past any shadow (§7). It is the qualified
+form, and being qualified it is always statically known — `check` can report a
+missing `&` on `::push(rows, x)` even in a file where a module could not be
+resolved.
 
 **[D]** They are ordinary values. `f := print` binds it, `f("hi")` calls it.
 
@@ -171,8 +177,9 @@ longer needed for them. Both rules are switched off when a `use`d module cannot
 be resolved: that module might export a `push` of its own, and §11 reports what
 is guaranteed rather than what is likely.
 
-**[O] The name `push` is contested.** §14's reference program already calls
-`push(h, img)` to push an *image to a host*, which is a different operation with
-the same name. One of the two has to give.
+**[D] The name `push` may be taken.** §14's reference program calls
+`push(h, img)` to push an *image to a host*. Nothing has to give: whichever
+module supplies that one shadows the builtin for unqualified calls, `check`
+warns at the `use`, and `::push` reaches the builtin.
 
 The formatter is unaffected: they are ordinary calls.

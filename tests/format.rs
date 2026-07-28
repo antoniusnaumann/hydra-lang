@@ -32,6 +32,8 @@ fn spacing_around_operators_and_after_commas() {
     assert_eq!(fmt_idempotent("x := a[ i ]\n"), "x := a[i]\n");
     assert_eq!(fmt_idempotent("x := a . b\n"), "x := a.b\n");
     assert_eq!(fmt_idempotent("x := json :: decode(b)\n"), "x := json::decode(b)\n");
+    // A leading `::` is the builtin namespace and stays tight too (§7).
+    assert_eq!(fmt_idempotent(":: push(& rows,1)\n"), "::push(&rows, 1)\n");
     assert_eq!(fmt_idempotent("x := a==b\n"), "x := a == b\n");
     assert_eq!(fmt_idempotent("x := not a and b\n"), "x := not a and b\n");
     assert_eq!(fmt_idempotent("x := a>>>b\n"), "x := a >>> b\n");

@@ -228,3 +228,49 @@ fn print_writes_the_text_form_and_returns_null() {
     assert_eq!(eval("x := print(\"hi\")\n", "x"), ".null");
     assert_eq!(eval("x := print(\"hi\", \"\")\n", "x"), ".null");
 }
+
+// --- qualified builtins (§7) ------------------------------------------------
+
+#[test]
+fn a_builtin_is_reachable_through_a_leading_namespace_selector() {
+    // Qualified syntax wins: `::name` is the language's own namespace.
+    assert_eq!(eval("rows := []\n::push(&rows, 1)\nn := ::len(rows)\n", "n"), "1");
+
+    // Past a local shadow.
+    let src = "
+len := fn(a) \"shadowed\"
+rows := [1, 2]
+theirs := len(rows)
+ours := ::len(rows)
+";
+    assert_eq!(eval(src, "theirs"), "shadowed");
+    assert_eq!(eval(src, "ours"), "2");
+
+    // It is a value like any other.
+    assert_eq!(eval("f := ::len\nx := f(\"abc\")\n", "x"), "3");
+}
+
+#[test]
+fn a_builtin_is_not_a_variable() {
+    assert!(run_source("::len = 1\n", "t.hy", opts()).is_err());
+    assert!(run_source("x := &::len\n", "t.hy", opts()).is_err());
+    assert!(crash_of("x := ::nope()\n").contains("no builtin named `nope`"));
+}
+
+#[test]
+fn a_module_export_shadows_a_builtin_and_the_qualified_form_gets_past_it() {
+    // `shadows.hy` exports its own `push`, which is §14's "push an image to a
+    // host" rather than the list append.
+    let src = "
+use shadows
+theirs := push(\"host\", \"img\")
+rows := []
+mine := ::push(&rows, 1)
+";
+    let result = run_source(src, "tests/fixtures/main.hy", Options::default()).expect("compiles");
+    assert!(result.crash.is_none(), "{:?}", result.crash);
+    let read =
+        |name: &str| to_text(&result.root_scope.lookup(name).expect("binding").borrow().clone());
+    assert_eq!(read("theirs"), "pushed img to host");
+    assert_eq!(read("mine"), "1");
+}

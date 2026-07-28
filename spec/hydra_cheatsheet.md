@@ -13,6 +13,7 @@ Companion to the implementation spec.
 | Declaration | `x := 1` | Introduces the name; on an existing name it shadows |
 | Assignment | `x = 2` | Crashes if the name does not exist |
 | Namespace | `json::decode` | Breaks an import clash |
+| Builtin | `::push` | The language's own namespace, past any shadow |
 | Deep equality | `a == b` | Identity first, then structural walk |
 | Identity | `a === b`, `a !== b` | By identity |
 | Reference | `f(&a)`, `{ .b : &a }` | Opt out of copying |
@@ -138,6 +139,9 @@ http::decode(body)  // explicit
 `use` **executes** a file's toplevel once, but **rebinds** its names every time —
 so unqualified lookup always matches source order, even for transitive imports.
 
+Unqualified lookup is scope chain, then imports, then builtins. `::push` names
+the builtin whatever else has taken it.
+
 ---
 
 ## Concurrency
@@ -200,6 +204,8 @@ threading, and it returns `.true` outside a trail.
 
 ## Tooling
 
+- **Builtins** — `print(value, end := "\n")`, `has(c, k)`, `get(c, k, fallback)`,
+  `len(v)`, `push(&list, v)`. A `&` parameter makes the call mark it or crash.
 - **Formatter** — owns column padding; canonical form; idempotent.
 - **`check`** — reports only what is *guaranteed* to crash. Best catch: reading
   a trail-local `:=` after the block.

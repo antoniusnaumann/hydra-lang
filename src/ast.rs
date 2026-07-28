@@ -67,7 +67,8 @@ pub enum Expr {
     List { items: Vec<Expr>, pos: Pos },
     Dict { entries: Vec<(SymLit, Expr)>, pos: Pos },
     Name { name: String, pos: Pos },
-    /// `mod::name` (§7).
+    /// `mod::name`, and `::name` with an empty module — the language's own
+    /// namespace, which is how a builtin is reached past a shadow (§7).
     Namespace { module: String, name: String, pos: Pos },
     /// `a.b` — sugar for `a[.b]` (§5).
     Key { obj: Box<Expr>, key: SymLit, pos: Pos },
@@ -111,9 +112,16 @@ impl Expr {
         )
     }
 
+    /// `::name`: a builtin, not a variable. It can be called and passed
+    /// around, but never assigned to or referenced.
+    pub fn is_builtin_ref(&self) -> bool {
+        matches!(self, Expr::Namespace { module, .. } if module.is_empty())
+    }
+
     /// The variable an lvalue is rooted at, if it is rooted at one at all.
     pub fn lvalue_root(&self) -> Option<&Expr> {
         match self {
+            Expr::Namespace { module, .. } if module.is_empty() => None,
             Expr::Name { .. } | Expr::Namespace { .. } => Some(self),
             Expr::Key { obj, .. } | Expr::Index { obj, .. } => obj.lvalue_root(),
             _ => None,

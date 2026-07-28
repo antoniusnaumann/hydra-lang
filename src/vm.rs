@@ -704,6 +704,9 @@ impl Vm {
     }
 
     fn lookup_ns(&self, task: &Task, module: &str, name: &str) -> Result<Cell, Crash> {
+        if module.is_empty() {
+            return Err(Crash::new(format!("`::{name}` is a builtin, not a variable")));
+        }
         let importer = task.frame().module;
         let target = self.modules[importer].aliases.borrow().get(module).copied();
         let Some(target) = target else {
@@ -732,6 +735,13 @@ impl Vm {
                     None => return Err(Crash::new(format!("`{name}` is not declared"))),
                 },
             },
+            // `::name` is the builtin, whatever else holds the name (§7).
+            Root::Ns { module, name } if module.is_empty() => {
+                return match Native::lookup(name) {
+                    Some(native) => Ok(Value::Native(native)),
+                    None => Err(Crash::new(format!("there is no builtin named `{name}`"))),
+                }
+            }
             Root::Ns { module, name } => self.lookup_ns(task, module, name)?,
         };
         let value = cell.borrow().clone();

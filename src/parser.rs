@@ -846,6 +846,13 @@ impl<'a> Parser<'a> {
                 Ok(Expr::List { items, pos })
             }
             Tok::Op("{") => self.parse_dict(pos),
+            // `::name` selects the language's own namespace: the builtin, even
+            // where something else has taken the name (§7).
+            Tok::Op("::") => {
+                self.advance();
+                let (name, _) = self.expect_ident("a builtin name after `::`")?;
+                Ok(Expr::Namespace { module: String::new(), name, pos })
+            }
             _ => self.err(format!("expected an expression, found {tok}"), pos),
         }
     }

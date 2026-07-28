@@ -431,6 +431,16 @@ order even when a module was already pulled in transitively.
 **[D]** `mod::name` selects explicitly and is the way to disambiguate.
 Private (`_`-prefixed) names are not reachable through it.
 
+**[D] Qualified syntax wins.** `::name` — the same selector with the module
+omitted — names the **language's own namespace**: the builtin, whatever else has
+taken the name. Unqualified lookup goes scope chain, then imports, then
+builtins, so a module that exports `push` shadows the builtin one and `::push`
+is how the builtin is still reached. `check` warns at the `use` that does it,
+because a silently shadowed name still returns *something*.
+
+**[D]** `::name` is not a variable: it can be called and passed around, but
+never assigned to or referenced with `&`.
+
 **[D]** Resolution order for `use fmt`: same directory, then a path list from an
 environment variable. Circular imports resolve to whatever is bound so far
 rather than looping forever.

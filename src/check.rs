@@ -286,6 +286,20 @@ impl<'a> Checker<'a> {
                     "ambiguous-import",
                 );
             }
+            let mut shadowed: Vec<String> =
+                exports.keys().filter(|n| Native::lookup(n).is_some()).cloned().collect();
+            shadowed.sort();
+            for builtin in shadowed {
+                self.warn(
+                    format!(
+                        "`{name}` exports `{builtin}`, which is also a builtin; \
+                         the unqualified name now means `{name}::{builtin}` — \
+                         write `::{builtin}` for the builtin"
+                    ),
+                    pos,
+                    "shadowed-builtin",
+                );
+            }
             for (export, arity) in &exports {
                 self.imports.insert(export.clone(), (name.clone(), arity.clone()));
             }
@@ -804,6 +818,14 @@ impl<'a> Checker<'a> {
     }
 
     fn namespace(&mut self, module: &str, name: &str, pos: Pos) {
+        // `::name` is the language's own namespace, which is always knowable —
+        // that is the point of writing it (§7).
+        if module.is_empty() {
+            if Native::lookup(name).is_none() {
+                self.error(format!("there is no builtin named `{name}`"), pos, "unknown-builtin");
+            }
+            return;
+        }
         // Private names are not reachable through `::` (§7). That is a
         // syntactic fact, so it holds even when modules cannot be resolved.
         if is_private(name) {
@@ -875,6 +897,11 @@ impl<'a> Checker<'a> {
                     None
                 };
                 (name.clone(), known)
+            }
+            // `::name` names the builtin unambiguously, so its signature is
+            // known even when a module could not be resolved.
+            Expr::Namespace { module, name, .. } if module.is_empty() => {
+                (format!("::{name}"), Native::lookup(name).map(Signature::native))
             }
             Expr::Namespace { module, name, .. } => {
                 let signature = self
