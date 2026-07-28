@@ -1,0 +1,21 @@
+{
+  "name": "Hydra",
+  "scopeName": "source.hydra",
+  "fileTypes": ["hy"],
+  "patterns": [
+    { "name": "comment.hydra", "match": "//.*$" },
+    { "name": "string.hydra", "match": "\\\"(\\\\\\\\.|[^\\\"\\\\\\\\])*\\\"" },
+    { "name": "keyword.concurrency.hydra", "match": "\\b(parallel[ \\t]+for|parallel[ \\t]+while|race[ \\t]+for|race[ \\t]+while)\\b" },
+    { "name": "keyword.concurrency.hydra", "match": "\\b(parallel|race)\\b" },
+    { "name": "keyword.control.hydra", "match": "\\belse[ \\t]+if\\b" },
+    { "name": "keyword.control.hydra", "match": "\\b(if|else|else if|for|in|while|return|break|continue|end)\\b" },
+    { "name": "keyword.other.hydra", "match": "\\b(fn|use|and|or|not|as)\\b" },
+    { "name": "punctuation.trail.hydra", "match": "\\|\\|" },
+    { "name": "entity.symbol.hydra", "match": "\\.(\\\"[^\\\"]*\\\"|[A-Za-z_][A-Za-z0-9_]*)" },
+    { "name": "entity.namespace.hydra", "match": "[A-Za-z_][A-Za-z0-9_]*(?=::)" },
+    { "name": "entity.function.hydra", "match": "[A-Za-z_][A-Za-z0-9_]*(?=\\()" },
+    { "name": "constant.numeric.hydra", "match": "\\b[0-9]+(\\.[0-9]+)?([eE][+-]?[0-9]+)?\\b" },
+    { "name": "constant.hydra", "match": "\\b[A-Z][A-Z0-9_]*\\b" },
+    { "name": "variable.hydra", "match": "[A-Za-z_][A-Za-z0-9_]*" }
+  ]
+}

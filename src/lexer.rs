@@ -73,9 +73,17 @@ pub enum Tok {
 pub struct Token {
     pub kind: Tok,
     pub pos: Pos,
+    /// How many source characters the token spans. Not always the length of
+    /// its canonical spelling: `else   if` is one keyword whose text is
+    /// `else if`, and editor tooling needs the source extent (§13).
+    pub len: u32,
 }
 
 impl Token {
+    pub fn new(kind: Tok, pos: Pos) -> Token {
+        Token { kind, pos, len: 0 }
+    }
+
     pub fn is_op(&self, op: &str) -> bool {
         matches!(&self.kind, Tok::Op(o) if *o == op)
     }
@@ -131,7 +139,7 @@ impl fmt::Display for Token {
         match &self.kind {
             Tok::Newline => write!(f, "end of line"),
             Tok::Eof => write!(f, "end of file"),
-            other => write!(f, "`{}`", Token { kind: other.clone(), pos: self.pos }.text()),
+            other => write!(f, "`{}`", Token::new(other.clone(), self.pos).text()),
         }
     }
 }
@@ -249,6 +257,8 @@ impl<'a> Lexer<'a> {
         let mut out: Vec<Token> = Vec::new();
 
         while !self.at_end() {
+            let before = self.i;
+            let produced = out.len();
             let c = self.peek().unwrap();
 
             if c == ' ' || c == '\t' || c == '\r' {
@@ -259,7 +269,8 @@ impl<'a> Lexer<'a> {
             if c == '\n' {
                 let pos = self.pos();
                 self.bump();
-                out.push(Token { kind: Tok::Newline, pos });
+                out.push(Token::new(Tok::Newline, pos));
+                set_len(&mut out, produced, 1);
                 continue;
             }
 
@@ -281,38 +292,43 @@ impl<'a> Lexer<'a> {
 
             if c == '"' {
                 let (value, raw) = self.string()?;
-                out.push(Token { kind: Tok::Str { value, raw }, pos });
+                out.push(Token::new(Tok::Str { value, raw }, pos));
+                set_len(&mut out, produced, self.i - before);
                 continue;
             }
 
             if c.is_ascii_digit() {
                 out.push(self.number(pos));
+                set_len(&mut out, produced, self.i - before);
                 continue;
             }
 
             if is_ident_start(c) {
                 out.push(self.word(pos));
+                set_len(&mut out, produced, self.i - before);
                 continue;
             }
 
             if c == '.' {
                 let tok = self.dot(pos, out.last())?;
                 out.push(tok);
+                set_len(&mut out, produced, self.i - before);
                 continue;
             }
 
             match self.operator() {
-                Some(op) => out.push(Token { kind: Tok::Op(op), pos }),
+                Some(op) => out.push(Token::new(Tok::Op(op), pos)),
                 None => return Err(self.err(format!("unexpected character `{c}`"), pos)),
             }
+            set_len(&mut out, produced, self.i - before);
         }
 
         // A file that does not end in a newline still ends its last statement.
         if matches!(out.last(), Some(t) if !t.is_newline()) {
-            out.push(Token { kind: Tok::Newline, pos: self.pos() });
+            out.push(Token::new(Tok::Newline, self.pos()));
         }
         let line_count = self.line.saturating_sub(if self.col == 1 { 1 } else { 0 }).max(1);
-        out.push(Token { kind: Tok::Eof, pos: self.pos() });
+        out.push(Token::new(Tok::Eof, self.pos()));
 
         Ok(Lexed { tokens: out, comments: self.comments, line_count })
     }
@@ -355,7 +371,7 @@ impl<'a> Lexer<'a> {
             }
         }
         let value = raw.parse::<f64>().unwrap_or(f64::NAN);
-        Token { kind: Tok::Num { value, raw }, pos }
+        Token::new(Tok::Num { value, raw }, pos)
     }
 
     fn word(&mut self, pos: Pos) -> Token {
@@ -375,7 +391,7 @@ impl<'a> Lexer<'a> {
                 if let Some(&(_, _, spelling)) =
                     COMPOUND.iter().find(|(head, tail, _)| *head == word && *tail == next)
                 {
-                    return Token { kind: Tok::Kw(spelling), pos };
+                    return Token::new(Tok::Kw(spelling), pos);
                 }
             }
             self.i = save.0;
@@ -384,8 +400,8 @@ impl<'a> Lexer<'a> {
         }
 
         match KEYWORDS.iter().find(|k| **k == word) {
-            Some(k) => Token { kind: Tok::Kw(k), pos },
-            None => Token { kind: Tok::Ident(word), pos },
+            Some(k) => Token::new(Tok::Kw(k), pos),
+            None => Token::new(Tok::Ident(word), pos),
         }
     }
 
@@ -408,19 +424,19 @@ impl<'a> Lexer<'a> {
         };
         if lookup {
             self.bump();
-            return Ok(Token { kind: Tok::Op("."), pos });
+            return Ok(Token::new(Tok::Op("."), pos));
         }
 
         self.bump(); // the dot
         if self.peek() == Some('"') {
             let (value, _) = self.string()?;
-            return Ok(Token { kind: Tok::Sym { name: value, quoted: true }, pos });
+            return Ok(Token::new(Tok::Sym { name: value, quoted: true }, pos));
         }
         if !matches!(self.peek(), Some(c) if is_ident_start(c)) {
             return Err(self.err("expected a name or a quoted string after `.`", pos));
         }
         let name = self.take_ident();
-        Ok(Token { kind: Tok::Sym { name, quoted: false }, pos })
+        Ok(Token::new(Tok::Sym { name, quoted: false }, pos))
     }
 
     /// Escapes are `\" \\ \n \t \r \0` (§1).
@@ -462,6 +478,13 @@ impl<'a> Lexer<'a> {
             raw.push(self.bump().unwrap());
         }
         Ok((value, raw))
+    }
+}
+
+/// Record how many source characters the token just pushed spans.
+fn set_len(out: &mut [Token], produced: usize, len: usize) {
+    if out.len() > produced {
+        out[produced].len = len as u32;
     }
 }
 

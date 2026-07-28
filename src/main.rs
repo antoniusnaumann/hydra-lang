@@ -16,6 +16,8 @@ usage:
   hydra run FILE.hy [options]     run a program
   hydra check FILE.hy [options]   report what is guaranteed to crash
   hydra fmt FILE.hy [options]     print the canonical form
+  hydra tokens FILE.hy            print token classes for editor tooling (§13)
+  hydra grammar [--theme]         print a TextMate grammar, or its colours
 
 run options:
   --strict            a crash in a dead trail is fatal, so tests fail on bugs
@@ -57,6 +59,15 @@ fn main() -> ExitCode {
         "run" => command(&args[1..], run),
         "check" => command(&args[1..], check),
         "fmt" => command(&args[1..], fmt),
+        "tokens" => command(&args[1..], tokens),
+        "grammar" => {
+            if flag(&args[1..], "--theme") {
+                print!("{}", hydra::editor::theme_json());
+            } else {
+                print!("{}", hydra::editor::tmlanguage_json());
+            }
+            ExitCode::SUCCESS
+        }
         other => {
             eprintln!("hydra: unknown command `{other}`");
             eprint!("{USAGE}");
@@ -150,6 +161,30 @@ fn check(path: &Path, args: &[String]) -> ExitCode {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// §13's token classes for one file, one per line: `line:col len class`.
+fn tokens(path: &Path, _args: &[String]) -> ExitCode {
+    let file = path.display().to_string();
+    let src = match std::fs::read_to_string(path) {
+        Ok(src) => src,
+        Err(e) => {
+            eprintln!("hydra: cannot read {file}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    match hydra::editor::semantic_tokens(&src, &file) {
+        Ok(tokens) => {
+            for token in tokens {
+                println!("{}:{} {} {}", token.line, token.col, token.len, token.class);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::from(2)
+        }
     }
 }
 

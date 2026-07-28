@@ -1,0 +1,17 @@
+{
+  "textMateRules": [
+    { "scope": "keyword.concurrency.hydra", "settings": { "foreground": "#ff8a65", "fontStyle": "bold" } },
+    { "scope": "punctuation.trail.hydra", "settings": { "foreground": "#ff8a6580" } },
+    { "scope": "keyword.control.hydra", "settings": { "foreground": "#c586c0" } },
+    { "scope": "keyword.other.hydra", "settings": { "foreground": "#569cd6" } },
+    { "scope": "entity.symbol.hydra", "settings": { "foreground": "#4ec9b0" } },
+    { "scope": "entity.namespace.hydra", "settings": { "foreground": "#4ec9b0" } },
+    { "scope": "variable.hydra", "settings": { "foreground": "#9cdcfe" } },
+    { "scope": "variable.property.hydra", "settings": { "foreground": "#9cdcfe" } },
+    { "scope": "entity.function.hydra", "settings": { "foreground": "#dcdcaa" } },
+    { "scope": "constant.hydra", "settings": { "foreground": "#4fc1ff" } },
+    { "scope": "string.hydra", "settings": { "foreground": "#ce9178" } },
+    { "scope": "constant.numeric.hydra", "settings": { "foreground": "#b5cea8" } },
+    { "scope": "comment.hydra", "settings": { "foreground": "#6a9955", "fontStyle": "italic" } }
+  ]
+}

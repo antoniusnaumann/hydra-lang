@@ -515,9 +515,9 @@ impl<'a> Parser<'a> {
                 first_pos.get_or_insert(cell.pos);
                 let last = cell.tokens[cell.tokens.len() - 1].pos;
                 stream.extend(cell.tokens.iter().cloned());
-                stream.push(Token { kind: Tok::Newline, pos: last });
+                stream.push(Token::new(Tok::Newline, last));
             }
-            stream.push(Token { kind: Tok::Eof, pos: self.pos() });
+            stream.push(Token::new(Tok::Eof, self.pos()));
             let mut sub = Parser::new(stream, self.file, true);
             let body = sub.parse_program()?;
             trails.push(TrailDef { body, column, pos: first_pos.unwrap_or(pos) });

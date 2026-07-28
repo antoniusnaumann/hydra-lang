@@ -11,6 +11,12 @@ Three tools, as the spec asks for:
 | static checker | `hydra check FILE.hy` | §11 |
 | formatter | `hydra fmt FILE.hy` | §12 |
 
+Plus the editor support §13 describes: `hydra tokens FILE.hy` classifies a
+file for semantic highlighting, and `hydra grammar` prints a TextMate grammar
+(`--theme` for §13's colours). Both are generated from the same table, and
+because classification runs on real tokens, `parallel for` is coloured as one
+unit for free.
+
 ## Building it
 
 Rust, no dependencies at all — everything the spec asks for is in `std`.
@@ -40,6 +46,8 @@ cargo run -- run examples/trails.hy --dump-scope
 | `src/sched.rs` | §9: trails, cancel flags, the run queue |
 | `src/check.rs` | §11 |
 | `src/format.rs` | §12 |
+| `src/editor.rs` | §13: token classes, TextMate grammar, colours |
+| `editor/` | the generated grammar and theme fragment |
 
 ## Implementation notes
 
