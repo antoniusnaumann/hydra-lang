@@ -10,13 +10,12 @@
 //! closures holding the old one keep the old one) while `x = …` writes into the
 //! cell an outward search finds.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::{Arc, RwLock};
 
 use crate::value::{Cell, Value};
 
-pub type ScopeRef = Rc<Scope>;
+pub type ScopeRef = Arc<Scope>;
 
 impl std::fmt::Debug for Scope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -25,17 +24,17 @@ impl std::fmt::Debug for Scope {
 }
 
 pub struct Scope {
-    vars: RefCell<HashMap<Rc<str>, Cell>>,
+    vars: RwLock<HashMap<Arc<str>, Cell>>,
     parent: Option<ScopeRef>,
 }
 
 impl Scope {
     pub fn root() -> ScopeRef {
-        Rc::new(Scope { vars: RefCell::new(HashMap::new()), parent: None })
+        Arc::new(Scope { vars: RwLock::new(HashMap::new()), parent: None })
     }
 
     pub fn child(parent: &ScopeRef) -> ScopeRef {
-        Rc::new(Scope { vars: RefCell::new(HashMap::new()), parent: Some(parent.clone()) })
+        Arc::new(Scope { vars: RwLock::new(HashMap::new()), parent: Some(parent.clone()) })
     }
 
     pub fn parent(&self) -> Option<&ScopeRef> {
@@ -44,27 +43,28 @@ impl Scope {
 
     /// `x := expr` — a fresh binding in this scope, shadowing any outer one.
     pub fn declare(&self, name: &str, value: Value) -> Cell {
-        let cell = Rc::new(RefCell::new(value));
-        self.vars.borrow_mut().insert(Rc::from(name), cell.clone());
+        let cell = Arc::new(RwLock::new(value));
+        self.vars.write().unwrap_or_else(|e| e.into_inner()).insert(Arc::from(name), cell.clone());
         cell
     }
 
     /// The cell for `name` in this scope only.
     pub fn get_local(&self, name: &str) -> Option<Cell> {
-        self.vars.borrow().get(name).cloned()
+        self.vars.read().unwrap_or_else(|e| e.into_inner()).get(name).cloned()
     }
 
     /// The cell for `name`, searching outward through the chain (§6).
+    ///
+    /// The walk borrows rather than cloning each `Arc`: an outer scope is
+    /// shared by every trail under it, and bumping its refcount on every
+    /// variable read would put one cache line in the path of all of them.
     pub fn lookup(&self, name: &str) -> Option<Cell> {
-        if let Some(cell) = self.get_local(name) {
-            return Some(cell);
-        }
-        let mut scope = self.parent.clone();
+        let mut scope = Some(self);
         while let Some(s) = scope {
             if let Some(cell) = s.get_local(name) {
                 return Some(cell);
             }
-            scope = s.parent.clone();
+            scope = s.parent.as_deref();
         }
         None
     }
@@ -77,15 +77,12 @@ impl Scope {
     /// different shape does not hide the original (§3).
     pub fn all_bindings(&self, name: &str) -> Vec<Cell> {
         let mut out = Vec::new();
-        if let Some(cell) = self.get_local(name) {
-            out.push(cell);
-        }
-        let mut scope = self.parent.clone();
+        let mut scope = Some(self);
         while let Some(s) = scope {
             if let Some(cell) = s.get_local(name) {
                 out.push(cell);
             }
-            scope = s.parent.clone();
+            scope = s.parent.as_deref();
         }
         out
     }
@@ -93,12 +90,13 @@ impl Scope {
     /// Bind an existing cell under a name — how `use` shares a module's own
     /// storage rather than a copy of it (§7).
     pub fn bind_cell(&self, name: &str, cell: Cell) {
-        self.vars.borrow_mut().insert(Rc::from(name), cell);
+        self.vars.write().unwrap_or_else(|e| e.into_inner()).insert(Arc::from(name), cell);
     }
 
     /// Every name bound directly in this scope, for `use` and for tests.
-    pub fn names(&self) -> Vec<Rc<str>> {
-        let mut names: Vec<Rc<str>> = self.vars.borrow().keys().cloned().collect();
+    pub fn names(&self) -> Vec<Arc<str>> {
+        let mut names: Vec<Arc<str>> =
+            self.vars.read().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
         names.sort();
         names
     }

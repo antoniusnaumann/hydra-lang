@@ -12,7 +12,7 @@
 //! Nothing about the language changes: scopes are still hash maps with parent
 //! pointers (§6), and names are still resolved dynamically.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::ast::*;
 use crate::errors::{HydraError, Pos, Result};
@@ -22,8 +22,8 @@ use crate::value::{sym, Sym};
 /// of a module — can root an assignment or a `&` (§5.1).
 #[derive(Clone, Debug)]
 pub enum Root {
-    Name(Rc<str>),
-    Ns { module: Rc<str>, name: Rc<str> },
+    Name(Arc<str>),
+    Ns { module: Arc<str>, name: Arc<str> },
 }
 
 impl Root {
@@ -38,7 +38,7 @@ impl Root {
 #[derive(Clone, Debug)]
 pub enum Instr {
     PushNum(f64),
-    PushStr(Rc<str>),
+    PushStr(Arc<str>),
     PushSym(Sym),
     MakeList(usize),
     /// Pops `n` key/value pairs. Keys are values rather than a static table
@@ -49,13 +49,13 @@ pub enum Instr {
     /// Pops a string and interns it as a symbol — the runtime half of a
     /// symbol built by interpolation (§2).
     MakeSym,
-    MakeClosure { name: Rc<str>, params: Rc<Vec<ParamInfo>>, chunk: Rc<Chunk> },
+    MakeClosure { name: Arc<str>, params: Arc<Vec<ParamInfo>>, chunk: Arc<Chunk> },
     Pop,
 
     /// Read a variable: dereference a `&` transparently, then copy (§5.1).
     Load(Root),
     /// `x := v` — a fresh binding in the current scope, shadowing (§6).
-    Declare(Rc<str>),
+    Declare(Arc<str>),
     /// `place = v` — writes into the binding an outward search finds (§6),
     /// path-copying shared nodes and creating a missing final key (§5).
     Store { root: Root, segs: usize },
@@ -76,10 +76,10 @@ pub enum Instr {
 
     /// Call the value on the stack under the arguments: one candidate only,
     /// because the callee was written as something other than a bare name.
-    Call { positional: usize, names: Rc<Vec<Rc<str>>> },
+    Call { positional: usize, names: Arc<Vec<Arc<str>>> },
     /// Call by name: every function bound to that name is a candidate, and the
     /// first that accepts the argument count and names is the one (§3).
-    CallName { name: Rc<str>, positional: usize, names: Rc<Vec<Rc<str>>> },
+    CallName { name: Arc<str>, positional: usize, names: Arc<Vec<Arc<str>>> },
     Return,
     ReturnNull,
 
@@ -101,22 +101,25 @@ pub enum Instr {
     SkipIfProvided { index: usize, target: usize },
 
     /// Open a `parallel` / `race` block.
-    BeginBlock { kind: BlockKind, label: Option<Rc<str>> },
+    BeginBlock { kind: BlockKind, label: Option<Arc<str>> },
     /// Start one trail of the open block. With `var`, the top of the stack
     /// becomes that binding in the trail's scope (`parallel for`).
-    SpawnTrail { body: Rc<Chunk>, var: Option<Rc<str>>, column: usize },
+    SpawnTrail { body: Arc<Chunk>, var: Option<Arc<str>>, column: usize },
     /// Wait for the open block: all trails, or the first (§9.3, §9.4).
     JoinBlock,
+    /// Leave a `race`'s spawn loop once the block has been decided: a trail
+    /// started after that would be born cancelled and run nothing (§9.4).
+    JumpIfDecided(usize),
 
     /// `break trail` (§9.6).
     EndTrail,
-    Use(Rc<str>),
+    Use(Arc<str>),
 }
 
 /// What a call has to supply for one parameter.
 #[derive(Clone, Debug)]
 pub struct ParamInfo {
-    pub name: Rc<str>,
+    pub name: Arc<str>,
     /// `&name`: the argument must be a reference (§5.1).
     pub by_ref: bool,
     pub has_default: bool,
@@ -125,7 +128,7 @@ pub struct ParamInfo {
 /// A compiled body: a function, a module, a trail, or a closure.
 pub struct Chunk {
     pub name: String,
-    pub file: Rc<str>,
+    pub file: Arc<str>,
     pub code: Vec<Instr>,
     /// One position per instruction, for crash diagnostics.
     pub pos: Vec<Pos>,
@@ -159,7 +162,7 @@ struct LoopCtx {
 }
 
 pub struct Compiler {
-    file: Rc<str>,
+    file: Arc<str>,
     code: Vec<Instr>,
     pos: Vec<Pos>,
     loops: Vec<LoopCtx>,
@@ -169,17 +172,17 @@ pub struct Compiler {
     in_trail: bool,
 }
 
-pub fn compile_program(program: &Program) -> Result<Rc<Chunk>> {
+pub fn compile_program(program: &Program) -> Result<Arc<Chunk>> {
     let mut c = Compiler::new(&program.file, false);
     c.block(&program.body)?;
     c.emit(Instr::ReturnNull, Pos::NONE);
-    Ok(Rc::new(c.finish(program.file.clone(), Vec::new())))
+    Ok(Arc::new(c.finish(program.file.clone(), Vec::new())))
 }
 
 impl Compiler {
     fn new(file: &str, in_trail: bool) -> Compiler {
         Compiler {
-            file: Rc::from(file),
+            file: Arc::from(file),
             code: Vec::new(),
             pos: Vec::new(),
             loops: Vec::new(),
@@ -210,6 +213,7 @@ impl Compiler {
             | Instr::AndJump(t)
             | Instr::OrJump(t)
             | Instr::IterNext { exit: t, .. }
+            | Instr::JumpIfDecided(t)
             | Instr::SkipIfProvided { target: t, .. } => *t = target,
             other => panic!("cannot patch {other:?}"),
         }
@@ -243,11 +247,11 @@ impl Compiler {
         self.emit(Instr::Tick, pos);
         match stmt {
             Stmt::Use { module, pos } => {
-                self.emit(Instr::Use(Rc::from(module.as_str())), *pos);
+                self.emit(Instr::Use(Arc::from(module.as_str())), *pos);
             }
             Stmt::FnDecl { name, def, pos } => {
                 self.closure(def, name, *pos)?;
-                self.emit(Instr::Declare(Rc::from(name.as_str())), *pos);
+                self.emit(Instr::Declare(Arc::from(name.as_str())), *pos);
             }
             Stmt::Decl { name, value, pos } => {
                 // A closure declared as `f := fn(…)` answers to `f` in
@@ -256,7 +260,7 @@ impl Compiler {
                     Expr::Closure(def) => self.closure(def, name, def.pos)?,
                     other => self.expr(other)?,
                 }
-                self.emit(Instr::Declare(Rc::from(name.as_str())), *pos);
+                self.emit(Instr::Declare(Arc::from(name.as_str())), *pos);
             }
             Stmt::Assign { target, value, pos } => {
                 let (root, segs) = self.place(target)?;
@@ -293,7 +297,7 @@ impl Compiler {
             Stmt::Continue { label, pos } => self.compile_continue(label.as_deref(), *pos)?,
             Stmt::Parallel { kind, trails, label, pos, .. } => {
                 self.emit(
-                    Instr::BeginBlock { kind: *kind, label: label.as_deref().map(Rc::from) },
+                    Instr::BeginBlock { kind: *kind, label: label.as_deref().map(Arc::from) },
                     *pos,
                 );
                 for trail in trails {
@@ -307,7 +311,7 @@ impl Compiler {
             }
             Stmt::ParallelFor { kind, var, iterable, body, label, pos, .. } => {
                 self.emit(
-                    Instr::BeginBlock { kind: *kind, label: label.as_deref().map(Rc::from) },
+                    Instr::BeginBlock { kind: *kind, label: label.as_deref().map(Arc::from) },
                     *pos,
                 );
                 let chunk = self.trail_chunk(body, 0, label.as_deref())?;
@@ -315,31 +319,49 @@ impl Compiler {
                 self.emit(Instr::IterStart, *pos);
                 self.iter_depth += 1;
                 let top = self.here();
+                let decided = if *kind == BlockKind::Race {
+                    Some(self.emit(Instr::JumpIfDecided(0), *pos))
+                } else {
+                    None
+                };
                 let next = self.emit(Instr::IterNext { exit: 0 }, *pos);
                 self.emit(
-                    Instr::SpawnTrail { body: chunk, var: Some(Rc::from(var.as_str())), column: 0 },
+                    Instr::SpawnTrail { body: chunk, var: Some(Arc::from(var.as_str())), column: 0 },
                     *pos,
                 );
                 self.emit(Instr::Jump(top), *pos);
                 let exit = self.here();
                 self.patch(next, exit);
+                if let Some(decided) = decided {
+                    self.patch(decided, exit);
+                }
                 self.emit(Instr::IterDrop, *pos);
                 self.iter_depth -= 1;
                 self.emit(Instr::JoinBlock, *pos);
             }
             Stmt::ParallelWhile { kind, cond, body, label, pos, .. } => {
                 self.emit(
-                    Instr::BeginBlock { kind: *kind, label: label.as_deref().map(Rc::from) },
+                    Instr::BeginBlock { kind: *kind, label: label.as_deref().map(Arc::from) },
                     *pos,
                 );
                 let chunk = self.trail_chunk(body, 0, label.as_deref())?;
                 let top = self.here();
+                // A `race` stops spawning as soon as it is decided, before
+                // evaluating the condition again (§9.4).
+                let decided = if *kind == BlockKind::Race {
+                    Some(self.emit(Instr::JumpIfDecided(0), *pos))
+                } else {
+                    None
+                };
                 self.expr(cond)?;
                 let exit = self.emit(Instr::JumpIfFalse(0), *pos);
                 self.emit(Instr::SpawnTrail { body: chunk, var: None, column: 0 }, *pos);
                 self.emit(Instr::Jump(top), *pos);
                 let after = self.here();
                 self.patch(exit, after);
+                if let Some(decided) = decided {
+                    self.patch(decided, after);
+                }
                 self.emit(Instr::JoinBlock, *pos);
             }
         }
@@ -430,7 +452,7 @@ impl Compiler {
         // binding (§6).
         self.emit(Instr::PushScope, pos);
         self.scope_depth += 1;
-        self.emit(Instr::Declare(Rc::from(var)), pos);
+        self.emit(Instr::Declare(Arc::from(var)), pos);
         self.block(body)?;
         self.scope_depth -= 1;
         self.emit(Instr::PopScope(1), pos);
@@ -557,13 +579,13 @@ impl Compiler {
                 self.emit(Instr::MakeDict(entries.len()), *pos);
             }
             Expr::Name { name, pos } => {
-                self.emit(Instr::Load(Root::Name(Rc::from(name.as_str()))), *pos);
+                self.emit(Instr::Load(Root::Name(Arc::from(name.as_str()))), *pos);
             }
             Expr::Namespace { module, name, pos } => {
                 self.emit(
                     Instr::Load(Root::Ns {
-                        module: Rc::from(module.as_str()),
-                        name: Rc::from(name.as_str()),
+                        module: Arc::from(module.as_str()),
+                        name: Arc::from(name.as_str()),
                     }),
                     *pos,
                 );
@@ -579,8 +601,8 @@ impl Compiler {
                 self.emit(Instr::GetMember, *pos);
             }
             Expr::Call { callee, args, pos } => {
-                let names: Rc<Vec<Rc<str>>> = Rc::new(
-                    args.iter().filter_map(|a| a.name.as_deref().map(Rc::from)).collect(),
+                let names: Arc<Vec<Arc<str>>> = Arc::new(
+                    args.iter().filter_map(|a| a.name.as_deref().map(Arc::from)).collect(),
                 );
                 let positional = args.iter().filter(|a| a.name.is_none()).count();
                 match callee.as_ref() {
@@ -589,7 +611,7 @@ impl Compiler {
                             self.expr(&arg.value)?;
                         }
                         self.emit(
-                            Instr::CallName { name: Rc::from(name.as_str()), positional, names },
+                            Instr::CallName { name: Arc::from(name.as_str()), positional, names },
                             *pos,
                         );
                     }
@@ -640,17 +662,17 @@ impl Compiler {
     /// of its pieces when it interpolates (§1).
     fn interpolated(&mut self, parts: &[StrPart], pos: Pos) -> Result<()> {
         if parts.is_empty() {
-            self.emit(Instr::PushStr(Rc::from("")), pos);
+            self.emit(Instr::PushStr(Arc::from("")), pos);
             return Ok(());
         }
         if let [StrPart::Text(text)] = parts {
-            self.emit(Instr::PushStr(Rc::from(text.as_str())), pos);
+            self.emit(Instr::PushStr(Arc::from(text.as_str())), pos);
             return Ok(());
         }
         for part in parts {
             match part {
                 StrPart::Text(text) => {
-                    self.emit(Instr::PushStr(Rc::from(text.as_str())), pos);
+                    self.emit(Instr::PushStr(Arc::from(text.as_str())), pos);
                 }
                 StrPart::Expr(expr) => self.expr(expr)?,
             }
@@ -671,14 +693,14 @@ impl Compiler {
         Ok(())
     }
 
-    fn closure(&mut self, def: &Rc<ClosureDef>, name: &str, pos: Pos) -> Result<()> {
+    fn closure(&mut self, def: &Arc<ClosureDef>, name: &str, pos: Pos) -> Result<()> {
         let mut sub = Compiler::new(&self.file, self.in_trail);
         // The prologue fills in the parameters the call did not supply.
         for (index, param) in def.params.iter().enumerate() {
             let Some(default) = &param.default else { continue };
             let skip = sub.emit(Instr::SkipIfProvided { index, target: 0 }, param.pos);
             sub.expr(default)?;
-            sub.emit(Instr::Declare(Rc::from(param.name.as_str())), param.pos);
+            sub.emit(Instr::Declare(Arc::from(param.name.as_str())), param.pos);
             let after = sub.here();
             sub.patch(skip, after);
         }
@@ -699,15 +721,15 @@ impl Compiler {
             .params
             .iter()
             .map(|p| ParamInfo {
-                name: Rc::from(p.name.as_str()),
+                name: Arc::from(p.name.as_str()),
                 by_ref: p.by_ref,
                 has_default: p.default.is_some(),
             })
             .collect();
         let display = if name.is_empty() { "fn".to_string() } else { name.to_string() };
-        let chunk = Rc::new(sub.finish(display, params.clone()));
+        let chunk = Arc::new(sub.finish(display, params.clone()));
         self.emit(
-            Instr::MakeClosure { name: Rc::from(name), params: Rc::new(params), chunk },
+            Instr::MakeClosure { name: Arc::from(name), params: Arc::new(params), chunk },
             pos,
         );
         Ok(())
@@ -721,7 +743,7 @@ impl Compiler {
         loop {
             match current {
                 Expr::Name { name, .. } => {
-                    let root = Root::Name(Rc::from(name.as_str()));
+                    let root = Root::Name(Arc::from(name.as_str()));
                     return self.emit_segments(root, segs);
                 }
                 Expr::Namespace { module, name, pos } if module.is_empty() => {
@@ -732,8 +754,8 @@ impl Compiler {
                 }
                 Expr::Namespace { module, name, .. } => {
                     let root = Root::Ns {
-                        module: Rc::from(module.as_str()),
-                        name: Rc::from(name.as_str()),
+                        module: Arc::from(module.as_str()),
+                        name: Arc::from(name.as_str()),
                     };
                     return self.emit_segments(root, segs);
                 }
@@ -771,7 +793,7 @@ impl Compiler {
         body: &[Stmt],
         column: usize,
         label: Option<&str>,
-    ) -> Result<Rc<Chunk>> {
+    ) -> Result<Arc<Chunk>> {
         let mut sub = Compiler::new(&self.file, true);
         sub.loops.push(LoopCtx {
             label: label.map(str::to_string),
@@ -788,6 +810,6 @@ impl Compiler {
         // A trail's `break` ends the trail; those are `EndTrail` instructions
         // already, so nothing should be waiting to be patched.
         debug_assert!(ctx.breaks.is_empty() && ctx.continues.is_empty());
-        Ok(Rc::new(sub.finish(format!("trail {column}"), Vec::new())))
+        Ok(Arc::new(sub.finish(format!("trail {column}"), Vec::new())))
     }
 }

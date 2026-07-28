@@ -153,9 +153,11 @@ the builtin whatever else has taken it.
 
 ## Concurrency
 
-Trails are **green threads** sharing the parent **scope**. Writes to a parent
-binding are **last-write-wins**; nothing is guaranteed atomic. Data itself is
-copied per trail — shared mutable state exists only where a `&` put it.
+Trails are **green threads** sharing the parent **scope**, run on a pool of OS
+threads, so CPU-bound work in a `parallel` block really runs in parallel. Writes
+to a parent binding are **last-write-wins** and land whole; nothing is
+guaranteed atomic across statements. Data itself is copied per trail — shared
+mutable state exists only where a `&` put it.
 
 ```hydra
 parallel
@@ -165,7 +167,8 @@ end
 ```
 
 - Each column is a **trail**. **Rows are cosmetic** — no barrier between them.
-- `parallel` joins at `end`; `race` ends at the first completion.
+- `parallel` joins at `end`; `race` ends at the first completion, and stops
+  spawning once it is decided.
 - Every row carries the **same number of separators**; empty cells stay empty
   but keep their `||`. The block's `end` is the line with no separators.
 - A trail reads and writes the parent scope, but `:=` inside a trail is

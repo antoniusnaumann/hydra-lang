@@ -51,17 +51,39 @@ cargo run -- run examples/trails.hy --dump-scope
 
 ## Implementation notes
 
-- **Trails are real green threads.** The evaluator is a stack machine, so a
-  trail is a small suspendable state rather than an OS thread, and the scheduler
-  multiplexes every trail onto one thread with a run queue and a step budget —
-  the shape §9.1 recommends. Suspension works at any depth, including inside a
-  `parallel` block that a called function opened.
+- **Trails are green threads on a worker pool.** The evaluator is a stack
+  machine, so a trail is a small suspendable state and spawning one costs an
+  object rather than a thread. Those trails are then spread over a pool of OS
+  threads — `--threads`, defaulting to the machine's parallelism — so CPU-bound
+  work inside a `parallel` block runs on several cores:
 
-  This is the one place the implementation departs from the §10 checklist, which
-  suggests a tree-walking evaluator: a tree-walker cannot suspend a trail that
-  is several Rust stack frames deep without either an OS thread per trail or a
-  hand-rolled stack. Scopes are still hash maps with parent pointers and names
-  are still resolved dynamically, so nothing about the language changes.
+  ```
+  threads=1  0.14s      threads=4  0.09s
+  threads=2  0.13s      threads=8  0.07s
+  ```
+
+  The pool bounds how many trails run at one instant, not how many exist:
+  `parallel for` over 200 elements is 200 trails on however many workers.
+  `RunResult::peak_parallelism` reports the most that ever ran at once, which is
+  what `tests/parallelism.rs` asserts on.
+
+  Suspension works at any depth, including inside a `parallel` block that a
+  called function opened. This is the one place the implementation departs from
+  the §10 checklist, which suggests a tree-walking evaluator: a tree-walker
+  cannot suspend a trail that is several Rust stack frames deep. Scopes are
+  still hash maps with parent pointers and names are still resolved
+  dynamically, so nothing about the language changes.
+
+- **Real threads are bought, not free.** §9.2 says writes to a parent binding
+  are last-write-wins with no memory model. That stays true because every
+  binding and every value node has its own lock, so a write lands whole and
+  nothing is torn — the program cannot observe anything §9.2 does not describe.
+  Locks are taken root-to-leaf and never re-entered; a `&` that would send a
+  walk back to another root unwinds first, so the one way to build a cycle
+  cannot deadlock.
+
+  Scaling is real but not linear: every variable access goes through a lock and
+  a scope chain, so per-instruction overhead dominates before the cores do.
 
 - **Copy-on-write is structural.** Lists and dicts are nodes carrying a `shared`
   mark. Assignment, argument passing and insertion clone the *handle* and set
@@ -73,6 +95,12 @@ cargo run -- run examples/trails.hy --dump-scope
 - **`&` is a path, not a pointer.** A reference is `(root variable cell, path)`,
   so it survives the path copying COW does underneath it, and only the lvalues
   §5.1 allows can produce one.
+
+- **Blocks are tracked by the scheduler, not by the parent trail.** A trail can
+  finish while its parent is being stepped on another worker, and a running task
+  has been taken out of the task table — so the parent would never hear about
+  it. Wake tokens close the same race from the other side, for a parent that is
+  about to block just as its last child finishes.
 
 - **Cancellation falls out of two instructions.** `Declare` and `Store` check
   the trail's flag after evaluating and before writing, which is §9.5's

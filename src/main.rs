@@ -25,6 +25,8 @@ run options:
   --quiet             do not report dead-trail crashes on stderr
   --step-budget N     statement boundaries a trail runs before the scheduler
                       looks at the others (default 1)
+  --threads N         OS threads running trails (default: the machine's
+                      parallelism). 1 gives a reproducible interleaving
   --dump-scope        print the program's toplevel bindings when it finishes
 
 check options:
@@ -111,6 +113,9 @@ fn run(path: &Path, args: &[String]) -> ExitCode {
     if let Some(budget) = value(args, "--step-budget").and_then(|v| v.parse::<u32>().ok()) {
         options.step_budget = budget.max(1);
     }
+    if let Some(threads) = value(args, "--threads").and_then(|v| v.parse::<usize>().ok()) {
+        options.threads = threads.max(1);
+    }
 
     match run_file(path, options) {
         Err(error) => {
@@ -125,7 +130,8 @@ fn run(path: &Path, args: &[String]) -> ExitCode {
                 names.sort();
                 for name in names {
                     if let Some(cell) = result.root_scope.get_local(&name) {
-                        println!("{name} = {}", to_text(&cell.borrow()));
+                        let value = cell.read().unwrap_or_else(|e| e.into_inner()).clone();
+                        println!("{name} = {}", to_text(&value));
                     }
                 }
             }

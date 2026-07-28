@@ -500,24 +500,36 @@ finish its in-flight statement, print the diagnostic, exit non-zero.
 
 **[D]** Trails are **green threads**.
 
-**[P]** Implement as coroutines multiplexed on one OS thread, with an event loop
-for I/O. This makes the "simple arithmetic is atomic in practice" property true
-for free and avoids a memory model entirely. Revisit only if CPU-bound
-parallelism is wanted later.
+**[D]** Trails are multiplexed onto a **pool of OS threads**, so CPU-bound work
+in a `parallel` block really does run on several cores. The pool size bounds how
+many trails make progress at one instant; it does not bound how many trails
+there are.
+
+A trail is still a green thread — spawning one costs a small object, not a
+thread — and a trail still suspends and resumes anywhere. What real threads cost
+is the free lunch a single thread was giving: "simple arithmetic is atomic in
+practice" is no longer had for nothing. It is bought instead, by locking each
+binding and each value node, which is what keeps §9.2's rule true — a write to a
+parent binding lands whole, so concurrent writes really are last-write-wins and
+nothing is ever torn.
 
 **[D] Scheduling points** are I/O suspension and long-running computation.
 Nothing is guaranteed atomic; in practice a statement that neither performs I/O
 nor runs long will not be interleaved.
 
 **[P]** Concretely: check for preemption at statement boundaries, at any I/O
-suspension, and every N interpreter steps inside a long statement.
+suspension, and every N interpreter steps inside a long statement. Cancellation
+is checked at *every* statement boundary regardless; N only decides how often a
+trail is handed back to the queue, and with a pool it wants to be large enough
+that the scheduler is not the bottleneck.
 
 **[D]** Trails are **not guaranteed to start immediately**. A trail may still be
 unscheduled when a `race` is decided, in which case it never runs at all. Never
 put required side effects in a racing trail.
 
-**[O]** Trail count for `parallel for` over a large list: one green thread per
-element, or a bounded pool with a queue?
+**[D]** Trail count for `parallel for` over a large list: **one trail per
+element**, unbounded. The *thread pool* is the bound that matters, and it is on
+how many run at once rather than on how many exist.
 
 ### 9.2 Shared state
 
@@ -539,10 +551,14 @@ Rows are **cosmetic** — there is no barrier between them.
 **[D]** The block is decided when the first trail finishes. Losers are cancelled
 (§9.5).
 
-**[O]** Does `end` release control immediately, or wait for losers' in-flight
-calls? Discarding results (§9.5) makes both safe for data, so this is purely
-about latency. Recommendation **[P]**: release immediately; the runtime keeps
-orphaned trails alive to completion; at program exit, wait for them.
+**[D]** `end` releases control immediately; the runtime keeps orphaned trails
+alive to completion and waits for them at program exit. Discarding results
+(§9.5) is what makes that safe for data.
+
+**[D]** A `race` **stops spawning** once it is decided: `race while` re-checks
+before evaluating its condition again, and `race for` before taking the next
+element. A trail started after the decision would be born cancelled and run no
+statement at all, so starting it is pure waste.
 
 **[D]** Nothing records the winner. If you need to know, write it down as the
 trail's last statement.
@@ -762,15 +778,10 @@ proposed stdlib. See the note at the top of this document.
    JSON. **Highest priority.** A symbol that isn't a valid identifier is
    spelled `."like-this"`, and built from data with `."\(x)"`.
 2a. Whether `===` keeps reporting COW storage or gains a real identity stamp.
-3. Whether `race`'s `end` waits for in-flight losers, and whether program exit
-   waits for orphaned trails.
-4. `parallel for` trail count over large collections.
 5. Whether `break` inside `parallel for` ends that iteration's trail (consistent
    with `break` in a plain trail) or stays invalid.
-6. Every remaining **[P]**, all of which are the parallelism proposals: the
-   single-OS-thread coroutine runtime, the preemption points, whether `race`'s
-   `end` releases control immediately, and whether a `parallel` block may be
-   written syntactically inside a cell.
+6. Every remaining **[P]**: the preemption points, and whether a `parallel`
+   block may be written syntactically inside a cell.
 7. The standard library. `print`, `has`, `get`, `len` and `push` are specified
    in `hydra_stdlib.md`; everything else the examples lean on is still
    undefined. `push(&list, value)` set the precedent value semantics demanded:

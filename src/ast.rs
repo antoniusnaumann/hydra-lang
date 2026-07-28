@@ -5,7 +5,7 @@
 //! to know which source line every construct occupies.
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::errors::Pos;
 use crate::lexer::Token;
@@ -79,7 +79,7 @@ pub enum Expr {
     /// `&lvalue` (§5.1): the caller marks it, never the callee.
     Ref { target: Box<Expr>, pos: Pos },
     Binary { op: &'static str, left: Box<Expr>, right: Box<Expr>, pos: Pos },
-    Closure(Rc<ClosureDef>),
+    Closure(Arc<ClosureDef>),
 }
 
 impl Expr {
@@ -243,7 +243,7 @@ pub enum Stmt {
     },
     FnDecl {
         name: String,
-        def: Rc<ClosureDef>,
+        def: Arc<ClosureDef>,
         pos: Pos,
     },
     /// `x := expr` declares, shadowing an existing name (§6).

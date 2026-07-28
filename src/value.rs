@@ -19,22 +19,38 @@
 //! keys and indices to walk from it. That is what lets a reference survive the
 //! path copying happening underneath it, and it falls out of §5.1's rule that
 //! only a variable, a dict key or a list element may be referenced.
+//!
+//! ## Threads
+//!
+//! Trails run on a pool of OS threads, so every value is shared with an `Arc`
+//! and every node carries its own lock. That is an implementation detail and
+//! not a change to §9.2: a lock per node and per binding is what makes
+//! "concurrent writes are last-write-wins" true — one write wins whole, and
+//! nothing is ever torn.
+//!
+//! Locks are taken **root to leaf and never re-entered**. A `&` that would send
+//! the walk back to another root unwinds first (see `Walk`), so the one way to
+//! build a cycle cannot deadlock.
 
-use std::cell::{Cell as StdCell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
-use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, RwLock, Weak};
 
 use crate::compile::{Chunk, ParamInfo};
 use crate::errors::Crash;
 use crate::scope::ScopeRef;
 
 /// The storage a name refers to. `&` points at one of these plus a path.
-pub type Cell = Rc<RefCell<Value>>;
+pub type Cell = Arc<RwLock<Value>>;
 
 pub fn cell(value: Value) -> Cell {
-    Rc::new(RefCell::new(value))
+    Arc::new(RwLock::new(value))
 }
+
+/// How many `&` hops one read or write follows before giving up. Only a cycle
+/// of references can exceed it.
+const MAX_REDIRECTS: usize = 64;
 
 // --- symbols ----------------------------------------------------------------
 
@@ -44,7 +60,7 @@ pub fn cell(value: Value) -> Cell {
 /// symbols minted from input data can be collected again — without that, a
 /// program that decodes data in a loop grows without bound (§2).
 #[derive(Clone)]
-pub struct Sym(Rc<str>);
+pub struct Sym(Arc<str>);
 
 impl Sym {
     pub fn name(&self) -> &str {
@@ -52,13 +68,13 @@ impl Sym {
     }
 
     pub fn ptr(&self) -> *const u8 {
-        Rc::as_ptr(&self.0) as *const u8
+        Arc::as_ptr(&self.0) as *const u8
     }
 }
 
 impl PartialEq for Sym {
     fn eq(&self, other: &Sym) -> bool {
-        Rc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
@@ -76,60 +92,48 @@ impl fmt::Debug for Sym {
     }
 }
 
-thread_local! {
-    static INTERNED: RefCell<HashMap<Box<str>, Weak<str>>> = RefCell::new(HashMap::new());
-    static SWEEP_COUNTDOWN: std::cell::Cell<u32> = const { std::cell::Cell::new(1024) };
-}
+static INTERNED: LazyLock<Mutex<HashMap<Box<str>, Weak<str>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Intern a symbol name. Equal names always give the identical symbol.
 pub fn sym(name: &str) -> Sym {
-    INTERNED.with(|table| {
-        let mut table = table.borrow_mut();
-        if let Some(weak) = table.get(name) {
-            if let Some(strong) = weak.upgrade() {
-                return Sym(strong);
-            }
+    let mut table = INTERNED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(weak) = table.get(name) {
+        if let Some(strong) = weak.upgrade() {
+            return Sym(strong);
         }
-        let strong: Rc<str> = Rc::from(name);
-        table.insert(Box::from(name), Rc::downgrade(&strong));
-
+    }
+    let strong: Arc<str> = Arc::from(name);
+    table.insert(Box::from(name), Arc::downgrade(&strong));
+    if table.len().is_power_of_two() {
         // Drop entries whose symbol has gone away. Amortised, so minting
         // symbols in a loop does not leave the table growing.
-        let due = SWEEP_COUNTDOWN.with(|c| {
-            let next = c.get().saturating_sub(1);
-            c.set(if next == 0 { (table.len() as u32).max(1024) } else { next });
-            next == 0
-        });
-        if due {
-            table.retain(|_, weak| weak.strong_count() > 0);
-        }
-        Sym(strong)
-    })
+        table.retain(|_, weak| weak.strong_count() > 0);
+    }
+    Sym(strong)
 }
 
 /// How many names the intern table is holding, for tests about collectability.
 pub fn interned_count() -> usize {
-    INTERNED.with(|t| {
-        let mut t = t.borrow_mut();
-        t.retain(|_, weak| weak.strong_count() > 0);
-        t.len()
-    })
+    let mut table = INTERNED.lock().unwrap_or_else(|e| e.into_inner());
+    table.retain(|_, weak| weak.strong_count() > 0);
+    table.len()
 }
 
-thread_local! {
-    static WELL_KNOWN: (Sym, Sym, Sym) = (sym("null"), sym("true"), sym("false"));
-}
+static SYM_NULL: LazyLock<Sym> = LazyLock::new(|| sym("null"));
+static SYM_TRUE: LazyLock<Sym> = LazyLock::new(|| sym("true"));
+static SYM_FALSE: LazyLock<Sym> = LazyLock::new(|| sym("false"));
 
 pub fn sym_null() -> Sym {
-    WELL_KNOWN.with(|w| w.0.clone())
+    SYM_NULL.clone()
 }
 
 pub fn sym_true() -> Sym {
-    WELL_KNOWN.with(|w| w.1.clone())
+    SYM_TRUE.clone()
 }
 
 pub fn sym_false() -> Sym {
-    WELL_KNOWN.with(|w| w.2.clone())
+    SYM_FALSE.clone()
 }
 
 pub fn boolean(b: bool) -> Value {
@@ -143,10 +147,10 @@ pub struct ListData {
     pub items: Vec<Value>,
     /// Set when a handle to this node is copied. The next write clones.
     ///
-    /// It is a `Cell` and not a plain field so that marking a node shared never
-    /// needs a mutable borrow: a deep comparison walks a structure holding
-    /// immutable borrows, and reading through it copies as it goes.
-    pub shared: StdCell<bool>,
+    /// Atomic rather than a plain field so that marking a node shared never
+    /// needs the write lock: a deep comparison reads a structure while copying
+    /// every handle it passes.
+    pub shared: AtomicBool,
 }
 
 /// Entries are kept in insertion order: a dict is compared key by key (§5), and
@@ -154,7 +158,7 @@ pub struct ListData {
 #[derive(Debug)]
 pub struct DictData {
     pub entries: Vec<(Sym, Value)>,
-    pub shared: StdCell<bool>,
+    pub shared: AtomicBool,
 }
 
 impl DictData {
@@ -174,15 +178,24 @@ impl DictData {
     }
 }
 
-pub type ListRef = Rc<RefCell<ListData>>;
-pub type DictRef = Rc<RefCell<DictData>>;
+pub type ListRef = Arc<RwLock<ListData>>;
+pub type DictRef = Arc<RwLock<DictData>>;
 
 pub fn new_list(items: Vec<Value>) -> Value {
-    Value::List(Rc::new(RefCell::new(ListData { items, shared: StdCell::new(false) })))
+    Value::List(Arc::new(RwLock::new(ListData { items, shared: AtomicBool::new(false) })))
 }
 
 pub fn new_dict(entries: Vec<(Sym, Value)>) -> Value {
-    Value::Dict(Rc::new(RefCell::new(DictData { entries, shared: StdCell::new(false) })))
+    Value::Dict(Arc::new(RwLock::new(DictData { entries, shared: AtomicBool::new(false) })))
+}
+
+/// Snapshot a node so the lock can be released before anything walks further.
+pub fn list_items(list: &ListRef) -> Vec<Value> {
+    list.read().unwrap_or_else(|e| e.into_inner()).items.clone()
+}
+
+pub fn dict_entries(dict: &DictRef) -> Vec<(Sym, Value)> {
+    dict.read().unwrap_or_else(|e| e.into_inner()).entries.clone()
 }
 
 // --- closures ---------------------------------------------------------------
@@ -191,7 +204,7 @@ pub fn new_dict(entries: Vec<(Sym, Value)>) -> Value {
 pub struct Closure {
     pub name: String,
     pub params: Vec<ParamInfo>,
-    pub chunk: Rc<Chunk>,
+    pub chunk: Arc<Chunk>,
     pub scope: ScopeRef,
 }
 
@@ -256,8 +269,8 @@ impl Native {
     pub fn required(self) -> usize {
         match self {
             Native::Alive => 0,
-            Native::Len => 1,
-            Native::Print | Native::Has | Native::Push => 1 + usize::from(self != Native::Print),
+            Native::Len | Native::Print => 1,
+            Native::Has | Native::Push => 2,
             Native::Get => 3,
         }
     }
@@ -268,8 +281,7 @@ impl Native {
         match self {
             Native::Alive => 0,
             Native::Len => 1,
-            Native::Print => 2,
-            Native::Has | Native::Push => 2,
+            Native::Print | Native::Has | Native::Push => 2,
             Native::Get => 3,
         }
     }
@@ -279,7 +291,7 @@ impl Native {
         match self {
             Native::Alive => &[],
             // Not `end`: that keyword closes every block, so it can never be a
-            // name. `terminator` follows Swift's print (see hydra_stdlib.md §2).
+            // name. `terminator` follows Swift's print (hydra_stdlib.md §2).
             Native::Print => &["value", "terminator"],
             Native::Has => &["container", "key"],
             Native::Get => &["container", "key", "fallback"],
@@ -318,24 +330,11 @@ pub enum PathSeg {
     Index(isize),
 }
 
-/// Resolve a list index against a length: 0-based, and a negative index counts
-/// from the end, so `a[-1]` is the last element. Anything still outside the
-/// list crashes, the way a missing key does (§5, §15.2).
-pub fn resolve_index(raw: isize, len: usize) -> Result<usize, Crash> {
-    let resolved = if raw < 0 { raw + len as isize } else { raw };
-    if resolved < 0 || resolved as usize >= len {
-        return Err(Crash::new(format!(
-            "list index {raw} is out of range for a list of {len} element(s)"
-        )));
-    }
-    Ok(resolved as usize)
-}
-
 /// `&lvalue`: the root variable's cell plus the path from it (§5.1).
 #[derive(Clone)]
 pub struct RefValue {
     pub root: Cell,
-    pub path: Rc<Vec<PathSeg>>,
+    pub path: Arc<Vec<PathSeg>>,
 }
 
 impl fmt::Debug for RefValue {
@@ -349,11 +348,11 @@ impl fmt::Debug for RefValue {
 #[derive(Clone, Debug)]
 pub enum Value {
     Num(f64),
-    Str(Rc<str>),
+    Str(Arc<str>),
     Sym(Sym),
     List(ListRef),
     Dict(DictRef),
-    Fn(Rc<Closure>),
+    Fn(Arc<Closure>),
     Native(Native),
     /// Only ever lives in a binding, a dict entry or a list element: reads
     /// dereference it transparently.
@@ -386,10 +385,15 @@ impl Value {
         }
     }
 
+    /// The number this is, or a crash naming the operator that wanted one.
+    ///
+    /// `what` is borrowed and the message is built only on the failing path:
+    /// this runs on every arithmetic operation, and formatting one string per
+    /// operation costs more than the operation.
     pub fn as_num(&self, what: &str) -> Result<f64, Crash> {
         match self {
             Value::Num(n) => Ok(*n),
-            other => Err(Crash::new(format!("{what} needs a number, got a {}", other.kind()))),
+            other => Err(Crash::new(format!("`{what}` needs a number, got a {}", other.kind()))),
         }
     }
 }
@@ -403,11 +407,11 @@ impl Value {
 pub fn copy_value(v: &Value) -> Value {
     match v {
         Value::List(rc) => {
-            rc.borrow().shared.set(true);
+            rc.read().unwrap_or_else(|e| e.into_inner()).shared.store(true, Ordering::Relaxed);
             Value::List(rc.clone())
         }
         Value::Dict(rc) => {
-            rc.borrow().shared.set(true);
+            rc.read().unwrap_or_else(|e| e.into_inner()).shared.store(true, Ordering::Relaxed);
             Value::Dict(rc.clone())
         }
         other => other.clone(),
@@ -419,19 +423,24 @@ pub fn copy_value(v: &Value) -> Value {
 fn unshare(slot: &mut Value) {
     match slot {
         Value::List(rc) => {
-            let needs = rc.borrow().shared.get();
-            if needs {
-                let items: Vec<Value> = rc.borrow().items.iter().map(copy_value).collect();
-                *rc = Rc::new(RefCell::new(ListData { items, shared: StdCell::new(false) }));
-            }
+            let items = {
+                let data = rc.read().unwrap_or_else(|e| e.into_inner());
+                if !data.shared.load(Ordering::Relaxed) {
+                    return;
+                }
+                data.items.iter().map(copy_value).collect()
+            };
+            *rc = Arc::new(RwLock::new(ListData { items, shared: AtomicBool::new(false) }));
         }
         Value::Dict(rc) => {
-            let needs = rc.borrow().shared.get();
-            if needs {
-                let entries: Vec<(Sym, Value)> =
-                    rc.borrow().entries.iter().map(|(k, v)| (k.clone(), copy_value(v))).collect();
-                *rc = Rc::new(RefCell::new(DictData { entries, shared: StdCell::new(false) }));
-            }
+            let entries = {
+                let data = rc.read().unwrap_or_else(|e| e.into_inner());
+                if !data.shared.load(Ordering::Relaxed) {
+                    return;
+                }
+                data.entries.iter().map(|(k, v)| (k.clone(), copy_value(v))).collect()
+            };
+            *rc = Arc::new(RwLock::new(DictData { entries, shared: AtomicBool::new(false) }));
         }
         _ => {}
     }
@@ -439,11 +448,22 @@ fn unshare(slot: &mut Value) {
 
 // --- indexing ---------------------------------------------------------------
 
+/// Resolve a list index against a length: 0-based, and a negative index counts
+/// from the end, so `a[-1]` is the last element. Anything still outside the
+/// list crashes, the way a missing key does (§5, §15.2).
+pub fn resolve_index(raw: isize, len: usize) -> Result<usize, Crash> {
+    let resolved = if raw < 0 { raw + len as isize } else { raw };
+    if resolved < 0 || resolved as usize >= len {
+        return Err(Crash::new(format!(
+            "list index {raw} is out of range for a list of {len} element(s)"
+        )));
+    }
+    Ok(resolved as usize)
+}
+
 /// Turn an evaluated key into a path segment.
 ///
 /// `d.k` is exactly `d[.k]` (§5), so there is one code path here and not two.
-/// List indexing is 0-based and whole-numbers-only; §15.2 leaves the rest open,
-/// see QUESTIONS.md §2.
 pub fn path_segment(key: &Value) -> Result<PathSeg, Crash> {
     match key {
         Value::Sym(s) => Ok(PathSeg::Key(s.clone())),
@@ -454,9 +474,6 @@ pub fn path_segment(key: &Value) -> Result<PathSeg, Crash> {
                     num_to_text(*n)
                 )));
             }
-            // A negative index counts from the end (§15.2, decided by the
-            // language owner). Resolving it needs the length, so it is carried
-            // as-is and resolved where the list is in hand.
             Ok(PathSeg::Index(*n as isize))
         }
         other => Err(Crash::new(format!(
@@ -466,46 +483,42 @@ pub fn path_segment(key: &Value) -> Result<PathSeg, Crash> {
     }
 }
 
-// --- reading and writing places --------------------------------------------
-
-/// Read one step: `container[key]`. Reading a missing key is a crash (§5).
-pub fn get_member(container: &Value, key: &Value) -> Result<Value, Crash> {
-    let container = deref(container)?;
-    match (&container, path_segment(key)?) {
-        (Value::Dict(rc), PathSeg::Key(s)) => match rc.borrow().get(&s) {
-            Some(v) => read_through(v),
-            None => Err(Crash::new(format!("no key .{} in this dict", s.name()))),
-        },
-        (Value::List(rc), PathSeg::Index(i)) => {
-            let data = rc.borrow();
-            let at = resolve_index(i, data.items.len())?;
-            read_through(&data.items[at])
-        }
-        (Value::List(_), PathSeg::Key(s)) => {
-            Err(Crash::new(format!("a list has no key .{}; index it with a number", s.name())))
-        }
-        (Value::Dict(_), PathSeg::Index(i)) => {
-            Err(Crash::new(format!("a dict has no index {i}; its keys are symbols")))
-        }
-        (other, _) => Err(Crash::new(format!("cannot index a {}", other.kind()))),
+fn missing(seg: &PathSeg) -> Crash {
+    match seg {
+        PathSeg::Key(s) => Crash::new(format!("no key .{} in this dict", s.name())),
+        PathSeg::Index(i) => Crash::new(format!("list index {i} is out of range")),
     }
 }
 
-/// `container[key]`, or `None` when the key or index is simply absent.
+// --- reading and writing places --------------------------------------------
+
+/// Where a walk has to start over because it met a `&`.
 ///
-/// Reading a missing key crashes (§5); `has` and `get` are how a program asks
-/// without crashing, so they need a lookup that can answer "no".
-pub fn member_opt(container: &Value, key: &Value) -> Result<Option<Value>, Crash> {
-    let container = deref(container)?;
-    match (&container, path_segment(key)?) {
-        (Value::Dict(rc), PathSeg::Key(s)) => match rc.borrow().get(&s) {
-            Some(v) => read_through(v).map(Some),
-            None => Ok(None),
-        },
+/// Following a reference from inside a structure means jumping to another root,
+/// so the walk returns this instead: every lock it holds is released, and it
+/// starts again from there. That is what keeps locks strictly root-to-leaf.
+enum Walk<T> {
+    Done(T),
+    Redirect { root: Cell, path: Vec<PathSeg> },
+}
+
+fn redirect<T>(reference: &RefValue, rest: &[PathSeg]) -> Walk<T> {
+    let mut path = reference.path.as_ref().clone();
+    path.extend_from_slice(rest);
+    Walk::Redirect { root: reference.root.clone(), path }
+}
+
+/// One step of a read, or `None` when the key or index is simply absent. The
+/// lock is released before the value is looked at any further.
+fn member_of(container: &Value, seg: &PathSeg) -> Result<Option<Value>, Crash> {
+    match (container, seg) {
+        (Value::Dict(rc), PathSeg::Key(s)) => {
+            Ok(rc.read().unwrap_or_else(|e| e.into_inner()).get(s).cloned())
+        }
         (Value::List(rc), PathSeg::Index(i)) => {
-            let data = rc.borrow();
-            match resolve_index(i, data.items.len()) {
-                Ok(at) => read_through(&data.items[at]).map(Some),
+            let data = rc.read().unwrap_or_else(|e| e.into_inner());
+            match resolve_index(*i, data.items.len()) {
+                Ok(at) => Ok(Some(data.items[at].clone())),
                 Err(_) => Ok(None),
             }
         }
@@ -519,62 +532,26 @@ pub fn member_opt(container: &Value, key: &Value) -> Result<Option<Value>, Crash
     }
 }
 
-/// Append to the list at `root` + `path`, path-copying shared nodes on the way,
-/// and answer the new length. This is what `push(&list, v)` does.
-pub fn push_place(root: &Cell, path: &[PathSeg], value: Value) -> Result<usize, Crash> {
-    let mut guard = root
-        .try_borrow_mut()
-        .map_err(|_| Crash::new("a reference cycle was followed while appending"))?;
-    push_slot(&mut guard, path, value)
+/// Read one step: `container[key]`. Reading a missing key is a crash (§5).
+pub fn get_member(container: &Value, key: &Value) -> Result<Value, Crash> {
+    let container = deref(container)?;
+    let seg = path_segment(key)?;
+    match member_of(&container, &seg)? {
+        Some(value) => read_through(&value),
+        None => Err(missing(&seg)),
+    }
 }
 
-fn push_slot(slot: &mut Value, path: &[PathSeg], value: Value) -> Result<usize, Crash> {
-    if let Value::Ref(r) = slot {
-        let root = r.root.clone();
-        let mut full = r.path.as_ref().clone();
-        full.extend_from_slice(path);
-        return push_place(&root, &full, value);
-    }
-
-    unshare(slot);
-    let Some(seg) = path.first() else {
-        return match slot {
-            Value::List(rc) => {
-                let mut data = rc
-                    .try_borrow_mut()
-                    .map_err(|_| Crash::new("a list that contains itself was appended to"))?;
-                data.items.push(value);
-                Ok(data.items.len())
-            }
-            other => Err(Crash::new(format!("`push` appends to a list, got a {}", other.kind()))),
-        };
-    };
-
-    match slot {
-        Value::Dict(rc) => {
-            let PathSeg::Key(key) = seg else {
-                return Err(Crash::new("a dict is keyed by symbols, not by index"));
-            };
-            let mut data = rc
-                .try_borrow_mut()
-                .map_err(|_| Crash::new("a value that contains itself was appended to"))?;
-            match data.position(key) {
-                Some(i) => push_slot(&mut data.entries[i].1, &path[1..], value),
-                None => Err(Crash::new(format!("no key .{} in this dict", key.name()))),
-            }
-        }
-        Value::List(rc) => {
-            let PathSeg::Index(i) = seg else {
-                return Err(Crash::new("a list is indexed by number"));
-            };
-            let mut data = rc
-                .try_borrow_mut()
-                .map_err(|_| Crash::new("a value that contains itself was appended to"))?;
-            let len = data.items.len();
-            let at = resolve_index(*i, len)?;
-            push_slot(&mut data.items[at], &path[1..], value)
-        }
-        other => Err(Crash::new(format!("cannot append inside a {}", other.kind()))),
+/// `container[key]`, or `None` when the key or index is simply absent.
+///
+/// Reading a missing key crashes (§5); `has` and `get` are how a program asks
+/// without crashing, so they need a lookup that can answer "no".
+pub fn member_opt(container: &Value, key: &Value) -> Result<Option<Value>, Crash> {
+    let container = deref(container)?;
+    let seg = path_segment(key)?;
+    match member_of(&container, &seg)? {
+        Some(value) => read_through(&value).map(Some),
+        None => Ok(None),
     }
 }
 
@@ -595,53 +572,68 @@ pub fn deref(v: &Value) -> Result<Value, Crash> {
 }
 
 pub fn read_place(root: &Cell, path: &[PathSeg]) -> Result<Value, Crash> {
-    let start = {
-        let guard = root
-            .try_borrow()
-            .map_err(|_| Crash::new("a reference cycle was followed while reading"))?;
-        guard.clone()
-    };
-    let mut current = match &start {
-        Value::Ref(r) => {
-            let mut full = r.path.as_ref().clone();
-            full.extend_from_slice(path);
-            return read_place(&r.root.clone(), &full);
+    let mut root = root.clone();
+    let mut path = path.to_vec();
+    for _ in 0..MAX_REDIRECTS {
+        // The root's own lock is released before the walk begins.
+        let mut current = root.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut rest = path.as_slice();
+        let mut jump = None;
+        loop {
+            if let Value::Ref(r) = &current {
+                jump = Some(redirect::<()>(r, rest));
+                break;
+            }
+            let Some((seg, tail)) = rest.split_first() else { break };
+            match member_of(&current, seg)? {
+                Some(value) => current = value,
+                None => return Err(missing(seg)),
+            }
+            rest = tail;
         }
-        other => other.clone(),
-    };
-    for seg in path {
-        let key = match seg {
-            PathSeg::Key(s) => Value::Sym(s.clone()),
-            PathSeg::Index(i) => Value::Num(*i as f64),
-        };
-        current = get_member(&current, &key)?;
+        match jump {
+            Some(Walk::Redirect { root: next, path: rest }) => {
+                root = next;
+                path = rest;
+            }
+            _ => return Ok(copy_value(&current)),
+        }
     }
-    Ok(copy_value(&current))
+    Err(Crash::new("a cycle of references was followed while reading"))
 }
 
 /// Write `value` at `root` + `path`, path-copying shared nodes on the way (§5.1).
 ///
 /// Writing a missing key **creates** it; reading one crashes (§5).
 pub fn write_place(root: &Cell, path: &[PathSeg], value: Value) -> Result<(), Crash> {
-    let mut guard = root
-        .try_borrow_mut()
-        .map_err(|_| Crash::new("a reference cycle was followed while assigning"))?;
-    write_slot(&mut guard, path, value)
+    let mut root = root.clone();
+    let mut path = path.to_vec();
+    for _ in 0..MAX_REDIRECTS {
+        let step = {
+            let mut guard = root.write().unwrap_or_else(|e| e.into_inner());
+            write_slot(&mut guard, &path, value.clone())?
+        };
+        match step {
+            Walk::Done(()) => return Ok(()),
+            Walk::Redirect { root: next, path: rest } => {
+                root = next;
+                path = rest;
+            }
+        }
+    }
+    Err(Crash::new("a cycle of references was followed while assigning"))
 }
 
-fn write_slot(slot: &mut Value, path: &[PathSeg], value: Value) -> Result<(), Crash> {
+fn write_slot(slot: &mut Value, path: &[PathSeg], value: Value) -> Result<Walk<()>, Crash> {
     // A reference in the slot is written *through*: `f(&a)` with `x = 5` in the
     // body sets the caller's `a` (see QUESTIONS.md §6).
     if let Value::Ref(r) = slot {
-        let root = r.root.clone();
-        let mut full = r.path.as_ref().clone();
-        full.extend_from_slice(path);
-        return write_place(&root, &full, value);
+        return Ok(redirect(r, path));
     }
 
     let Some(seg) = path.first() else {
         *slot = value;
-        return Ok(());
+        return Ok(Walk::Done(()));
     };
 
     unshare(slot);
@@ -651,15 +643,13 @@ fn write_slot(slot: &mut Value, path: &[PathSeg], value: Value) -> Result<(), Cr
             let PathSeg::Key(key) = seg else {
                 return Err(Crash::new("a dict is keyed by symbols, not by index"));
             };
-            let mut data = rc
-                .try_borrow_mut()
-                .map_err(|_| Crash::new("a value that contains itself was assigned into"))?;
+            let mut data = rc.write().unwrap_or_else(|e| e.into_inner());
             match data.position(key) {
                 Some(i) => write_slot(&mut data.entries[i].1, &path[1..], value),
                 None if last => {
                     // Key writes create (§5).
                     data.entries.push((key.clone(), value));
-                    Ok(())
+                    Ok(Walk::Done(()))
                 }
                 None => Err(Crash::new(format!("no key .{} in this dict", key.name()))),
             }
@@ -672,14 +662,74 @@ fn write_slot(slot: &mut Value, path: &[PathSeg], value: Value) -> Result<(), Cr
                     k.name()
                 )));
             };
-            let mut data = rc
-                .try_borrow_mut()
-                .map_err(|_| Crash::new("a value that contains itself was assigned into"))?;
+            let mut data = rc.write().unwrap_or_else(|e| e.into_inner());
             let len = data.items.len();
             let at = resolve_index(*i, len)?;
             write_slot(&mut data.items[at], &path[1..], value)
         }
         other => Err(Crash::new(format!("cannot assign into a {}", other.kind()))),
+    }
+}
+
+/// Append to the list at `root` + `path`, path-copying shared nodes on the way,
+/// and answer the new length. This is what `push(&list, v)` does.
+pub fn push_place(root: &Cell, path: &[PathSeg], value: Value) -> Result<usize, Crash> {
+    let mut root = root.clone();
+    let mut path = path.to_vec();
+    for _ in 0..MAX_REDIRECTS {
+        let step = {
+            let mut guard = root.write().unwrap_or_else(|e| e.into_inner());
+            push_slot(&mut guard, &path, value.clone())?
+        };
+        match step {
+            Walk::Done(len) => return Ok(len),
+            Walk::Redirect { root: next, path: rest } => {
+                root = next;
+                path = rest;
+            }
+        }
+    }
+    Err(Crash::new("a cycle of references was followed while appending"))
+}
+
+fn push_slot(slot: &mut Value, path: &[PathSeg], value: Value) -> Result<Walk<usize>, Crash> {
+    if let Value::Ref(r) = slot {
+        return Ok(redirect(r, path));
+    }
+
+    unshare(slot);
+    let Some(seg) = path.first() else {
+        return match slot {
+            Value::List(rc) => {
+                let mut data = rc.write().unwrap_or_else(|e| e.into_inner());
+                data.items.push(value);
+                Ok(Walk::Done(data.items.len()))
+            }
+            other => Err(Crash::new(format!("`push` appends to a list, got a {}", other.kind()))),
+        };
+    };
+
+    match slot {
+        Value::Dict(rc) => {
+            let PathSeg::Key(key) = seg else {
+                return Err(Crash::new("a dict is keyed by symbols, not by index"));
+            };
+            let mut data = rc.write().unwrap_or_else(|e| e.into_inner());
+            match data.position(key) {
+                Some(i) => push_slot(&mut data.entries[i].1, &path[1..], value),
+                None => Err(Crash::new(format!("no key .{} in this dict", key.name()))),
+            }
+        }
+        Value::List(rc) => {
+            let PathSeg::Index(i) = seg else {
+                return Err(Crash::new("a list is indexed by number"));
+            };
+            let mut data = rc.write().unwrap_or_else(|e| e.into_inner());
+            let len = data.items.len();
+            let at = resolve_index(*i, len)?;
+            push_slot(&mut data.items[at], &path[1..], value)
+        }
+        other => Err(Crash::new(format!("cannot append inside a {}", other.kind()))),
     }
 }
 
@@ -698,9 +748,9 @@ pub fn identical(a: &Value, b: &Value) -> bool {
         (Value::Num(x), Value::Num(y)) => x == y,
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Sym(x), Value::Sym(y)) => x == y,
-        (Value::List(x), Value::List(y)) => Rc::ptr_eq(x, y),
-        (Value::Dict(x), Value::Dict(y)) => Rc::ptr_eq(x, y),
-        (Value::Fn(x), Value::Fn(y)) => Rc::ptr_eq(x, y),
+        (Value::List(x), Value::List(y)) => Arc::ptr_eq(x, y),
+        (Value::Dict(x), Value::Dict(y)) => Arc::ptr_eq(x, y),
+        (Value::Fn(x), Value::Fn(y)) => Arc::ptr_eq(x, y),
         (Value::Native(x), Value::Native(y)) => x == y,
         _ => false,
     }
@@ -716,6 +766,27 @@ pub fn deep_equal(a: &Value, b: &Value) -> bool {
     deep_equal_inner(a, b, &mut visited, 0)
 }
 
+fn node_pair(x: &impl AsPtr, y: &impl AsPtr) -> (usize, usize) {
+    (x.as_addr(), y.as_addr())
+}
+
+/// So the visited-pair set can hold either kind of node.
+trait AsPtr {
+    fn as_addr(&self) -> usize;
+}
+
+impl AsPtr for ListRef {
+    fn as_addr(&self) -> usize {
+        Arc::as_ptr(self) as *const u8 as usize
+    }
+}
+
+impl AsPtr for DictRef {
+    fn as_addr(&self) -> usize {
+        Arc::as_ptr(self) as *const u8 as usize
+    }
+}
+
 fn deep_equal_inner(a: &Value, b: &Value, visited: &mut Vec<(usize, usize)>, depth: u32) -> bool {
     if identical(a, b) {
         return true;
@@ -724,43 +795,43 @@ fn deep_equal_inner(a: &Value, b: &Value, visited: &mut Vec<(usize, usize)>, dep
         let (Ok(a), Ok(b)) = (deref(a), deref(b)) else { return false };
         return deep_equal_inner(&a, &b, visited, depth);
     }
+    // The visited-pair set is only allocated once recursion passes a small
+    // depth (§5).
+    let tracking = depth > 8;
     match (a, b) {
         (Value::List(x), Value::List(y)) => {
-            // The visited-pair set is only allocated once recursion passes a
-            // small depth (§5).
-            if depth > 8 {
-                let pair = (Rc::as_ptr(x) as *const u8 as usize, Rc::as_ptr(y) as *const u8 as usize);
+            if tracking {
+                let pair = node_pair(x, y);
                 if visited.contains(&pair) {
                     return true;
                 }
                 visited.push(pair);
             }
-            let (x, y) = (x.borrow(), y.borrow());
-            let equal = x.items.len() == y.items.len()
-                && x.items
-                    .iter()
-                    .zip(y.items.iter())
-                    .all(|(p, q)| deep_equal_inner(p, q, visited, depth + 1));
-            if depth > 8 {
+            // Snapshot both nodes and let the locks go before recursing: a `&`
+            // inside could lead the walk back to either of them.
+            let (x, y) = (list_items(x), list_items(y));
+            let equal = x.len() == y.len()
+                && x.iter().zip(y.iter()).all(|(p, q)| deep_equal_inner(p, q, visited, depth + 1));
+            if tracking {
                 visited.pop();
             }
             equal
         }
         (Value::Dict(x), Value::Dict(y)) => {
-            if depth > 8 {
-                let pair = (Rc::as_ptr(x) as *const u8 as usize, Rc::as_ptr(y) as *const u8 as usize);
+            if tracking {
+                let pair = node_pair(x, y);
                 if visited.contains(&pair) {
                     return true;
                 }
                 visited.push(pair);
             }
-            let (x, y) = (x.borrow(), y.borrow());
-            let equal = x.entries.len() == y.entries.len()
-                && x.entries.iter().all(|(k, v)| match y.get(k) {
-                    Some(other) => deep_equal_inner(v, other, visited, depth + 1),
+            let (x, y) = (dict_entries(x), dict_entries(y));
+            let equal = x.len() == y.len()
+                && x.iter().all(|(k, v)| match y.iter().find(|(key, _)| key == k) {
+                    Some((_, other)) => deep_equal_inner(v, other, visited, depth + 1),
                     None => false,
                 });
-            if depth > 8 {
+            if tracking {
                 visited.pop();
             }
             equal
@@ -788,8 +859,7 @@ pub fn num_to_text(n: f64) -> String {
     format!("{n}")
 }
 
-/// The text form of a value. See QUESTIONS.md §3: the spec does not define one,
-/// but `+` on a string and a non-string forces the question.
+/// The text form of a value: what `\(value)` renders and what `print` writes.
 pub fn to_text(v: &Value) -> String {
     to_text_at(v, 0)
 }
@@ -814,17 +884,15 @@ fn to_text_at(v: &Value, depth: u32) -> String {
             }
         }
         Value::List(rc) => {
-            let data = rc.borrow();
-            let items: Vec<String> = data.items.iter().map(to_text).collect();
+            let items: Vec<String> = list_items(rc).iter().map(to_text).collect();
             format!("[{}]", items.join(", "))
         }
         Value::Dict(rc) => {
-            let data = rc.borrow();
-            if data.entries.is_empty() {
+            let entries = dict_entries(rc);
+            if entries.is_empty() {
                 return "{}".to_string();
             }
-            let entries: Vec<String> = data
-                .entries
+            let entries: Vec<String> = entries
                 .iter()
                 .map(|(k, v)| format!("{} : {}", to_text(&Value::Sym(k.clone())), to_text(v)))
                 .collect();
@@ -875,7 +943,7 @@ pub fn binary_op(op: &str, a: &Value, b: &Value) -> Result<Value, Crash> {
     if op == "+" {
         match (a, b) {
             (Value::Str(x), Value::Str(y)) => {
-                return Ok(Value::Str(Rc::from(format!("{x}{y}").as_str())))
+                return Ok(Value::Str(Arc::from(format!("{x}{y}").as_str())))
             }
             (Value::Str(_), other) | (other, Value::Str(_)) => {
                 return Err(Crash::new(format!(
@@ -890,8 +958,8 @@ pub fn binary_op(op: &str, a: &Value, b: &Value) -> Result<Value, Crash> {
 
     match op {
         "+" | "-" | "*" | "/" | "%" | "<" | ">" | "<=" | ">=" => {
-            let x = a.as_num(&format!("`{op}`"))?;
-            let y = b.as_num(&format!("`{op}`"))?;
+            let x = a.as_num(op)?;
+            let y = b.as_num(op)?;
             Ok(match op {
                 "+" => Value::Num(x + y),
                 "-" => Value::Num(x - y),
@@ -906,8 +974,8 @@ pub fn binary_op(op: &str, a: &Value, b: &Value) -> Result<Value, Crash> {
             })
         }
         "|" | "&" | "^" | "<<" | ">>" | ">>>" => {
-            let x = a.as_num(&format!("`{op}`"))?;
-            let y = b.as_num(&format!("`{op}`"))?;
+            let x = a.as_num(op)?;
+            let y = b.as_num(op)?;
             Ok(match op {
                 "|" => int_result(to_int32(x) | to_int32(y)),
                 "&" => int_result(to_int32(x) & to_int32(y)),
@@ -926,8 +994,8 @@ pub fn binary_op(op: &str, a: &Value, b: &Value) -> Result<Value, Crash> {
 
 pub fn unary_op(op: &str, v: &Value) -> Result<Value, Crash> {
     match op {
-        "-" => Ok(Value::Num(-v.as_num("unary `-`")?)),
-        "~" => Ok(int_result(!to_int32(v.as_num("`~`")?))),
+        "-" => Ok(Value::Num(-v.as_num("-")?)),
+        "~" => Ok(int_result(!to_int32(v.as_num("~")?))),
         "not" => Ok(boolean(!v.truthy())),
         other => Err(Crash::new(format!("unknown operator `{other}`"))),
     }

@@ -178,21 +178,27 @@ meaningful per file. Imported names bind to the *module's own storage cell*, so
 
 Implemented exactly as recommended, listed so they are easy to revisit:
 
-- §9.1 green threads on one OS thread; preemption at every statement boundary
-  and at every loop iteration (`--step-budget`, default 1 statement per slice,
-  raisable). Round-robin, so a schedule is reproducible and a test can assert
-  on it.
+- §9.1 preemption at every statement boundary and at every loop iteration
+  (`--step-budget`). Cancellation is checked at every boundary regardless; the
+  budget only decides how often a trail returns to the queue. It defaults to 1
+  on a single worker — reproducible, which is what the schedule-asserting tests
+  use — and to 64 with a pool, where a shorter slice spends more time in the
+  scheduler's lock than in the program.
 - §9.4 `race`'s `end` releases control immediately; orphaned losers keep running
   and the program waits for them at exit.
+
+**Superseded by the owner:** §9.1's single-OS-thread coroutine runtime. Trails
+now run on a pool of OS threads so CPU-bound work is actually parallel, and
+`race` stops spawning once it is decided. Both are recorded as **[D]** in the
+handoff.
 - §4 a `parallel`/`race` block may not appear syntactically inside a cell;
   `check` reports it with the "call a function that opens it" suggestion.
 
 ## 12. Points where an `[O]` blocks only a warning, not the build
 
-- §9.1 trail count for `parallel for` over a large list. **Chosen:** one trail
-  per element, unbounded — the straightforward reading. A bounded pool changes
-  observable interleaving, so it should be decided before anyone writes code
-  that depends on it.
+- ~~§9.1 trail count for `parallel for` over a large list.~~ **Decided:** one
+  trail per element, unbounded. The thread pool is the bound that matters, and
+  it bounds how many run at once rather than how many exist.
 - §9.5/§15.5 whether `break` inside `parallel for` ends that iteration's trail.
   **Chosen:** yes, it ends that iteration's trail only, consistent with `break`
   in a plain trail. `check` does not reject it.
@@ -279,3 +285,27 @@ because it affects the tools rather than the language.
 `hydra run --dump-scope` prints the toplevel bindings a program ends with. It
 exists so that the interpreter can be demonstrated and tested at all, and it is
 a flag on the tool, not a builtin: nothing in the language can reach it.
+
+---
+
+## 19. What real threads cost, and what is left
+
+Scaling is real but not linear — roughly 2x on eight workers for eight
+CPU-bound trails. Every variable access takes a lock and walks a scope chain, so
+the interpreter's own per-instruction overhead is reached before the cores are.
+
+Two things were worth fixing and are done: the scope walk no longer touches the
+refcount of scopes every trail shares, and arithmetic no longer formats an error
+string it usually throws away.
+
+What is left, in the order it would pay:
+
+- **Resolve names at compile time.** Slot indices instead of a hash lookup per
+  access would remove most of the remaining lock traffic. It is a real change:
+  §6's scopes are hash maps by specification, and `:=` shadowing plus the
+  resolution rules of §3 mean a slot is not always statically knowable.
+- **Per-worker run queues.** One mutex serialises every scheduling decision.
+- **Read-mostly scopes.** A scope is written once per declaration and read
+  constantly; something cheaper than an `RwLock` would suit it.
+
+None of these change the language, so none of them is blocking.

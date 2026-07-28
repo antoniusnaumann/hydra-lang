@@ -4,8 +4,11 @@
 use hydra::value::to_text;
 use hydra::vm::{run_source, Options, RunResult};
 
+/// One worker thread, so the interleaving is round-robin and reproducible:
+/// these tests assert on the schedule itself. `tests/parallelism.rs` is where
+/// the pool runs wide.
 fn opts() -> Options {
-    Options { search_path: Vec::new(), ..Options::default() }
+    Options { search_path: Vec::new(), threads: 1, step_budget: 1, ..Options::default() }
 }
 
 fn run(src: &str) -> RunResult {
@@ -17,7 +20,7 @@ fn eval(src: &str, name: &str) -> String {
     if let Some(crash) = &result.crash {
         panic!("unexpected crash: {crash}");
     }
-    to_text(&result.root_scope.lookup(name).unwrap_or_else(|| panic!("no `{name}`")).borrow().clone())
+    to_text(&result.root_scope.lookup(name).unwrap_or_else(|| panic!("no `{name}`")).read().unwrap().clone())
 }
 
 fn expr(src: &str) -> String {
@@ -169,10 +172,10 @@ use shadows
 theirs := push(\"host\", \"img\")
 fetched := fetch(\"url\")
 ";
-    let result = run_source(src, "tests/fixtures/main.hy", Options::default()).expect("compiles");
+    let result = run_source(src, "tests/fixtures/main.hy", Options { threads: 1, step_budget: 1, ..Options::default() }).expect("compiles");
     assert!(result.crash.is_none(), "{:?}", result.crash);
     let read =
-        |name: &str| to_text(&result.root_scope.lookup(name).expect("binding").borrow().clone());
+        |name: &str| to_text(&result.root_scope.lookup(name).expect("binding").read().unwrap().clone());
     assert_eq!(read("theirs"), "pushed img to host");
     assert_eq!(read("fetched"), "fetched url");
 }
@@ -371,10 +374,10 @@ theirs := push(\"host\", \"img\")
 rows := []
 mine := ::push(&rows, 1)
 ";
-    let result = run_source(src, "tests/fixtures/main.hy", Options::default()).expect("compiles");
+    let result = run_source(src, "tests/fixtures/main.hy", Options { threads: 1, step_budget: 1, ..Options::default() }).expect("compiles");
     assert!(result.crash.is_none(), "{:?}", result.crash);
     let read =
-        |name: &str| to_text(&result.root_scope.lookup(name).expect("binding").borrow().clone());
+        |name: &str| to_text(&result.root_scope.lookup(name).expect("binding").read().unwrap().clone());
     assert_eq!(read("theirs"), "pushed img to host");
     assert_eq!(read("mine"), "1");
 }

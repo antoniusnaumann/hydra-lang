@@ -6,8 +6,11 @@
 use hydra::value::to_text;
 use hydra::vm::{run_source, Options, RunResult};
 
+/// One worker thread, so the interleaving is round-robin and reproducible:
+/// these tests assert on the schedule itself. `tests/parallelism.rs` is where
+/// the pool runs wide.
 fn opts() -> Options {
-    Options { search_path: Vec::new(), ..Options::default() }
+    Options { search_path: Vec::new(), threads: 1, step_budget: 1, ..Options::default() }
 }
 
 fn run_with(src: &str, options: Options) -> RunResult {
@@ -24,7 +27,7 @@ fn eval(src: &str, name: &str) -> String {
         panic!("unexpected crash: {crash}");
     }
     let cell = result.root_scope.lookup(name).unwrap_or_else(|| panic!("no binding `{name}`"));
-    let value = cell.borrow().clone();
+    let value = cell.read().unwrap().clone();
     to_text(&value)
 }
 
@@ -113,7 +116,7 @@ end
     let result = run(src);
     assert!(result.crash.is_none());
     let read =
-        |name: &str| to_text(&result.root_scope.lookup(name).expect("binding").borrow().clone());
+        |name: &str| to_text(&result.root_scope.lookup(name).expect("binding").read().unwrap().clone());
     assert_eq!(read("hits"), read("n"), "every trail that ran did both statements");
     assert!(read("n").parse::<f64>().unwrap() >= 3.0, "the condition stopped holding");
 }
@@ -190,7 +193,7 @@ end
     let result = run(src);
     assert!(result.crash.is_none());
     let read = |name: &str| {
-        to_text(&result.root_scope.lookup(name).expect("binding").borrow().clone())
+        to_text(&result.root_scope.lookup(name).expect("binding").read().unwrap().clone())
     };
     assert_eq!(read("log"), "weffect", "the call completed but the trail stopped after it");
     assert_eq!(read("result"), ".null", "the pending assignment was discarded");
@@ -227,7 +230,7 @@ after = 1
     let result = run_with(src, Options { report_dead_crashes: false, ..opts() });
     assert!(result.crash.is_none(), "the program continues past a dead trail's crash");
     assert_eq!(result.dead_crashes.len(), 1);
-    let after = result.root_scope.lookup("after").expect("binding").borrow().clone();
+    let after = result.root_scope.lookup("after").expect("binding").read().unwrap().clone();
     assert_eq!(to_text(&after), "1");
 }
 
@@ -260,7 +263,7 @@ end
 ";
     let result = run(src);
     assert!(result.crash.is_some());
-    let log = result.root_scope.lookup("log").expect("binding").borrow().clone();
+    let log = result.root_scope.lookup("log").expect("binding").read().unwrap().clone();
     // The sibling's first statement had already been queued behind the crash;
     // whatever it managed, it stopped before running everything.
     assert!(to_text(&log).len() < 2, "siblings stopped early, got {:?}", to_text(&log));
@@ -334,7 +337,7 @@ end
 total := a + b
 ";
     let result = run_with(src, Options { step_budget: 64, ..opts() });
-    let total = result.root_scope.lookup("total").expect("binding").borrow().clone();
+    let total = result.root_scope.lookup("total").expect("binding").read().unwrap().clone();
     assert_eq!(to_text(&total), "3");
 }
 

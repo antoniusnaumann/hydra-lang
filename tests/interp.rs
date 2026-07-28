@@ -7,8 +7,11 @@
 use hydra::value::to_text;
 use hydra::vm::{run_source, Options, RunResult};
 
+/// One worker thread, so the interleaving is round-robin and reproducible:
+/// these tests assert on the schedule itself. `tests/parallelism.rs` is where
+/// the pool runs wide.
 fn opts() -> Options {
-    Options { search_path: Vec::new(), ..Options::default() }
+    Options { search_path: Vec::new(), threads: 1, step_budget: 1, ..Options::default() }
 }
 
 fn run(src: &str) -> RunResult {
@@ -22,7 +25,7 @@ fn eval(src: &str, name: &str) -> String {
         panic!("unexpected crash: {crash}");
     }
     let cell = result.root_scope.lookup(name).unwrap_or_else(|| panic!("no binding `{name}`"));
-    let value = cell.borrow().clone();
+    let value = cell.read().unwrap().clone();
     to_text(&value)
 }
 

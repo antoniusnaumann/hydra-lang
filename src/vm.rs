@@ -13,11 +13,11 @@
 //!   statement boundary of the trail's *own* body, so an in-flight call — and
 //!   everything it invokes — runs to the end and no frame is abandoned.
 
-use std::cell::RefCell;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use crate::ast::BlockKind;
 use crate::compile::{compile_program, Chunk, Instr, Root};
@@ -26,7 +26,7 @@ use crate::lexer::is_private;
 use crate::parser::parse;
 use crate::scope::{Scope, ScopeRef};
 use crate::sched::{
-    BlockCtx, CancelFlag, Frame, IterState, OnReturn, RunQueue, ScopeSlot, Task, TaskId, TaskState,
+    BlockCtx, BlockId, CancelFlag, Frame, IterState, OnReturn, ScopeSlot, Task, TaskId, TaskState,
 };
 use crate::value::{
     binary_op, boolean, copy_value, deref, get_member, member_opt, new_dict, new_list, path_segment,
@@ -41,13 +41,22 @@ pub struct Options {
     pub strict: bool,
     /// Dead-trail crashes are reported on stderr by default; silenceable.
     pub report_dead_crashes: bool,
-    /// How many statement boundaries a trail runs before the scheduler looks
-    /// at the others. §9.1 asks for a preemption check at every statement
-    /// boundary, so 1 is the finest — and the default: it makes a trail's
-    /// progress independent of how long its siblings are, and keeps a runaway
-    /// loop from starving the block it is in. A larger value trades
-    /// interleaving for scheduler overhead.
+    /// How many statement boundaries a trail runs before the scheduler looks at
+    /// the others. §9.1 asks for a preemption *check* at every statement
+    /// boundary, which cancellation still does whatever this is set to; this
+    /// only decides how often a trail is handed back to the queue.
+    ///
+    /// It defaults to 1 on a single worker, which gives the finest interleaving
+    /// and a reproducible one. With a pool it defaults higher: a slice that
+    /// short would spend more time in the scheduler's lock than in the program.
     pub step_budget: u32,
+    /// How many OS threads run trails. Trails are still green threads — this is
+    /// the cap on how many of them make progress at the same instant, and so on
+    /// how much CPU-bound work a `parallel` block can actually overlap.
+    ///
+    /// Defaults to the machine's parallelism. Set it to 1 for a deterministic,
+    /// reproducible interleaving, which is what the schedule-asserting tests do.
+    pub threads: usize,
     pub search_path: Vec<PathBuf>,
 }
 
@@ -56,22 +65,26 @@ impl Default for Options {
         let search_path = std::env::var("HYDRA_PATH")
             .map(|v| v.split(':').filter(|s| !s.is_empty()).map(PathBuf::from).collect())
             .unwrap_or_default();
-        Options { strict: false, report_dead_crashes: true, step_budget: 1, search_path }
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let step_budget = if threads > 1 { 64 } else { 1 };
+        Options { strict: false, report_dead_crashes: true, step_budget, threads, search_path }
     }
 }
 
 pub struct ModuleRt {
     pub name: String,
     pub path: PathBuf,
-    pub scope: ScopeRef,
+    /// Replaced when the module body returns: declarations may have opened
+    /// shadowing levels, so what it exports is the scope it *ended* with.
+    pub scope: RwLock<ScopeRef>,
     /// Names `use` brought in, consulted after the lexical chain (§7).
     ///
     /// A name can have more than one: the most recent `use` wins for an
     /// unqualified *read*, and a *call* may fall through to an earlier one that
     /// accepts it (§3).
-    pub imports: RefCell<HashMap<String, Vec<Cell>>>,
+    pub imports: RwLock<HashMap<String, Vec<Cell>>>,
     /// `alias -> module`, for `mod::name`.
-    pub aliases: RefCell<HashMap<String, usize>>,
+    pub aliases: RwLock<HashMap<String, usize>>,
 }
 
 enum Flow {
@@ -83,18 +96,41 @@ enum Flow {
     Done,
 }
 
+/// What the workers share: the task table, the run queue, and the count of
+/// tasks currently being stepped.
+///
+/// One mutex covers all three so that "is there anything left to do" is a
+/// single, exact question — the condition every worker parks on.
+#[derive(Default)]
+struct Sched {
+    tasks: HashMap<TaskId, Task>,
+    ready: VecDeque<TaskId>,
+    running: usize,
+    next_id: TaskId,
+    /// Open `parallel` / `race` blocks, by id.
+    blocks: HashMap<BlockId, BlockCtx>,
+    next_block: BlockId,
+    /// Tasks a block satisfied while they were still running. A worker parking
+    /// one consumes its token instead of parking it, which is what closes the
+    /// race between "I am about to block" and "your last child just finished".
+    wakes: HashSet<TaskId>,
+}
+
 pub struct Vm {
     pub options: Options,
-    modules: Vec<ModuleRt>,
-    module_by_path: HashMap<PathBuf, usize>,
-    tasks: HashMap<TaskId, Task>,
-    ready: RunQueue,
-    next_id: TaskId,
-    root_cancel: Rc<CancelFlag>,
+    modules: RwLock<Vec<Arc<ModuleRt>>>,
+    module_by_path: Mutex<HashMap<PathBuf, usize>>,
+    sched: Mutex<Sched>,
+    /// Woken when a task becomes ready or the last one finishes.
+    wake: Condvar,
+    root_cancel: Arc<CancelFlag>,
     /// The first crash in a live trail: it ends the program (§8).
-    pub crash: Option<Crash>,
+    crash: Mutex<Option<Crash>>,
     /// Crashes isolated to a dead trail (§9.5).
-    pub dead_crashes: Vec<Crash>,
+    dead_crashes: Mutex<Vec<Crash>>,
+    /// The most trails ever stepping at the same moment: what "true
+    /// parallelism" means, and what a test can assert on.
+    peak_parallelism: AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -102,6 +138,8 @@ pub struct RunResult {
     pub crash: Option<Crash>,
     pub dead_crashes: Vec<Crash>,
     pub root_scope: ScopeRef,
+    /// The most trails that were stepping at once.
+    pub peak_parallelism: usize,
 }
 
 impl RunResult {
@@ -114,34 +152,40 @@ impl Vm {
     pub fn new(options: Options) -> Vm {
         Vm {
             options,
-            modules: Vec::new(),
-            module_by_path: HashMap::new(),
-            tasks: HashMap::new(),
-            ready: RunQueue::default(),
-            next_id: 0,
+            modules: RwLock::new(Vec::new()),
+            module_by_path: Mutex::new(HashMap::new()),
+            sched: Mutex::new(Sched::default()),
+            wake: Condvar::new(),
             root_cancel: CancelFlag::root(),
-            crash: None,
-            dead_crashes: Vec::new(),
+            crash: Mutex::new(None),
+            dead_crashes: Mutex::new(Vec::new()),
+            peak_parallelism: AtomicUsize::new(0),
         }
     }
 
-    fn new_module(&mut self, name: &str, path: PathBuf) -> usize {
-        let id = self.modules.len();
-        self.modules.push(ModuleRt {
+    fn module(&self, id: usize) -> Arc<ModuleRt> {
+        self.modules.read().unwrap_or_else(|e| e.into_inner())[id].clone()
+    }
+
+    fn new_module(&self, name: &str, path: PathBuf) -> usize {
+        let mut modules = self.modules.write().unwrap_or_else(|e| e.into_inner());
+        let id = modules.len();
+        modules.push(Arc::new(ModuleRt {
             name: name.to_string(),
             path: path.clone(),
-            scope: Scope::root(),
-            imports: RefCell::new(HashMap::new()),
-            aliases: RefCell::new(HashMap::new()),
-        });
+            scope: RwLock::new(Scope::root()),
+            imports: RwLock::new(HashMap::new()),
+            aliases: RwLock::new(HashMap::new()),
+        }));
+        drop(modules);
         if !path.as_os_str().is_empty() {
-            self.module_by_path.insert(path, id);
+            self.module_by_path.lock().unwrap_or_else(|e| e.into_inner()).insert(path, id);
         }
         id
     }
 
     /// Compile and run a source string as the main module.
-    pub fn run_source(&mut self, src: &str, file: &str) -> Result<RunResult, HydraError> {
+    pub fn run_source(self: &Arc<Self>, src: &str, file: &str) -> Result<RunResult, HydraError> {
         let program = parse(src, file)?;
         let chunk = compile_program(&program)?;
         let path = PathBuf::from(file);
@@ -151,13 +195,14 @@ impl Vm {
     }
 
     pub fn module_scope(&self, id: usize) -> ScopeRef {
-        self.modules[id].scope.clone()
+        self.module(id).scope.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    fn spawn_root(&mut self, chunk: Rc<Chunk>, module: usize) {
-        let scope = self.modules[module].scope.clone();
-        let id = self.next_id;
-        self.next_id += 1;
+    fn spawn_root(&self, chunk: Arc<Chunk>, module: usize) {
+        let scope = self.module_scope(module);
+        let mut sched = self.sched.lock().unwrap_or_else(|e| e.into_inner());
+        let id = sched.next_id;
+        sched.next_id += 1;
         let task = Task {
             id,
             frames: vec![Frame {
@@ -174,56 +219,130 @@ impl Vm {
             }],
             stack: Vec::new(),
             cancel: self.root_cancel.clone(),
-            parent: None,
+            block: None,
             blocks: Vec::new(),
             state: TaskState::Ready,
             base_depth: 1,
             is_trail: false,
             module,
         };
-        self.tasks.insert(id, task);
-        self.ready.push(id);
+        sched.tasks.insert(id, task);
+        sched.ready.push_back(id);
     }
 
     /// Run until nothing is left to run.
     ///
+    /// Trails are green threads spread over a pool of OS threads, so CPU-bound
+    /// work in a `parallel` block runs on as many cores as the pool has. The
+    /// pool size is the cap on true parallelism; the number of *trails* is not
+    /// capped (§9.1).
+    ///
     /// Orphaned losers of a `race` are still in the queue, so the program waits
     /// for them at exit (§9.4's recommendation).
-    pub fn run(&mut self) -> RunResult {
-        while let Some(id) = self.ready.pop() {
-            let Some(mut task) = self.tasks.remove(&id) else { continue };
-            if task.state == TaskState::Blocked {
-                self.tasks.insert(id, task);
-                continue;
-            }
-            match self.run_slice(&mut task) {
-                Ok(Flow::Yield) => {
-                    self.tasks.insert(id, task);
-                    self.ready.push(id);
-                }
-                Ok(Flow::Blocked) => {
-                    task.state = TaskState::Blocked;
-                    self.tasks.insert(id, task);
-                }
-                Ok(Flow::Done) | Ok(Flow::Stop) => self.finish_task(task, Ok(())),
-                Ok(Flow::Next) => unreachable!("a slice never ends mid-step"),
-                Err(crash) => self.finish_task(task, Err(crash)),
-            }
+    pub fn run(self: &Arc<Self>) -> RunResult {
+        let workers = self.options.threads.max(1);
+        let extra: Vec<_> = (1..workers)
+            .map(|_| {
+                let vm = Arc::clone(self);
+                std::thread::spawn(move || vm.work())
+            })
+            .collect();
+        // The calling thread is a worker too, so a one-thread run needs no
+        // threads at all and keeps a schedule a test can assert on.
+        self.work();
+        for worker in extra {
+            let _ = worker.join();
         }
+
         RunResult {
-            crash: self.crash.clone(),
-            dead_crashes: self.dead_crashes.clone(),
-            root_scope: self.modules[0].scope.clone(),
+            crash: self.crash.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            dead_crashes: self.dead_crashes.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            root_scope: self.module_scope(0),
+            peak_parallelism: self.peak_parallelism.load(Ordering::Relaxed),
         }
     }
 
-    fn run_slice(&mut self, task: &mut Task) -> Result<Flow, Crash> {
+    /// One worker: take a ready trail, step it for a slice, hand it back.
+    fn work(&self) {
+        loop {
+            let mut task = {
+                let mut sched = self.sched.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    match sched.ready.pop_front() {
+                        Some(id) => match sched.tasks.remove(&id) {
+                            Some(task) => {
+                                sched.running += 1;
+                                self.peak_parallelism.fetch_max(sched.running, Ordering::Relaxed);
+                                break task;
+                            }
+                            None => continue,
+                        },
+                        // Nothing ready and nothing running means nothing can
+                        // become ready: the program is over for every worker.
+                        None if sched.running == 0 => {
+                            self.wake.notify_all();
+                            return;
+                        }
+                        None => {
+                            sched = self.wake.wait(sched).unwrap_or_else(|e| e.into_inner());
+                        }
+                    }
+                }
+            };
+
+            let id = task.id;
+            let outcome = self.run_slice(&mut task);
+
+            let mut sched = self.sched.lock().unwrap_or_else(|e| e.into_inner());
+            sched.running -= 1;
+            let was_ready = sched.ready.len();
+            match outcome {
+                Ok(Flow::Yield) => {
+                    sched.tasks.insert(id, task);
+                    sched.ready.push_back(id);
+                }
+                Ok(Flow::Blocked) => {
+                    if sched.wakes.remove(&id) {
+                        sched.ready.push_back(id);
+                    } else {
+                        task.state = TaskState::Blocked;
+                    }
+                    sched.tasks.insert(id, task);
+                }
+                Ok(Flow::Done) | Ok(Flow::Stop) => self.finish_task(&mut sched, task, Ok(())),
+                Ok(Flow::Next) => unreachable!("a slice never ends mid-step"),
+                Err(crash) => self.finish_task(&mut sched, task, Err(crash)),
+            }
+            // Wake a parked worker only when there is more to take than before,
+            // or when this was the last one running and everyone should leave.
+            let gained = sched.ready.len() > was_ready;
+            let finished = sched.ready.is_empty() && sched.running == 0;
+            drop(sched);
+            if finished {
+                self.wake.notify_all();
+            } else if gained {
+                self.wake.notify_one();
+            }
+        }
+    }
+
+    fn run_slice(&self, task: &mut Task) -> Result<Flow, Crash> {
         let mut budget = self.options.step_budget;
+        // The running chunk is held for the whole slice and refreshed only when
+        // a call or a return changes frames. Cloning it per instruction would
+        // put an atomic refcount on a chunk every worker shares.
+        let mut chunk = match task.frames.last() {
+            Some(frame) => frame.chunk.clone(),
+            None => return Ok(Flow::Done),
+        };
         loop {
             if task.frames.is_empty() {
                 return Ok(Flow::Done);
             }
-            match self.step(task, &mut budget) {
+            if !Arc::ptr_eq(&chunk, &task.frame().chunk) {
+                chunk = task.frame().chunk.clone();
+            }
+            match self.step(task, &chunk, &mut budget) {
                 Ok(Flow::Next) => continue,
                 Ok(other) => return Ok(other),
                 Err(crash) => return Err(self.decorate(task, crash)),
@@ -251,32 +370,34 @@ impl Vm {
         crash
     }
 
-    fn step(&mut self, task: &mut Task, budget: &mut u32) -> Result<Flow, Crash> {
+    fn step(&self, task: &mut Task, chunk: &Chunk, budget: &mut u32) -> Result<Flow, Crash> {
+        // Falling off the end of a body returns nothing.
+        const END: Instr = Instr::ReturnNull;
         let instr = {
             let frame = task.frame_mut();
-            if frame.ip >= frame.chunk.code.len() {
-                // Falling off the end of a body returns nothing.
-                Instr::ReturnNull
+            if frame.ip >= chunk.code.len() {
+                &END
             } else {
-                let instr = frame.chunk.code[frame.ip].clone();
+                let at = frame.ip;
                 frame.ip += 1;
-                instr
+                &chunk.code[at]
             }
         };
 
         match instr {
-            Instr::PushNum(n) => task.push(Value::Num(n)),
-            Instr::PushStr(s) => task.push(Value::Str(s)),
-            Instr::PushSym(s) => task.push(Value::Sym(s)),
+            Instr::PushNum(n) => task.push(Value::Num(*n)),
+            Instr::PushStr(s) => task.push(Value::Str(s.clone())),
+            Instr::PushSym(s) => task.push(Value::Sym(s.clone())),
             Instr::Pop => {
                 task.pop();
             }
             Instr::MakeList(n) => {
-                let at = task.stack.len() - n;
+                let at = task.stack.len() - *n;
                 let items: Vec<Value> = task.stack.split_off(at);
                 task.push(new_list(items));
             }
             Instr::MakeDict(n) => {
+                let n = *n;
                 let at = task.stack.len() - n * 2;
                 let flat: Vec<Value> = task.stack.split_off(at);
                 let mut entries: Vec<(Sym, Value)> = Vec::with_capacity(n);
@@ -297,13 +418,13 @@ impl Vm {
                 task.push(new_dict(entries));
             }
             Instr::Interpolate(n) => {
-                let at = task.stack.len() - n;
+                let at = task.stack.len() - *n;
                 let parts: Vec<Value> = task.stack.split_off(at);
                 let mut text = String::new();
                 for part in &parts {
                     text.push_str(&to_text(part));
                 }
-                task.push(Value::Str(Rc::from(text.as_str())));
+                task.push(Value::Str(Arc::from(text.as_str())));
             }
             Instr::MakeSym => {
                 let value = task.pop();
@@ -319,16 +440,16 @@ impl Vm {
             }
             Instr::MakeClosure { name, params, chunk } => {
                 let scope = task.scope().clone();
-                task.push(Value::Fn(Rc::new(Closure {
+                task.push(Value::Fn(Arc::new(Closure {
                     name: name.to_string(),
                     params: params.as_ref().clone(),
-                    chunk,
+                    chunk: chunk.clone(),
                     scope,
                 })));
             }
 
             Instr::Load(root) => {
-                let value = self.load(task, &root)?;
+                let value = self.load(task, root)?;
                 task.push(value);
             }
             Instr::Declare(name) => {
@@ -339,26 +460,26 @@ impl Vm {
                 // Redeclaring a name already bound in this scope is a *fresh*
                 // binding, and a closure that captured the old one must keep
                 // it (§6), so the new binding goes in a level of its own.
-                if task.scope().get_local(&name).is_some() {
+                if task.scope().get_local(name).is_some() {
                     let child = Scope::child(task.scope());
                     task.frame_mut().push_scope(child, true);
                 }
-                task.scope().declare(&name, value);
+                task.scope().declare(name, value);
             }
             Instr::Store { root, segs } => {
                 let value = task.pop();
-                let path = self.take_path(task, segs)?;
+                let path = self.take_path(task, *segs)?;
                 // Evaluate → check the cancel flag → only then store (§9.5).
                 if task.should_stop() {
                     return Ok(Flow::Stop);
                 }
-                let cell = self.cell_for(task, &root)?;
+                let cell = self.cell_for(task, root)?;
                 write_place(&cell, &path, value)?;
             }
             Instr::MakeRef { root, segs } => {
-                let path = self.take_path(task, segs)?;
-                let cell = self.cell_for(task, &root)?;
-                task.push(Value::Ref(RefValue { root: cell, path: Rc::new(path) }));
+                let path = self.take_path(task, *segs)?;
+                let cell = self.cell_for(task, root)?;
+                task.push(Value::Ref(RefValue { root: cell, path: Arc::new(path) }));
             }
             Instr::GetMember => {
                 let key = task.pop();
@@ -378,6 +499,7 @@ impl Vm {
             }
 
             Instr::Jump(target) => {
+                let target = *target;
                 if target <= task.frame().ip {
                     // A backward jump is a loop iteration: bill it, so a loop
                     // whose body has no statements still yields (§9.1).
@@ -392,13 +514,13 @@ impl Vm {
             Instr::JumpIfFalse(target) => {
                 let value = task.pop();
                 if !value.truthy() {
-                    task.frame_mut().ip = target;
+                    task.frame_mut().ip = *target;
                 }
             }
             Instr::AndJump(target) => {
                 let keep = !task.stack.last().expect("operand").truthy();
                 if keep {
-                    task.frame_mut().ip = target;
+                    task.frame_mut().ip = *target;
                 } else {
                     task.pop();
                 }
@@ -406,14 +528,14 @@ impl Vm {
             Instr::OrJump(target) => {
                 let keep = task.stack.last().expect("operand").truthy();
                 if keep {
-                    task.frame_mut().ip = target;
+                    task.frame_mut().ip = *target;
                 } else {
                     task.pop();
                 }
             }
 
             Instr::Call { positional, names } => {
-                let args = take_args(task, positional, &names);
+                let args = take_args(task, *positional, names);
                 let callee = task.pop();
                 let Some(bound) = bind_args(&callee, &args) else {
                     return Err(rejected(None, &[callee], &args));
@@ -421,10 +543,10 @@ impl Vm {
                 return self.enter(task, callee, bound);
             }
             Instr::CallName { name, positional, names } => {
-                let args = take_args(task, positional, &names);
+                let args = take_args(task, *positional, names);
                 // Every function bound to the name is a candidate, innermost
                 // first; the first that accepts the call is the one (§3).
-                let candidates = self.candidates(task, &name)?;
+                let candidates = self.candidates(task, name)?;
                 if candidates.is_empty() {
                     return Err(Crash::new(format!("`{name}` is not declared")));
                 }
@@ -432,7 +554,7 @@ impl Vm {
                     .iter()
                     .find_map(|c| bind_args(c, &args).map(|bound| (c.clone(), bound)));
                 let Some((callee, bound)) = chosen else {
-                    return Err(rejected(Some(&name), &candidates, &args));
+                    return Err(rejected(Some(name), &candidates, &args));
                 };
                 return self.enter(task, callee, bound);
             }
@@ -448,13 +570,16 @@ impl Vm {
                 let child = Scope::child(task.scope());
                 task.frame_mut().push_scope(child, false);
             }
-            Instr::PopScope(n) => task.frame_mut().pop_scopes(n),
+            Instr::PopScope(n) => task.frame_mut().pop_scopes(*n),
 
             Instr::IterStart => {
                 let value = deref(&task.pop())?;
                 match value {
                     Value::List(list) => {
-                        list.borrow().shared.set(true);
+                        list.read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .shared
+                            .store(true, Ordering::Relaxed);
                         task.frame_mut().iters.push(IterState { list, index: 0 });
                     }
                     other => {
@@ -468,7 +593,7 @@ impl Vm {
             Instr::IterNext { exit } => {
                 let next = {
                     let iter = task.frame_mut().iters.last_mut().expect("iterator");
-                    let data = iter.list.borrow();
+                    let data = iter.list.read().unwrap_or_else(|e| e.into_inner());
                     if iter.index < data.items.len() {
                         let value = data.items[iter.index].clone();
                         iter.index += 1;
@@ -485,7 +610,7 @@ impl Vm {
                         };
                         task.push(value);
                     }
-                    None => task.frame_mut().ip = exit,
+                    None => task.frame_mut().ip = *exit,
                 }
             }
             Instr::IterDrop => {
@@ -493,8 +618,8 @@ impl Vm {
             }
 
             Instr::SkipIfProvided { index, target } => {
-                if task.frame().provided.get(index) == Some(&true) {
-                    task.frame_mut().ip = target;
+                if task.frame().provided.get(*index) == Some(&true) {
+                    task.frame_mut().ip = *target;
                 }
             }
             Instr::Tick => {
@@ -511,21 +636,52 @@ impl Vm {
             }
 
             Instr::BeginBlock { kind, .. } => {
-                task.blocks.push(BlockCtx { kind, children: Vec::new(), pending: 0, decided: false });
+                let mut sched = self.sched.lock().unwrap_or_else(|e| e.into_inner());
+                let id = sched.next_block;
+                sched.next_block += 1;
+                sched.blocks.insert(
+                    id,
+                    BlockCtx {
+                        kind: *kind,
+                        owner: task.id,
+                        children: Vec::new(),
+                        pending: 0,
+                        decided: false,
+                    },
+                );
+                task.blocks.push(id);
             }
             Instr::SpawnTrail { body, var, column } => {
-                let init = var.map(|name| (name, task.pop()));
-                self.spawn_trail(task, body, init, column);
+                let init = var.clone().map(|name| (name, task.pop()));
+                self.spawn_trail(task, body.clone(), init, *column);
+            }
+            Instr::JumpIfDecided(target) => {
+                let decided = match task.blocks.last() {
+                    Some(id) => {
+                        let sched = self.sched.lock().unwrap_or_else(|e| e.into_inner());
+                        sched.blocks.get(id).map(|b| b.decided).unwrap_or(true)
+                    }
+                    None => false,
+                };
+                if decided {
+                    task.frame_mut().ip = *target;
+                }
             }
             Instr::JoinBlock => {
                 let satisfied = match task.blocks.last() {
-                    Some(block) => match block.kind {
-                        // Control passes `end` only when all have finished (§9.3).
-                        BlockKind::Parallel => block.pending == 0,
-                        // Decided by the first completion; losers are cancelled
-                        // and `end` releases control at once (§9.4).
-                        BlockKind::Race => block.decided || block.pending == 0,
-                    },
+                    Some(id) => {
+                        let mut sched = self.sched.lock().unwrap_or_else(|e| e.into_inner());
+                        match sched.blocks.get(id) {
+                            // Satisfied: drop the block, so a loser finishing
+                            // later finds nothing to report to (§9.4).
+                            Some(block) if block.satisfied() => {
+                                sched.blocks.remove(id);
+                                true
+                            }
+                            Some(_) => false,
+                            None => true,
+                        }
+                    }
                     None => true,
                 };
                 if satisfied {
@@ -537,7 +693,7 @@ impl Vm {
             }
 
             Instr::EndTrail => return Ok(Flow::Stop),
-            Instr::Use(name) => return self.use_module(task, &name),
+            Instr::Use(name) => return self.use_module(task, name),
         }
         Ok(Flow::Next)
     }
@@ -549,12 +705,14 @@ impl Vm {
     fn candidates(&self, task: &Task, name: &str) -> Result<Vec<Value>, Crash> {
         let mut cells: Vec<Cell> = task.scope().all_bindings(name);
         let module = task.frame().module;
-        if let Some(imported) = self.modules[module].imports.borrow().get(name) {
+        if let Some(imported) =
+            self.module(module).imports.read().unwrap_or_else(|e| e.into_inner()).get(name)
+        {
             cells.extend(imported.iter().cloned());
         }
         let mut out = Vec::new();
         for cell in cells {
-            let value = cell.borrow().clone();
+            let value = cell.read().unwrap_or_else(|e| e.into_inner()).clone();
             out.push(match value {
                 Value::Ref(r) => read_place(&r.root, &r.path)?,
                 other => copy_value(&other),
@@ -568,7 +726,7 @@ impl Vm {
 
     /// Enter a call whose arguments are already matched to its parameters.
     fn enter(
-        &mut self,
+        &self,
         task: &mut Task,
         callee: Value,
         bound: Vec<Option<Value>>,
@@ -636,7 +794,7 @@ impl Vm {
 
     /// The builtins of `spec/hydra_stdlib.md`, plus `alive()` (§9.5).
     fn native(
-        &mut self,
+        &self,
         task: &Task,
         native: Native,
         args: Vec<Option<Value>>,
@@ -663,8 +821,8 @@ impl Vm {
             Native::Len => {
                 let value = deref(&arg(0))?;
                 let len = match &value {
-                    Value::List(rc) => rc.borrow().items.len(),
-                    Value::Dict(rc) => rc.borrow().entries.len(),
+                    Value::List(rc) => rc.read().unwrap_or_else(|e| e.into_inner()).items.len(),
+                    Value::Dict(rc) => rc.read().unwrap_or_else(|e| e.into_inner()).entries.len(),
                     // Characters, not bytes: source is UTF-8 (§1).
                     Value::Str(text) => text.chars().count(),
                     other => {
@@ -686,13 +844,14 @@ impl Vm {
         }
     }
 
-    fn pop_frame(&mut self, task: &mut Task, value: Value) -> Flow {
+    fn pop_frame(&self, task: &mut Task, value: Value) -> Flow {
         let frame = task.frames.pop().expect("a frame to return from");
         task.stack.truncate(frame.stack_base);
         if frame.is_module_body {
             // Declarations may have opened shadowing levels, so the namespace
             // a module exports is the scope it *ended* with (§6, §7).
-            self.modules[frame.module].scope = frame.scope().clone();
+            *self.module(frame.module).scope.write().unwrap_or_else(|e| e.into_inner()) =
+                frame.scope().clone();
         }
         match frame.on_return {
             OnReturn::PushValue => {
@@ -735,8 +894,9 @@ impl Vm {
             return Some(cell);
         }
         let module = task.frame().module;
-        let found = self.modules[module].imports.borrow().get(name).and_then(|c| c.first().cloned());
-        found
+        let module = self.module(module);
+        let imports = module.imports.read().unwrap_or_else(|e| e.into_inner());
+        imports.get(name).and_then(|c| c.first().cloned())
     }
 
     fn lookup_ns(&self, task: &Task, module: &str, name: &str) -> Result<Cell, Crash> {
@@ -744,7 +904,8 @@ impl Vm {
             return Err(Crash::new(format!("`::{name}` is a builtin, not a variable")));
         }
         let importer = task.frame().module;
-        let target = self.modules[importer].aliases.borrow().get(module).copied();
+        let target =
+            self.module(importer).aliases.read().unwrap_or_else(|e| e.into_inner()).get(module).copied();
         let Some(target) = target else {
             return Err(Crash::new(format!("no module `{module}` is in scope; `use {module}` first")));
         };
@@ -754,8 +915,7 @@ impl Vm {
                 "`{name}` is private to module `{module}` and cannot be selected"
             )));
         }
-        self.modules[target]
-            .scope
+        self.module_scope(target)
             .get_local(name)
             .ok_or_else(|| Crash::new(format!("module `{module}` has no name `{name}`")))
     }
@@ -780,7 +940,7 @@ impl Vm {
             }
             Root::Ns { module, name } => self.lookup_ns(task, module, name)?,
         };
-        let value = cell.borrow().clone();
+        let value = cell.read().unwrap_or_else(|e| e.into_inner()).clone();
         match value {
             Value::Ref(r) => read_place(&r.root, &r.path),
             other => Ok(copy_value(&other)),
@@ -790,10 +950,10 @@ impl Vm {
     // --- trails -------------------------------------------------------------
 
     fn spawn_trail(
-        &mut self,
+        &self,
         task: &mut Task,
-        body: Rc<Chunk>,
-        init: Option<(Rc<str>, Value)>,
+        body: Arc<Chunk>,
+        init: Option<(Arc<str>, Value)>,
         _column: usize,
     ) {
         // A trail's scope's parent is the block's enclosing scope, so the trail
@@ -803,8 +963,10 @@ impl Vm {
         if let Some((name, value)) = init {
             scope.declare(&name, value);
         }
-        let id = self.next_id;
-        self.next_id += 1;
+        let mut sched = self.sched.lock().unwrap_or_else(|e| e.into_inner());
+        let id = sched.next_id;
+        sched.next_id += 1;
+        let block = task.blocks.last().copied();
         let child = Task {
             id,
             frames: vec![Frame {
@@ -821,22 +983,30 @@ impl Vm {
             }],
             stack: Vec::new(),
             cancel: CancelFlag::child(&task.cancel),
-            parent: Some(task.id),
+            block,
             blocks: Vec::new(),
             state: TaskState::Ready,
             base_depth: 1,
             is_trail: true,
             module: task.module,
         };
-        if let Some(block) = task.blocks.last_mut() {
+        if let Some(block) = block.and_then(|b| sched.blocks.get_mut(&b)) {
             block.children.push(id);
             block.pending += 1;
         }
-        self.tasks.insert(id, child);
-        self.ready.push(id);
+        sched.tasks.insert(id, child);
+        sched.ready.push_back(id);
+        drop(sched);
+        // A parked worker may be the one that runs it.
+        self.wake.notify_one();
     }
 
-    fn finish_task(&mut self, task: Task, result: Result<(), Crash>) {
+    /// Retire a finished trail and wake whoever was waiting on it.
+    ///
+    /// The scheduler lock is already held, so the parent's bookkeeping, the
+    /// sibling cancellations and the wake-up all happen as one step — no other
+    /// worker can see the block half-decided.
+    fn finish_task(&self, sched: &mut Sched, task: Task, result: Result<(), Crash>) {
         if let Err(crash) = result {
             if task.cancel.is_cancelled() {
                 // A crash inside a dead trail is isolated: that trail ends, the
@@ -844,7 +1014,7 @@ impl Vm {
                 if self.options.report_dead_crashes {
                     eprintln!("hydra: crash in a cancelled trail (isolated): {crash}");
                 }
-                self.dead_crashes.push(crash.clone());
+                self.dead_crashes.lock().unwrap_or_else(|e| e.into_inner()).push(crash.clone());
                 if self.options.strict {
                     self.fatal(crash);
                 }
@@ -853,57 +1023,59 @@ impl Vm {
             }
         }
 
-        let Some(parent_id) = task.parent else { return };
+        // The block may already be gone: a `race` releases control at its first
+        // completion and its losers finish afterwards, with nothing to report to.
+        let Some(block_id) = task.block else { return };
+        let Some(block) = sched.blocks.get_mut(&block_id) else { return };
+
+        block.pending -= 1;
         let mut to_cancel: Vec<TaskId> = Vec::new();
-        let mut wake = false;
-        if let Some(parent) = self.tasks.get_mut(&parent_id) {
-            if let Some(block) = parent.blocks.iter_mut().find(|b| b.children.contains(&task.id)) {
-                block.pending -= 1;
-                match block.kind {
-                    BlockKind::Parallel => wake = block.pending == 0,
-                    BlockKind::Race => {
-                        if !block.decided {
-                            block.decided = true;
-                            wake = true;
-                            to_cancel.extend(block.children.iter().filter(|c| **c != task.id));
-                        } else {
-                            wake = block.pending == 0;
-                        }
-                    }
-                }
-            }
-            if wake && parent.state == TaskState::Blocked {
-                parent.state = TaskState::Ready;
-            } else {
-                wake = false;
-            }
+        if block.kind == BlockKind::Race && !block.decided {
+            block.decided = true;
+            to_cancel.extend(block.children.iter().filter(|c| **c != task.id));
         }
+        let owner = block.owner;
+        let satisfied = block.satisfied();
+
         // Losers are cancelled (§9.4); they are never interrupted, so they stop
         // at their own next statement boundary.
         for id in to_cancel {
-            if let Some(sibling) = self.tasks.get(&id) {
+            if let Some(sibling) = sched.tasks.get(&id) {
                 sibling.cancel.cancel();
             }
         }
-        if wake {
-            self.ready.push(parent_id);
+
+        if !satisfied {
+            return;
+        }
+        // The owner may be blocked, or still running on another worker and not
+        // in the table at all. Leaving a token covers both.
+        match sched.tasks.get_mut(&owner) {
+            Some(parent) if parent.state == TaskState::Blocked => {
+                parent.state = TaskState::Ready;
+                sched.ready.push_back(owner);
+            }
+            _ => {
+                sched.wakes.insert(owner);
+            }
         }
     }
 
     /// A crash in a live trail: mark every sibling cancelled, keep the first
     /// diagnostic, and let the program drain (§8).
-    fn fatal(&mut self, crash: Crash) {
-        if self.crash.is_none() {
-            self.crash = Some(crash);
+    fn fatal(&self, crash: Crash) {
+        let mut first = self.crash.lock().unwrap_or_else(|e| e.into_inner());
+        if first.is_none() {
+            *first = Some(crash);
         }
         self.root_cancel.cancel();
     }
 
     // --- modules (§7) -------------------------------------------------------
 
-    fn use_module(&mut self, task: &mut Task, name: &str) -> Result<Flow, Crash> {
+    fn use_module(&self, task: &mut Task, name: &str) -> Result<Flow, Crash> {
         let importer = task.frame().module;
-        let from = self.modules[importer].path.clone();
+        let from = self.module(importer).path.clone();
         let Some(path) = self.resolve_module(name, &from) else {
             return Err(Crash::new(format!(
                 "cannot find module `{name}`: no `{name}.hy` beside {} or on HYDRA_PATH",
@@ -911,7 +1083,8 @@ impl Vm {
             )));
         };
 
-        if let Some(&id) = self.module_by_path.get(&path) {
+        let known = self.module_by_path.lock().unwrap_or_else(|e| e.into_inner()).get(&path).copied();
+        if let Some(id) = known {
             // Executing is skipped if the file is already in scope, but binding
             // always runs — including for a circular import, which resolves to
             // whatever is bound so far (§7).
@@ -925,7 +1098,7 @@ impl Vm {
         let program = parse(&src, &file).map_err(|e| Crash::new(e.to_string()))?;
         let chunk = compile_program(&program).map_err(|e| Crash::new(e.to_string()))?;
         let id = self.new_module(name, path);
-        let scope = self.modules[id].scope.clone();
+        let scope = self.module_scope(id);
         let stack_base = task.stack.len();
         task.frames.push(Frame {
             chunk,
@@ -934,7 +1107,7 @@ impl Vm {
             iters: Vec::new(),
             stack_base,
             module: id,
-            on_return: OnReturn::BindModule { alias: Rc::from(name), module: id },
+            on_return: OnReturn::BindModule { alias: Arc::from(name), module: id },
             call_site: Pos::NONE,
             is_module_body: true,
             provided: Vec::new(),
@@ -959,34 +1132,39 @@ impl Vm {
 
     /// Bind a module's non-private names into the importer, and register the
     /// alias `::` selects through (§7).
-    fn bind_module(&mut self, task: &Task, module: usize, alias: &str) {
+    fn bind_module(&self, task: &Task, module: usize, alias: &str) {
         let importer = task.frame().module;
-        let exported: Vec<(String, Cell)> = self.modules[module]
-            .scope
+        let exported_scope = self.module_scope(module);
+        let exported: Vec<(String, Cell)> = exported_scope
             .names()
             .into_iter()
             .filter(|n| !is_private(n))
-            .filter_map(|n| self.modules[module].scope.get_local(&n).map(|c| (n.to_string(), c)))
+            .filter_map(|n| exported_scope.get_local(&n).map(|c| (n.to_string(), c)))
             .collect();
         {
-            let mut imports = self.modules[importer].imports.borrow_mut();
+            let importer_module = self.module(importer);
+            let mut imports = importer_module.imports.write().unwrap_or_else(|e| e.into_inner());
             for (name, cell) in exported {
                 // Most recent `use` wins, so binding unconditionally is what
                 // makes unqualified lookup match source order (§7). Earlier
                 // ones stay behind it as call candidates.
                 let slot = imports.entry(name).or_default();
-                slot.retain(|existing| !Rc::ptr_eq(existing, &cell));
+                slot.retain(|existing| !Arc::ptr_eq(existing, &cell));
                 slot.insert(0, cell);
             }
         }
-        self.modules[importer].aliases.borrow_mut().insert(alias.to_string(), module);
+        self.module(importer)
+            .aliases
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(alias.to_string(), module);
     }
 }
 
 /// The arguments of one call, split the way the syntax splits them.
 struct CallArgs {
     positional: Vec<Value>,
-    named: Vec<(Rc<str>, Value)>,
+    named: Vec<(Arc<str>, Value)>,
 }
 
 impl CallArgs {
@@ -1002,7 +1180,7 @@ impl CallArgs {
 
 /// Pop one call's arguments: the positional ones, then the named ones in the
 /// order they were written.
-fn take_args(task: &mut Task, positional: usize, names: &[Rc<str>]) -> CallArgs {
+fn take_args(task: &mut Task, positional: usize, names: &[Arc<str>]) -> CallArgs {
     let at = task.stack.len() - names.len();
     let named_values: Vec<Value> = task.stack.split_off(at);
     let at = task.stack.len() - positional;
@@ -1012,7 +1190,7 @@ fn take_args(task: &mut Task, positional: usize, names: &[Rc<str>]) -> CallArgs 
 
 /// What one parameter expects, for a closure or a builtin alike.
 struct ParamSpec {
-    name: Rc<str>,
+    name: Arc<str>,
     has_default: bool,
     by_ref: bool,
 }
@@ -1036,7 +1214,7 @@ fn param_specs(callee: &Value) -> Option<Vec<ParamSpec>> {
                 .iter()
                 .enumerate()
                 .map(|(i, name)| ParamSpec {
-                    name: Rc::from(*name),
+                    name: Arc::from(*name),
                     has_default: i >= native.required(),
                     by_ref: native.by_ref().get(i) == Some(&true),
                 })
@@ -1108,7 +1286,7 @@ fn stem(path: &Path) -> String {
 
 /// Run a source string, the way the CLI and the tests both want it.
 pub fn run_source(src: &str, file: &str, options: Options) -> Result<RunResult, HydraError> {
-    let mut vm = Vm::new(options);
+    let vm = Arc::new(Vm::new(options));
     vm.run_source(src, file)
 }
 
@@ -1117,7 +1295,7 @@ pub fn run_file(path: &Path, options: Options) -> Result<RunResult, HydraError> 
     let src = std::fs::read_to_string(path).map_err(|e| {
         HydraError::new(format!("cannot read {}: {e}", path.display()), &path.display().to_string(), Pos::NONE)
     })?;
-    let mut vm = Vm::new(options);
+    let vm = Arc::new(Vm::new(options));
     let file = path.display().to_string();
     let program = parse(&src, &file)?;
     let chunk = compile_program(&program)?;

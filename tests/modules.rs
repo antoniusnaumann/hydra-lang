@@ -10,8 +10,12 @@ use hydra::vm::{run_source, Options, RunResult};
 /// Run with the fixture directory as the importing file's own directory, so
 /// `use` resolves the way §7 says: same directory first.
 fn run(src: &str) -> RunResult {
-    run_source(src, "tests/fixtures/main.hy", Options { search_path: Vec::new(), ..Options::default() })
-        .expect("compiles")
+    run_source(
+        src,
+        "tests/fixtures/main.hy",
+        Options { search_path: Vec::new(), threads: 1, step_budget: 1, ..Options::default() },
+    )
+    .expect("compiles")
 }
 
 fn eval(src: &str, name: &str) -> String {
@@ -19,7 +23,7 @@ fn eval(src: &str, name: &str) -> String {
     if let Some(crash) = &result.crash {
         panic!("unexpected crash: {crash}");
     }
-    to_text(&result.root_scope.lookup(name).unwrap_or_else(|| panic!("no `{name}`")).borrow().clone())
+    to_text(&result.root_scope.lookup(name).unwrap_or_else(|| panic!("no `{name}`")).read().unwrap().clone())
 }
 
 #[test]

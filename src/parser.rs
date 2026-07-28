@@ -7,7 +7,7 @@
 //! token keeps its original position, so a diagnostic from inside a trail
 //! points at the real source line and not at the transposed one (§4 step 6).
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::ast::*;
 use crate::errors::{HydraError, Pos, Result};
@@ -254,7 +254,7 @@ impl<'a> Parser<'a> {
         self.advance();
         let body = self.parse_block()?;
         let end_pos = self.expect_block_end()?;
-        let def = Rc::new(ClosureDef {
+        let def = Arc::new(ClosureDef {
             name: name.clone(),
             params,
             body: ClosureBody::Block(body),
@@ -946,7 +946,7 @@ impl<'a> Parser<'a> {
             let body = self.parse_block()?;
             let end_pos = self.pos();
             self.expect_kw("end")?;
-            return Ok(Expr::Closure(Rc::new(ClosureDef {
+            return Ok(Expr::Closure(Arc::new(ClosureDef {
                 name: String::new(),
                 params,
                 body: ClosureBody::Block(body),
@@ -955,7 +955,7 @@ impl<'a> Parser<'a> {
             })));
         }
         let expr = self.parse_expr()?;
-        Ok(Expr::Closure(Rc::new(ClosureDef {
+        Ok(Expr::Closure(Arc::new(ClosureDef {
             name: String::new(),
             params,
             body: ClosureBody::Expr(Box::new(expr)),

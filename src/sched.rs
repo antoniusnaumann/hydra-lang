@@ -9,9 +9,9 @@
 //! everything inside it — including a `parallel` block a called function opened
 //! — without broadcasting to anyone.
 
-use std::cell::Cell as StdCell;
 use std::collections::VecDeque;
-use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::ast::BlockKind;
 use crate::compile::Chunk;
@@ -20,37 +20,42 @@ use crate::scope::ScopeRef;
 use crate::value::{ListRef, Value};
 
 pub type TaskId = u64;
+pub type BlockId = u64;
 
 /// A trail's liveness. `alive()` reads it; cancellation sets it (§9.5).
 pub struct CancelFlag {
-    cancelled: StdCell<bool>,
-    parent: Option<Rc<CancelFlag>>,
+    cancelled: AtomicBool,
+    parent: Option<Arc<CancelFlag>>,
 }
 
 impl CancelFlag {
-    pub fn root() -> Rc<CancelFlag> {
-        Rc::new(CancelFlag { cancelled: StdCell::new(false), parent: None })
+    pub fn root() -> Arc<CancelFlag> {
+        Arc::new(CancelFlag { cancelled: AtomicBool::new(false), parent: None })
     }
 
-    pub fn child(parent: &Rc<CancelFlag>) -> Rc<CancelFlag> {
-        Rc::new(CancelFlag { cancelled: StdCell::new(false), parent: Some(parent.clone()) })
+    pub fn child(parent: &Arc<CancelFlag>) -> Arc<CancelFlag> {
+        Arc::new(CancelFlag { cancelled: AtomicBool::new(false), parent: Some(parent.clone()) })
     }
 
     pub fn cancel(&self) {
-        self.cancelled.set(true);
+        self.cancelled.store(true, Ordering::Relaxed);
     }
 
     /// Cancellation propagates: everything inside a dead trail is dead (§9.5).
+    ///
+    /// A trail asks by walking up its own chain, so cancelling one is a single
+    /// store and never a broadcast — which matters more with real threads, not
+    /// less.
     pub fn is_cancelled(&self) -> bool {
-        if self.cancelled.get() {
+        if self.cancelled.load(Ordering::Relaxed) {
             return true;
         }
-        let mut parent = self.parent.clone();
+        let mut parent = self.parent.as_ref();
         while let Some(flag) = parent {
-            if flag.cancelled.get() {
+            if flag.cancelled.load(Ordering::Relaxed) {
                 return true;
             }
-            parent = flag.parent.clone();
+            parent = flag.parent.as_ref();
         }
         false
     }
@@ -68,7 +73,7 @@ pub enum OnReturn {
     /// Ordinary call: the value lands on the caller's operand stack.
     PushValue,
     /// A module body ran; bind its public names into the importer (§7).
-    BindModule { alias: Rc<str>, module: usize },
+    BindModule { alias: Arc<str>, module: usize },
 }
 
 /// One level of a frame's scope stack.
@@ -84,7 +89,7 @@ pub struct ScopeSlot {
 }
 
 pub struct Frame {
-    pub chunk: Rc<Chunk>,
+    pub chunk: Arc<Chunk>,
     pub ip: usize,
     /// Innermost last. Each `PushScope` opens a child of the current one (§6).
     pub scopes: Vec<ScopeSlot>,
@@ -124,12 +129,29 @@ impl Frame {
 }
 
 /// A `parallel` / `race` block opened by a task (§9.3, §9.4).
+///
+/// It lives in the scheduler rather than in the opening task, because a trail
+/// can finish while its parent is being stepped by another worker — and a
+/// parent that is running has been taken out of the task table, so there would
+/// be nowhere to record the completion.
 pub struct BlockCtx {
     pub kind: BlockKind,
+    pub owner: TaskId,
     pub children: Vec<TaskId>,
     pub pending: usize,
     /// Set when a `race` has been decided by its first completion.
     pub decided: bool,
+}
+
+impl BlockCtx {
+    /// Control passes `end` when every trail has finished (§9.3), or at the
+    /// first completion for a `race` (§9.4).
+    pub fn satisfied(&self) -> bool {
+        match self.kind {
+            BlockKind::Parallel => self.pending == 0,
+            BlockKind::Race => self.decided || self.pending == 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,9 +165,11 @@ pub struct Task {
     pub id: TaskId,
     pub frames: Vec<Frame>,
     pub stack: Vec<Value>,
-    pub cancel: Rc<CancelFlag>,
-    pub parent: Option<TaskId>,
-    pub blocks: Vec<BlockCtx>,
+    pub cancel: Arc<CancelFlag>,
+    /// The block this trail belongs to, if it is one.
+    pub block: Option<BlockId>,
+    /// Blocks this task has opened and not yet joined, innermost last.
+    pub blocks: Vec<BlockId>,
     pub state: TaskState,
     /// A trail stops at a statement boundary of *its own* body, never inside a
     /// call it made: an in-flight call runs to the end (§9.5).
