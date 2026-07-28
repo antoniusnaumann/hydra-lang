@@ -5,6 +5,7 @@
 //! formatter (§12).
 
 pub mod ast;
+pub mod check;
 pub mod compile;
 pub mod errors;
 pub mod lexer;

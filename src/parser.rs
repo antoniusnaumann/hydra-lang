@@ -468,6 +468,25 @@ impl<'a> Parser<'a> {
             rows.push(Row { cells: self.split_row(&line)?, line: line_pos.line });
         }
 
+        // `parallel` on one line and `for` on the next is a compound keyword
+        // split across lines (§2). It would otherwise parse as a block whose
+        // single trail holds a loop, and then fail somewhere much less useful.
+        if let Some(first) = rows.first() {
+            if first.cells.len() == 1 {
+                if let Some(token) = first.cells[0].tokens.first() {
+                    if let Tok::Kw(tail @ ("for" | "while")) = token.kind {
+                        return self.err(
+                            format!(
+                                "`{kw} {tail}` is one compound keyword and may not be split across \
+                                 lines; write it on the block's own line"
+                            ),
+                            token.pos,
+                        );
+                    }
+                }
+            }
+        }
+
         let width = rows.first().map(|r| r.cells.len()).unwrap_or(1);
         for row in &rows {
             if row.cells.len() != width {
