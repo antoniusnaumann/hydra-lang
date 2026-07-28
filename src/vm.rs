@@ -65,7 +65,11 @@ pub struct ModuleRt {
     pub path: PathBuf,
     pub scope: ScopeRef,
     /// Names `use` brought in, consulted after the lexical chain (§7).
-    pub imports: RefCell<HashMap<String, Cell>>,
+    ///
+    /// A name can have more than one: the most recent `use` wins for an
+    /// unqualified *read*, and a *call* may fall through to an earlier one that
+    /// accepts it (§3).
+    pub imports: RefCell<HashMap<String, Vec<Cell>>>,
     /// `alias -> module`, for `mod::name`.
     pub aliases: RefCell<HashMap<String, usize>>,
 }
@@ -166,7 +170,7 @@ impl Vm {
                 on_return: OnReturn::PushValue,
                 call_site: Pos::NONE,
                 is_module_body: true,
-                argc: 0,
+                provided: Vec::new(),
             }],
             stack: Vec::new(),
             cancel: self.root_cancel.clone(),
@@ -408,11 +412,29 @@ impl Vm {
                 }
             }
 
-            Instr::Call(argc) => {
-                let at = task.stack.len() - argc;
-                let args: Vec<Value> = task.stack.split_off(at);
+            Instr::Call { positional, names } => {
+                let args = take_args(task, positional, &names);
                 let callee = task.pop();
-                return self.call(task, callee, args);
+                let Some(bound) = bind_args(&callee, &args) else {
+                    return Err(rejected(None, &[callee], &args));
+                };
+                return self.enter(task, callee, bound);
+            }
+            Instr::CallName { name, positional, names } => {
+                let args = take_args(task, positional, &names);
+                // Every function bound to the name is a candidate, innermost
+                // first; the first that accepts the call is the one (§3).
+                let candidates = self.candidates(task, &name)?;
+                if candidates.is_empty() {
+                    return Err(Crash::new(format!("`{name}` is not declared")));
+                }
+                let chosen = candidates
+                    .iter()
+                    .find_map(|c| bind_args(c, &args).map(|bound| (c.clone(), bound)));
+                let Some((callee, bound)) = chosen else {
+                    return Err(rejected(Some(&name), &candidates, &args));
+                };
+                return self.enter(task, callee, bound);
             }
             Instr::Return => {
                 let value = task.pop();
@@ -471,7 +493,7 @@ impl Vm {
             }
 
             Instr::SkipIfProvided { index, target } => {
-                if index < task.frame().argc {
+                if task.frame().provided.get(index) == Some(&true) {
                     task.frame_mut().ip = target;
                 }
             }
@@ -522,36 +544,66 @@ impl Vm {
 
     // --- calls and frames ---------------------------------------------------
 
-    fn call(&mut self, task: &mut Task, callee: Value, args: Vec<Value>) -> Result<Flow, Crash> {
+    /// Every function the name could mean, innermost binding first, then the
+    /// most recent `use` first, then the builtin (§3, §7).
+    fn candidates(&self, task: &Task, name: &str) -> Result<Vec<Value>, Crash> {
+        let mut cells: Vec<Cell> = task.scope().all_bindings(name);
+        let module = task.frame().module;
+        if let Some(imported) = self.modules[module].imports.borrow().get(name) {
+            cells.extend(imported.iter().cloned());
+        }
+        let mut out = Vec::new();
+        for cell in cells {
+            let value = cell.borrow().clone();
+            out.push(match value {
+                Value::Ref(r) => read_place(&r.root, &r.path)?,
+                other => copy_value(&other),
+            });
+        }
+        if let Some(native) = Native::lookup(name) {
+            out.push(Value::Native(native));
+        }
+        Ok(out)
+    }
+
+    /// Enter a call whose arguments are already matched to its parameters.
+    fn enter(
+        &mut self,
+        task: &mut Task,
+        callee: Value,
+        bound: Vec<Option<Value>>,
+    ) -> Result<Flow, Crash> {
+        let specs = param_specs(&callee).expect("a callee that bound its arguments");
+        // `&name` in the signature says the caller must mark it, and the caller
+        // is the only one who can (§5.1). This is checked *after* resolution,
+        // deliberately: a missing `&` is an error to report, not a reason to
+        // quietly pick a different function.
+        for (spec, value) in specs.iter().zip(bound.iter()) {
+            if spec.by_ref {
+                match value {
+                    Some(Value::Ref(_)) => {}
+                    Some(_) => {
+                        return Err(Crash::new(format!(
+                            "`{}` takes `{}` by reference: write `&…` at the call site, \
+                             or it is handed a copy",
+                            signature_of(&callee),
+                            spec.name
+                        )))
+                    }
+                    None => {}
+                }
+            }
+        }
+
         match callee {
             Value::Fn(closure) => {
-                let (required, total) = (closure.required(), closure.params.len());
-                if args.len() < required || args.len() > total {
-                    let wanted = if required == total {
-                        format!("{required}")
-                    } else {
-                        format!("{required} to {total}")
-                    };
-                    return Err(Crash::new(format!(
-                        "`{}` takes {wanted} argument(s), got {}",
-                        closure.signature(),
-                        args.len()
-                    )));
-                }
                 let scope = Scope::child(&closure.scope);
-                let argc = args.len();
-                for (param, arg) in closure.params.iter().zip(args) {
-                    // `&name` in the signature says the caller must mark it, and
-                    // the caller is the only one who can (§5.1). Without this,
-                    // a mutating helper called by value is a silent no-op.
-                    if param.by_ref && !matches!(arg, Value::Ref(_)) {
-                        return Err(Crash::new(format!(
-                            "`{}` takes `{}` by reference: write `&…` at the call site",
-                            closure.signature(),
-                            param.name
-                        )));
+                let mut provided = vec![false; closure.params.len()];
+                for (i, (param, value)) in closure.params.iter().zip(bound).enumerate() {
+                    if let Some(value) = value {
+                        scope.declare(&param.name, value);
+                        provided[i] = true;
                     }
-                    scope.declare(&param.name, arg);
                 }
                 let call_site = {
                     let frame = task.frame();
@@ -569,33 +621,12 @@ impl Vm {
                     on_return: OnReturn::PushValue,
                     call_site,
                     is_module_body: false,
-                    argc,
+                    provided,
                 });
                 Ok(Flow::Next)
             }
             Value::Native(native) => {
-                if args.len() < native.required() || args.len() > native.total() {
-                    return Err(Crash::new(format!(
-                        "`{}` takes {} argument(s), got {}",
-                        native.signature(),
-                        if native.required() == native.total() {
-                            format!("{}", native.required())
-                        } else {
-                            format!("{} to {}", native.required(), native.total())
-                        },
-                        args.len()
-                    )));
-                }
-                for (i, arg) in args.iter().enumerate() {
-                    if native.by_ref().get(i) == Some(&true) && !matches!(arg, Value::Ref(_)) {
-                        return Err(Crash::new(format!(
-                            "`{}` takes its first argument by reference: \
-                             write `&…` at the call site, or the append happens to a copy",
-                            native.signature()
-                        )));
-                    }
-                }
-                let value = self.native(task, native, args)?;
+                let value = self.native(task, native, bound)?;
                 task.push(value);
                 Ok(Flow::Next)
             }
@@ -604,15 +635,20 @@ impl Vm {
     }
 
     /// The builtins of `spec/hydra_stdlib.md`, plus `alive()` (§9.5).
-    fn native(&mut self, task: &Task, native: Native, args: Vec<Value>) -> Result<Value, Crash> {
-        let arg = |i: usize| args.get(i).cloned().unwrap_or_else(Value::null);
+    fn native(
+        &mut self,
+        task: &Task,
+        native: Native,
+        args: Vec<Option<Value>>,
+    ) -> Result<Value, Crash> {
+        let arg = |i: usize| args.get(i).cloned().flatten().unwrap_or_else(Value::null);
         match native {
             // Dynamic, no token threading, `.true` outside any trail — and
             // false during crash shutdown too (§9.5).
             Native::Alive => Ok(boolean(!task.cancel.is_cancelled())),
             Native::Print => {
-                let end = match args.get(1) {
-                    Some(end) => to_text(&deref(end)?),
+                let end = match args.get(1).cloned().flatten() {
+                    Some(end) => to_text(&deref(&end)?),
                     None => "\n".to_string(),
                 };
                 let mut out = std::io::stdout().lock();
@@ -699,7 +735,7 @@ impl Vm {
             return Some(cell);
         }
         let module = task.frame().module;
-        let found = self.modules[module].imports.borrow().get(name).cloned();
+        let found = self.modules[module].imports.borrow().get(name).and_then(|c| c.first().cloned());
         found
     }
 
@@ -781,7 +817,7 @@ impl Vm {
                 on_return: OnReturn::PushValue,
                 call_site: Pos::NONE,
                 is_module_body: false,
-                argc: 0,
+                provided: Vec::new(),
             }],
             stack: Vec::new(),
             cancel: CancelFlag::child(&task.cancel),
@@ -901,7 +937,7 @@ impl Vm {
             on_return: OnReturn::BindModule { alias: Rc::from(name), module: id },
             call_site: Pos::NONE,
             is_module_body: true,
-            argc: 0,
+            provided: Vec::new(),
         });
         Ok(Flow::Next)
     }
@@ -936,12 +972,134 @@ impl Vm {
             let mut imports = self.modules[importer].imports.borrow_mut();
             for (name, cell) in exported {
                 // Most recent `use` wins, so binding unconditionally is what
-                // makes unqualified lookup match source order (§7).
-                imports.insert(name, cell);
+                // makes unqualified lookup match source order (§7). Earlier
+                // ones stay behind it as call candidates.
+                let slot = imports.entry(name).or_default();
+                slot.retain(|existing| !Rc::ptr_eq(existing, &cell));
+                slot.insert(0, cell);
             }
         }
         self.modules[importer].aliases.borrow_mut().insert(alias.to_string(), module);
     }
+}
+
+/// The arguments of one call, split the way the syntax splits them.
+struct CallArgs {
+    positional: Vec<Value>,
+    named: Vec<(Rc<str>, Value)>,
+}
+
+impl CallArgs {
+    fn describe(&self) -> String {
+        let named: Vec<String> = self.named.iter().map(|(n, _)| format!("{n} =")).collect();
+        if named.is_empty() {
+            format!("{} argument(s)", self.positional.len())
+        } else {
+            format!("{} positional and {}", self.positional.len(), named.join(", "))
+        }
+    }
+}
+
+/// Pop one call's arguments: the positional ones, then the named ones in the
+/// order they were written.
+fn take_args(task: &mut Task, positional: usize, names: &[Rc<str>]) -> CallArgs {
+    let at = task.stack.len() - names.len();
+    let named_values: Vec<Value> = task.stack.split_off(at);
+    let at = task.stack.len() - positional;
+    let positional = task.stack.split_off(at);
+    CallArgs { positional, named: names.iter().cloned().zip(named_values).collect() }
+}
+
+/// What one parameter expects, for a closure or a builtin alike.
+struct ParamSpec {
+    name: Rc<str>,
+    has_default: bool,
+    by_ref: bool,
+}
+
+fn param_specs(callee: &Value) -> Option<Vec<ParamSpec>> {
+    match callee {
+        Value::Fn(closure) => Some(
+            closure
+                .params
+                .iter()
+                .map(|p| ParamSpec {
+                    name: p.name.clone(),
+                    has_default: p.has_default,
+                    by_ref: p.by_ref,
+                })
+                .collect(),
+        ),
+        Value::Native(native) => Some(
+            native
+                .param_names()
+                .iter()
+                .enumerate()
+                .map(|(i, name)| ParamSpec {
+                    name: Rc::from(*name),
+                    has_default: i >= native.required(),
+                    by_ref: native.by_ref().get(i) == Some(&true),
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+fn signature_of(callee: &Value) -> String {
+    match callee {
+        Value::Fn(closure) => closure.signature(),
+        Value::Native(native) => native.signature().to_string(),
+        other => other.kind().to_string(),
+    }
+}
+
+/// Match a call's arguments to a candidate's parameters.
+///
+/// `None` means the candidate **rejects** the call — too many arguments, a name
+/// it does not have, a parameter given twice, or one it needs and did not get.
+/// That is what makes the next candidate worth trying (§3).
+fn bind_args(callee: &Value, args: &CallArgs) -> Option<Vec<Option<Value>>> {
+    let specs = param_specs(callee)?;
+    if args.positional.len() > specs.len() {
+        return None;
+    }
+    let mut bound: Vec<Option<Value>> = vec![None; specs.len()];
+    for (i, value) in args.positional.iter().enumerate() {
+        bound[i] = Some(value.clone());
+    }
+    for (name, value) in &args.named {
+        let index = specs.iter().position(|s| s.name.as_ref() == name.as_ref())?;
+        if bound[index].is_some() {
+            return None;
+        }
+        bound[index] = Some(value.clone());
+    }
+    for (spec, value) in specs.iter().zip(bound.iter()) {
+        if value.is_none() && !spec.has_default {
+            return None;
+        }
+    }
+    Some(bound)
+}
+
+/// The crash for a call nothing accepted, listing what was tried (§8).
+fn rejected(name: Option<&str>, candidates: &[Value], args: &CallArgs) -> Crash {
+    let callable: Vec<String> =
+        candidates.iter().filter(|c| param_specs(c).is_some()).map(signature_of).collect();
+    if callable.is_empty() {
+        let kind = candidates.first().map(|c| c.kind()).unwrap_or("value");
+        return Crash::new(format!("cannot call a {kind}"));
+    }
+    let called = match name {
+        Some(name) => format!("`{name}`"),
+        None => "this function".to_string(),
+    };
+    Crash::new(format!(
+        "no {called} accepts {}: tried {}",
+        args.describe(),
+        callable.join(", ")
+    ))
 }
 
 fn stem(path: &Path) -> String {

@@ -46,16 +46,24 @@ struct Signature {
     total: usize,
     /// Which parameters the call must mark with `&` (§5.1).
     by_ref: Vec<bool>,
+    /// Parameter names, so a named argument can be matched.
+    names: Vec<String>,
     label: String,
 }
 
 impl Signature {
     fn of(def: &ClosureDef, name: &str) -> Signature {
+        let params: Vec<String> = def
+            .params
+            .iter()
+            .map(|p| format!("{}{}", if p.by_ref { "&" } else { "" }, p.name))
+            .collect();
         Signature {
             required: def.required(),
             total: def.params.len(),
             by_ref: def.params.iter().map(|p| p.by_ref).collect(),
-            label: name.to_string(),
+            names: def.params.iter().map(|p| p.name.clone()).collect(),
+            label: format!("{name}({})", params.join(", ")),
         }
     }
 
@@ -64,16 +72,40 @@ impl Signature {
             required: native.required(),
             total: native.total(),
             by_ref: native.by_ref().to_vec(),
+            names: native.param_names().iter().map(|n| n.to_string()).collect(),
             label: native.signature().to_string(),
         }
     }
 
-    fn wanted(&self) -> String {
-        if self.required == self.total {
-            format!("{}", self.required)
-        } else {
-            format!("{} to {}", self.required, self.total)
+    /// Match a call's arguments to these parameters, or `None` if this
+    /// signature rejects the call — the same rule the runtime applies (§3).
+    fn bind<'a>(&self, args: &'a [Arg]) -> Option<Vec<Option<&'a Arg>>> {
+        let mut bound: Vec<Option<&Arg>> = vec![None; self.total];
+        let mut next = 0;
+        for arg in args {
+            match &arg.name {
+                None => {
+                    if next >= self.total {
+                        return None;
+                    }
+                    bound[next] = Some(arg);
+                    next += 1;
+                }
+                Some(name) => {
+                    let index = self.names.iter().position(|n| n == name)?;
+                    if bound[index].is_some() {
+                        return None;
+                    }
+                    bound[index] = Some(arg);
+                }
+            }
         }
+        for (index, slot) in bound.iter().enumerate() {
+            if slot.is_none() && index < self.required {
+                return None;
+            }
+        }
+        Some(bound)
     }
 }
 
@@ -155,6 +187,9 @@ struct Checker<'a> {
     /// Names ever written to or `&`-referenced anywhere in the file. Coarse on
     /// purpose: it only ever *suppresses* diagnostics.
     mutated: HashSet<String>,
+    /// Names declared more than once. A call one of them rejects goes to the
+    /// next (§3), so no single signature is guaranteed.
+    overloaded: HashSet<String>,
     read: HashSet<String>,
     externs: HashSet<String>,
     modules: HashMap<String, ModuleInfo>,
@@ -178,6 +213,7 @@ impl<'a> Checker<'a> {
             trail_depth: 0,
             race_depth: 0,
             mutated: HashSet::new(),
+            overloaded: HashSet::new(),
             read: HashSet::new(),
             externs: options.externs.iter().cloned().collect(),
             modules: HashMap::new(),
@@ -205,7 +241,7 @@ impl<'a> Checker<'a> {
     // --- entry point --------------------------------------------------------
 
     fn run(&mut self, program: &Program) {
-        collect_mutated(&program.body, &mut self.mutated);
+        collect_names(&program.body, &mut self.mutated, &mut self.overloaded);
         self.load_modules(&program.body);
         self.push_scope();
         self.hoist(&program.body);
@@ -740,7 +776,7 @@ impl<'a> Checker<'a> {
             Expr::Call { callee, args, pos } => {
                 self.expr(callee);
                 for arg in args {
-                    self.expr(arg);
+                    self.expr(&arg.value);
                 }
                 self.check_call(callee, args, *pos);
             }
@@ -879,19 +915,27 @@ impl<'a> Checker<'a> {
         );
     }
 
-    /// Arity mismatch, and a missing `&`, against a statically known function
-    /// (§11, §5.1).
-    fn check_call(&mut self, callee: &Expr, args: &[Expr], pos: Pos) {
+    /// A call nothing accepts, and a missing `&` on the one that does
+    /// (§11, §5.1, §3).
+    fn check_call(&mut self, callee: &Expr, args: &[Arg], pos: Pos) {
         let (name, signature) = match callee {
             Expr::Name { name, .. } => {
                 let local = self.lookup(name).and_then(|b| b.arity.clone());
-                let imported = self.imports.get(name).and_then(|(_, a)| a.clone());
-                let known = if self.lookup(name).is_some() || self.imports.contains_key(name) {
-                    local.or(imported)
-                } else if self.names_are_knowable {
-                    // Only when every `use` resolved: an unresolvable module
-                    // could export a `push` of its own, and §11 reports what is
-                    // guaranteed, not what is likely.
+                let has_local = self.lookup(name).is_some();
+                let has_import = self.imports.contains_key(name);
+                // Only when every `use` resolved: an unresolvable module could
+                // export a `push` of its own, and §11 reports what is
+                // guaranteed, not what is likely.
+                let has_native = self.names_are_knowable && Native::lookup(name).is_some();
+
+                // With more than one candidate, a call this one rejects simply
+                // goes to the next (§3), so nothing here is guaranteed.
+                if usize::from(has_local) + usize::from(has_import) + usize::from(has_native) > 1 {
+                    return;
+                }
+                let known = if has_local || has_import {
+                    local.or_else(|| self.imports.get(name).and_then(|(_, a)| a.clone()))
+                } else if has_native {
                     Native::lookup(name).map(Signature::native)
                 } else {
                     None
@@ -914,33 +958,39 @@ impl<'a> Checker<'a> {
             _ => return,
         };
         let Some(signature) = signature else { return };
-        if self.mutated.contains(&name) {
+        // A name that is written to could hold anything by the time it is
+        // called, and a shadowed one has candidates this does not model.
+        if self.mutated.contains(&name) || self.overloaded.contains(&name) {
             return;
         }
-        if args.len() < signature.required || args.len() > signature.total {
+
+        let Some(bound) = signature.bind(args) else {
             self.error(
                 format!(
-                    "`{name}` takes {} argument(s), called with {}",
-                    signature.wanted(),
-                    args.len()
+                    "`{name}` does not accept this call: it is `{}`",
+                    signature.label
                 ),
                 pos,
-                "arity",
+                "no-matching-call",
             );
             return;
-        }
+        };
+
         // A by-reference parameter passed by value is a guaranteed crash — and
         // before it was one, it was a silent no-op (§5.1).
-        for (i, arg) in args.iter().enumerate() {
-            if signature.by_ref.get(i) == Some(&true) && !matches!(arg, Expr::Ref { .. }) {
+        for (index, arg) in bound.iter().enumerate() {
+            let Some(arg) = arg else { continue };
+            if signature.by_ref.get(index) == Some(&true)
+                && !matches!(arg.value, Expr::Ref { .. })
+            {
                 self.error(
                     format!(
-                        "`{}` takes argument {} by reference; write `&` before it, \
+                        "`{}` takes `{}` by reference; write `&` before it, \
                          or it is handed a copy",
                         signature.label,
-                        i + 1
+                        signature.names.get(index).cloned().unwrap_or_default()
                     ),
-                    arg.pos(),
+                    arg.pos,
                     "missing-reference",
                 );
             }
@@ -950,12 +1000,14 @@ impl<'a> Checker<'a> {
 
 // --- pre-passes -------------------------------------------------------------
 
-/// Every name that is written to or `&`-referenced anywhere in the file.
+/// Two coarse, file-wide sets: names that are written to or `&`-referenced, and
+/// names declared more than once.
 ///
-/// Value semantics are what make this worth doing: passing a value to a
-/// function cannot change it, so only these two things can move a binding out
-/// from under an assumption.
-fn collect_mutated(body: &[Stmt], out: &mut HashSet<String>) {
+/// Value semantics are what make the first worth doing: passing a value to a
+/// function cannot change it, so only those two things can move a binding out
+/// from under an assumption. The second is about resolution — a name declared
+/// twice has two candidates, and a call one rejects goes to the other (§3).
+fn collect_names(body: &[Stmt], out: &mut HashSet<String>, overloaded: &mut HashSet<String>) {
     let mut declared: HashSet<String> = HashSet::new();
     walk_stmts(body, &mut |stmt| match stmt {
         Stmt::Assign { target, .. } => {
@@ -963,10 +1015,10 @@ fn collect_mutated(body: &[Stmt], out: &mut HashSet<String>) {
                 out.insert(name.clone());
             }
         }
-        // Two declarations of one name in a file: the second shadows, so
-        // nothing about the first is safe to assume elsewhere.
-        Stmt::Decl { name, .. } if !declared.insert(name.clone()) => {
-            out.insert(name.clone());
+        Stmt::Decl { name, .. } | Stmt::FnDecl { name, .. }
+            if !declared.insert(name.clone()) =>
+        {
+            overloaded.insert(name.clone());
         }
         _ => {}
     });
@@ -1117,7 +1169,7 @@ fn walk_expr(expr: &Expr, f: &mut dyn FnMut(&Expr)) {
         Expr::Call { callee, args, .. } => {
             walk_expr(callee, f);
             for arg in args {
-                walk_expr(arg, f);
+                walk_expr(&arg.value, f);
             }
         }
         Expr::Unary { operand, .. } => walk_expr(operand, f),

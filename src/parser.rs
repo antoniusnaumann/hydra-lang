@@ -271,11 +271,20 @@ impl<'a> Parser<'a> {
         if !self.peek().is_op(")") {
             loop {
                 let by_ref = self.eat_op("&");
+                if matches!(self.peek().kind, Tok::Kw(_)) {
+                    return self.err(
+                        format!(
+                            "`{}` is a keyword and cannot be a parameter name",
+                            self.peek().text()
+                        ),
+                        self.pos(),
+                    );
+                }
                 let (name, pos) = self.expect_ident("a parameter name")?;
                 if params.iter().any(|p| p.name == name) {
                     return self.err(format!("duplicate parameter `{name}`"), pos);
                 }
-                let default = if self.eat_op(":=") { Some(self.parse_expr()?) } else { None };
+                let default = if self.eat_op("=") { Some(self.parse_expr()?) } else { None };
 
                 if by_ref && default.is_some() {
                     return self.err(
@@ -752,15 +761,7 @@ impl<'a> Parser<'a> {
             let pos = self.pos();
             if self.peek().is_op("(") {
                 self.advance();
-                let mut args = Vec::new();
-                if !self.peek().is_op(")") {
-                    loop {
-                        args.push(self.parse_expr()?);
-                        if !self.eat_op(",") {
-                            break;
-                        }
-                    }
-                }
+                let args = self.parse_args()?;
                 self.expect_op(")")?;
                 expr = Expr::Call { callee: Box::new(expr), args, pos };
                 continue;
@@ -800,6 +801,53 @@ impl<'a> Parser<'a> {
             break;
         }
         Ok(expr)
+    }
+
+    /// `arg = [ ident "=" ] expr`. A named argument fills the parameter it
+    /// names; they come after the positional ones.
+    fn parse_args(&mut self) -> Result<Vec<Arg>> {
+        let mut args: Vec<Arg> = Vec::new();
+        if self.peek().is_op(")") {
+            return Ok(args);
+        }
+        loop {
+            let pos = self.pos();
+            // `name = value` is a named argument. There is no ambiguity with an
+            // assignment: assignment is a statement, never an expression (§3).
+            // A keyword cannot be a name, so say that rather than "expected an
+            // expression" when someone writes `f(end = 1)`.
+            if matches!(self.peek().kind, Tok::Kw(_)) && self.peek_at(1).is_op("=") {
+                return self.err(
+                    format!(
+                        "`{}` is a keyword and cannot be an argument name",
+                        self.peek().text()
+                    ),
+                    pos,
+                );
+            }
+            let named = self.peek().ident().is_some() && self.peek_at(1).is_op("=");
+            if named {
+                let (name, _) = self.expect_ident("an argument name")?;
+                self.expect_op("=")?;
+                let value = self.parse_expr()?;
+                if args.iter().any(|a| a.name.as_deref() == Some(name.as_str())) {
+                    return self.err(format!("`{name}` is given twice in this call"), pos);
+                }
+                args.push(Arg { name: Some(name), value, pos });
+            } else {
+                if args.iter().any(|a| a.name.is_some()) {
+                    return self.err(
+                        "a positional argument cannot follow a named one",
+                        pos,
+                    );
+                }
+                args.push(Arg { name: None, value: self.parse_expr()?, pos });
+            }
+            if !self.eat_op(",") {
+                break;
+            }
+        }
+        Ok(args)
     }
 
     fn parse_primary(&mut self) -> Result<Expr> {

@@ -61,3 +61,14 @@ print("winner: \(winner)")
 
 // `alive()` is dynamic: any function can ask, at any depth (§9.5).
 print("outside a trail, alive() is \(alive())")
+
+// A name can mean several functions: a call takes the first that accepts its
+// argument count and names, so shadowing one shape leaves the others reachable.
+fn describe(region)
+	return "region \(region)"
+end
+describe := fn(region, detail) "region \(region) (\(detail))"
+
+print(describe("eu"))
+print(describe("eu", "primary"))
+print(describe(detail = "backup", region = "ap"))

@@ -56,14 +56,14 @@ bump(d)
 
 #[test]
 fn a_default_is_evaluated_in_the_functions_own_scope() {
-    assert_eq!(eval("fn f(a, b := 10)\n\treturn a + b\nend\nx := f(1)\n", "x"), "11");
-    assert_eq!(eval("fn f(a, b := 10)\n\treturn a + b\nend\nx := f(1, 2)\n", "x"), "3");
+    assert_eq!(eval("fn f(a, b = 10)\n\treturn a + b\nend\nx := f(1)\n", "x"), "11");
+    assert_eq!(eval("fn f(a, b = 10)\n\treturn a + b\nend\nx := f(1, 2)\n", "x"), "3");
     // A later default may refer to an earlier parameter.
-    assert_eq!(eval("fn f(a, b := a * 2)\n\treturn b\nend\nx := f(4)\n", "x"), "8");
+    assert_eq!(eval("fn f(a, b = a * 2)\n\treturn b\nend\nx := f(4)\n", "x"), "8");
     // Defaults are evaluated per call, not once.
     let src = "
 n := 0
-fn tick(v := 1)
+fn tick(v = 1)
 \tn = n + v
 end
 tick()
@@ -72,14 +72,118 @@ tick(5)
 ";
     assert_eq!(eval(src, "n"), "7");
     // Closures take defaults too.
-    assert_eq!(eval("f := fn(a := 3) a\nx := f()\n", "x"), "3");
+    assert_eq!(eval("f := fn(a = 3) a\nx := f()\n", "x"), "3");
 }
 
 #[test]
-fn arity_is_a_range_once_there_are_defaults() {
-    assert!(crash_of("fn f(a, b := 1)\nend\nf()\n").contains("takes 1 to 2"));
-    assert!(crash_of("fn f(a, b := 1)\nend\nf(1, 2, 3)\n").contains("takes 1 to 2"));
-    assert!(crash_of("fn f(a)\nend\nf()\n").contains("takes 1 argument"));
+fn arguments_can_be_named() {
+    assert_eq!(eval("fn f(a, b)\n\treturn a - b\nend\nx := f(b = 1, a = 5)\n", "x"), "4");
+    assert_eq!(eval("fn f(a, b)\n\treturn a - b\nend\nx := f(5, b = 1)\n", "x"), "4");
+    // Naming a later parameter leaves an earlier default in place, which a
+    // positional call cannot do.
+    let src = "
+fn f(a, b = 10, c = 100)
+\treturn a + b + c
+end
+x := f(1, c = 2)
+";
+    assert_eq!(eval(src, "x"), "13");
+    // The builtin's parameter is `terminator`, because `end` is a keyword.
+    assert_eq!(eval("x := print(\"hi\", terminator = \"\")\n", "x"), ".null");
+    assert_eq!(eval("rows := []\nn := push(value = 1, list = &rows)\n", "n"), "1");
+}
+
+// --- resolution (§3) --------------------------------------------------------
+
+#[test]
+fn a_call_a_candidate_rejects_goes_to_the_next() {
+    // Shadowing a function with one of a different shape does not hide the
+    // original: the call picks the first candidate that accepts it.
+    let src = "
+fn f(a)
+\treturn \"one\"
+end
+f := fn(a, b) \"two\"
+one := f(1)
+two := f(1, 2)
+";
+    assert_eq!(eval(src, "one"), "one");
+    assert_eq!(eval(src, "two"), "two");
+}
+
+#[test]
+fn argument_names_take_part_in_resolution() {
+    let src = "
+fn f(width)
+\treturn \"by width\"
+end
+f := fn(height) \"by height\"
+w := f(width = 1)
+h := f(height = 1)
+";
+    assert_eq!(eval(src, "w"), "by width");
+    assert_eq!(eval(src, "h"), "by height");
+}
+
+#[test]
+fn a_builtin_is_the_last_candidate() {
+    // A local that rejects the call falls through to the builtin.
+    let src = "
+len := fn(a, b) \"local\"
+theirs := len(1, 2)
+builtin := len(\"abc\")
+";
+    assert_eq!(eval(src, "theirs"), "local");
+    assert_eq!(eval(src, "builtin"), "3");
+}
+
+#[test]
+fn only_when_no_candidate_accepts_is_it_a_crash() {
+    let crash = crash_of("fn f(a)\nend\nf := fn(a, b) a\nx := f(1, 2, 3)\n");
+    assert!(crash.contains("no `f` accepts"), "{crash}");
+    // The message lists what was tried.
+    assert!(crash.contains("f(a, b)") && crash.contains("f(a)"), "{crash}");
+}
+
+#[test]
+fn a_missing_reference_is_reported_not_resolved_around() {
+    // `&` is not part of accepting a call, so a missing one crashes with its
+    // own message instead of quietly selecting some other function.
+    let src = "
+fn push(target, image)
+\treturn \"module-ish\"
+end
+rows := []
+x := ::push(rows, 1)
+";
+    assert!(crash_of(src).contains("by reference"), "{}", crash_of(src));
+}
+
+#[test]
+fn resolution_reaches_past_an_import_to_an_earlier_one() {
+    // `use` keeps every candidate: the most recent wins a read, and a call it
+    // rejects falls through to the earlier module.
+    let src = "
+use http
+use shadows
+theirs := push(\"host\", \"img\")
+fetched := fetch(\"url\")
+";
+    let result = run_source(src, "tests/fixtures/main.hy", Options::default()).expect("compiles");
+    assert!(result.crash.is_none(), "{:?}", result.crash);
+    let read =
+        |name: &str| to_text(&result.root_scope.lookup(name).expect("binding").borrow().clone());
+    assert_eq!(read("theirs"), "pushed img to host");
+    assert_eq!(read("fetched"), "fetched url");
+}
+
+#[test]
+fn a_default_widens_what_a_function_accepts() {
+    assert_eq!(eval("fn f(a, b = 1)\n\treturn b\nend\nx := f(1)\n", "x"), "1");
+    assert_eq!(eval("fn f(a, b = 1)\n\treturn b\nend\nx := f(1, 2)\n", "x"), "2");
+    // Outside that range nothing accepts the call.
+    assert!(crash_of("fn f(a, b = 1)\nend\nf()\n").contains("no `f` accepts"));
+    assert!(crash_of("fn f(a, b = 1)\nend\nf(1, 2, 3)\n").contains("no `f` accepts"));
 }
 
 // --- the builtins -----------------------------------------------------------

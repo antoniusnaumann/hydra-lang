@@ -14,6 +14,8 @@ Companion to the implementation spec.
 | Assignment | `x = 2` | Crashes if the name does not exist |
 | Namespace | `json::decode` | Breaks an import clash |
 | Builtin | `::push` | The language's own namespace, past any shadow |
+| Default | `fn f(a, b = 1)` | Defaults come after the parameters without one |
+| Named argument | `f(1, b = 2)` | After the positional ones |
 | Deep equality | `a == b` | Identity first, then structural walk |
 | Identity | `a === b`, `a !== b` | By identity |
 | Reference | `f(&a)`, `{ .b : &a }` | Opt out of copying |
@@ -83,6 +85,11 @@ end
 ```
 
 Closures capture by reference.
+
+A name can mean several functions — `:=` shadows, imports stack, builtins sit
+under both. A call tries them innermost-first and takes **the first that accepts
+the argument count and names**; only when none does is it a crash. A missing `&`
+is reported against the one that accepted, never resolved around.
 
 ---
 

@@ -371,8 +371,10 @@ r := multi(4)
 }
 
 #[test]
-fn arity_mismatch_crashes() {
-    assert!(crash_of("fn f(a)\nend\nf(1, 2)\n").contains("takes 1 argument"));
+fn a_call_no_candidate_accepts_crashes() {
+    let crash = crash_of("fn f(a)\nend\nf(1, 2)\n");
+    assert!(crash.contains("no `f` accepts"), "{crash}");
+    assert!(crash.contains("f(a)"), "the crash names what it tried: {crash}");
 }
 
 #[test]

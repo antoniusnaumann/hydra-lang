@@ -27,32 +27,33 @@ resolved.
 
 **[D]** They are ordinary values. `f := print` binds it, `f("hi")` calls it.
 
-**[D]** Arity is a range when a parameter has a default (§3), and exact
-otherwise. Filling is positional: there are no named arguments at call sites,
-so `print(v, "")` is how the second argument is supplied.
+**[D]** Arguments may be named (§3): `print(v, terminator = "")`. And because a
+call takes the first candidate that accepts it, shadowing one of these with a
+function of a different shape leaves the builtin reachable for the calls the
+shadow rejects.
 
 ---
 
-## 2. `print(value, end := "\n")` → `.null`
+## 2. `print(value, terminator = "\n")` → `.null`
 
 **[D]** Writes the **text form** of `value` — the same rendering `\(value)`
 produces (§1) — followed by `end`, to standard output.
 
-`end` defaults to a newline, so `print(v)` writes a line and `print(v, "")`
-writes without one:
+It defaults to a newline, so `print(v)` writes a line and `print(v, "")` writes
+without one:
 
 ```hydra
-print("no newline", "")
+print("no newline", terminator = "")
 print(" — and now one")
 ```
+
+**[D]** The parameter is `terminator`, **not `end`**: `end` closes every block
+in this language (§1), so it can never be a name. Swift's `print(_:terminator:)`
+is the precedent.
 
 One *value* argument, not many: interpolation already composes, so
 `print("a \(b) c")` covers what a variadic `print` would, and Hydra has no
 variadic calls.
-
-**[O]** `end` can only be supplied positionally, because call sites cannot name
-arguments (§3). If naming is added later, `print(v, end := "")` reads better and
-this signature needs no change.
 
 **[D]** Returns `.null`, so it is a statement, not an expression to build with.
 
@@ -170,7 +171,7 @@ guaranteed":
 | Diagnostic | Basis |
 |---|---|
 | an argument for a `&` parameter that is not a reference | the signature — a guaranteed crash |
-| arity mismatch against any of the five | they are statically known functions |
+| a call none of the candidates accepts | they are statically known functions |
 
 The five stop being undeclared names, so `hydra check --extern print,…` is no
 longer needed for them. Both rules are switched off when a `use`d module cannot

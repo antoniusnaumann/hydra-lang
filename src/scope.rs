@@ -69,6 +69,27 @@ impl Scope {
         None
     }
 
+    /// Every binding of `name` in the chain, innermost first.
+    ///
+    /// There can be more than one: `x := …` on a name that already exists is a
+    /// fresh binding that shadows (§6). A *call* tries them in this order and
+    /// takes the first that accepts it, so shadowing a function with one of a
+    /// different shape does not hide the original (§3).
+    pub fn all_bindings(&self, name: &str) -> Vec<Cell> {
+        let mut out = Vec::new();
+        if let Some(cell) = self.get_local(name) {
+            out.push(cell);
+        }
+        let mut scope = self.parent.clone();
+        while let Some(s) = scope {
+            if let Some(cell) = s.get_local(name) {
+                out.push(cell);
+            }
+            scope = s.parent.clone();
+        }
+        out
+    }
+
     /// Bind an existing cell under a name — how `use` shares a module's own
     /// storage rather than a copy of it (§7).
     pub fn bind_cell(&self, name: &str, cell: Cell) {

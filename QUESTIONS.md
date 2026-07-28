@@ -9,28 +9,34 @@ cannot be finished until it is decided.
 
 ---
 
-## 1. The standard library — **BLOCKING** (spec §15.7)
+## 1. The standard library — **PARTLY DECIDED** (spec §15.7)
 
-The spec forbids the implementor from inventing builtins, and defines exactly one
-primitive, `alive()`. Consequences already visible:
+The owner specified five builtins, drafted in `spec/hydra_stdlib.md` and now
+implemented: `print`, `has`, `get`, `len`, `push`. A program can finally say
+what it computed, and decoded data can be read without crashing.
 
-- The reference program in §14 cannot run. It needs `print`, `read_file`,
-  `lease`, `push`, `wait_ready`, `healthy`, `drain`, `smoke`, `live`, `rollback`,
-  and `json::decode`.
-- A Hydra program currently has **no way to produce output or observe anything**.
-  `hydra run` can execute a program but the program cannot say what it computed.
-- §15.1's `has` / `get` are needed by any program that touches decoded data,
-  because a missing-key read crashes and nothing can be caught.
+Three language features came out of their signatures, all now in the handoff:
 
-**Chosen for now:** a host-binding table exists in the interpreter and is
-**empty**. Tests drive the evaluator directly and inspect the resulting scope.
-`hydra check --extern name,name` suppresses undeclared-name errors for names the
-host is expected to supply.
+- `&name` parameters (§5.1) — the call must pass a reference or crash, which is
+  what stops `push(rows, x)` from being a silent no-op;
+- `name = default` parameters and named arguments (§3);
+- resolution by shape (§3) — a call takes the first candidate that accepts its
+  argument count and names, so shadowing `len` leaves the builtin reachable for
+  the calls the shadow rejects.
 
-**Needed:** the stdlib specification, or at minimum a decision on how a program
-emits a value. Value semantics make the signatures urgent — a mutating helper
-needs `&` at the call site, so the stdlib decides where `&` appears in ordinary
-code.
+**Still open:**
+
+- Everything else §14 leans on: `read_file`, `lease`, `wait_ready`, `healthy`,
+  `drain`, `smoke`, `live`, `rollback`, `json::decode`. `--extern` still exists
+  for those.
+- String helpers, any I/O, and whether there is an `eprint`.
+- `print`'s second parameter is `terminator`, not `end`: `end` closes every
+  block, so it can never be a name. Swift's `print(_:terminator:)` is the
+  precedent, and the parser now says exactly why if you try `end`.
+- ~~The name `push` is contested.~~ **Resolved:** qualified syntax wins.
+  Whichever module supplies §14's `push(h, img)` shadows the builtin for
+  unqualified calls, `check` warns at the `use`, and `::push` reaches the
+  builtin (§7).
 
 ---
 

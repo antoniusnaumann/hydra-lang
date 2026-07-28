@@ -211,7 +211,7 @@ impl Formatter {
             Expr::Call { callee, args, .. } => {
                 self.expr(callee, depth);
                 for arg in args {
-                    self.expr(arg, depth);
+                    self.expr(&arg.value, depth);
                 }
             }
             Expr::Unary { operand, .. } => self.expr(operand, depth),

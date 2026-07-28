@@ -73,7 +73,7 @@ pub enum Expr {
     /// `a.b` — sugar for `a[.b]` (§5).
     Key { obj: Box<Expr>, key: SymLit, pos: Pos },
     Index { obj: Box<Expr>, index: Box<Expr>, pos: Pos },
-    Call { callee: Box<Expr>, args: Vec<Expr>, pos: Pos },
+    Call { callee: Box<Expr>, args: Vec<Arg>, pos: Pos },
     /// `-x`, `~x`, `not x`.
     Unary { op: &'static str, operand: Box<Expr>, pos: Pos },
     /// `&lvalue` (§5.1): the caller marks it, never the callee.
@@ -129,6 +129,22 @@ impl Expr {
     }
 }
 
+/// One argument at a call site. `name = expr` names the parameter it fills;
+/// named arguments come after the positional ones.
+#[derive(Clone, Debug)]
+pub struct Arg {
+    pub name: Option<String>,
+    pub value: Expr,
+    pub pos: Pos,
+}
+
+impl Arg {
+    pub fn positional(value: Expr) -> Arg {
+        let pos = value.pos();
+        Arg { name: None, value, pos }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum ClosureBody {
     /// `fn(a, b) a + b` — decided by something following the `)` on the same
@@ -144,8 +160,9 @@ pub enum ClosureBody {
 /// only says that marking it is not optional. Without that, value semantics
 /// make `push(rows, x)` a silent no-op that looks like working code.
 ///
-/// `name := expr` gives the parameter a default, evaluated in the function's
-/// own scope when the argument is missing.
+/// `name = expr` gives the parameter a default, evaluated in the function's own
+/// scope when the argument is missing. Parameters with defaults come after
+/// those without, so positional filling stays unambiguous.
 #[derive(Clone, Debug)]
 pub struct Param {
     pub name: String,

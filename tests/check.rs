@@ -170,14 +170,33 @@ fn private_names_through_a_namespace() {
 }
 
 #[test]
-fn arity_mismatch_against_a_statically_known_function() {
-    assert_eq!(codes("fn f(a, b)\nend\nf(1)\n"), vec!["arity"]);
+fn a_call_no_candidate_accepts() {
+    assert_eq!(codes("fn f(a, b)\nend\nf(1)\n"), vec!["no-matching-call"]);
     assert_eq!(codes("fn f(a, b)\nend\nf(1, 2)\n"), Vec::<&str>::new());
-    assert_eq!(codes("g := fn(a) a\ng()\n"), vec!["arity"]);
-    assert_eq!(codes("use json\njson::decode()\n"), vec!["arity"]);
-    assert_eq!(codes("use json\ndecode()\n"), vec!["arity"]);
+    assert_eq!(codes("g := fn(a) a\ng()\n"), vec!["no-matching-call"]);
+    assert_eq!(codes("use json\njson::decode()\n"), vec!["no-matching-call"]);
+    assert_eq!(codes("use json\ndecode()\n"), vec!["no-matching-call"]);
     // A name that is reassigned might hold anything by then.
     assert_eq!(codes("fn f(a)\nend\nf := fn(a, b) a\nf(1, 2)\n"), Vec::<&str>::new());
+}
+
+#[test]
+fn named_arguments_are_matched_against_the_signature() {
+    assert_eq!(codes("fn f(a, b)\nend\nf(1, b = 2)\n"), Vec::<&str>::new());
+    assert_eq!(codes("fn f(a, b)\nend\nf(b = 2, a = 1)\n"), Vec::<&str>::new());
+    // A name the function does not have, or one already filled positionally.
+    assert_eq!(codes("fn f(a, b)\nend\nf(1, nope = 2)\n"), vec!["no-matching-call"]);
+    assert_eq!(codes("fn f(a, b)\nend\nf(1, a = 2)\n"), vec!["no-matching-call"]);
+    // A default may be skipped by naming a later parameter.
+    assert_eq!(codes("fn f(a, b = 1, c = 2)\nend\nf(1, c = 3)\n"), Vec::<&str>::new());
+}
+
+#[test]
+fn a_name_with_several_candidates_says_nothing() {
+    // A call one candidate rejects goes to the next (§3), so no single
+    // signature is guaranteed — which is exactly §11's principle.
+    assert_eq!(codes("len := fn(a, b) a\nx := len(1)\n"), Vec::<&str>::new());
+    assert_eq!(codes("use shadows\nx := push(1, 2, 3)\n"), Vec::<&str>::new());
 }
 
 #[test]
@@ -316,17 +335,14 @@ fn a_by_reference_parameter_passed_by_value() {
 }
 
 #[test]
-fn builtins_are_known_names_with_known_arities() {
+fn builtins_are_known_names_with_known_signatures() {
     assert_eq!(codes("print(\"hi\")\n"), Vec::<&str>::new());
     assert_eq!(codes("print(\"hi\", \"\")\n"), Vec::<&str>::new());
-    assert_eq!(codes("print()\n"), vec!["arity"]);
-    assert_eq!(codes("print(\"a\", \"b\", \"c\")\n"), vec!["arity"]);
-    assert_eq!(codes("x := len([1], 2)\n"), vec!["arity"]);
-    assert_eq!(codes("x := get(d, .k)\n"), vec!["arity", "undeclared-name"]);
-
-    // A program may shadow a builtin, and then its own arity is what counts.
-    assert_eq!(codes("len := fn(a, b) a\nx := len(1, 2)\n"), Vec::<&str>::new());
-    assert_eq!(codes("len := fn(a, b) a\nx := len(1)\n"), vec!["arity"]);
+    assert_eq!(codes("print(\"hi\", terminator = \"\")\n"), Vec::<&str>::new());
+    assert_eq!(codes("print()\n"), vec!["no-matching-call"]);
+    assert_eq!(codes("print(\"a\", \"b\", \"c\")\n"), vec!["no-matching-call"]);
+    assert_eq!(codes("x := len([1], 2)\n"), vec!["no-matching-call"]);
+    assert_eq!(codes("x := get(d, .k)\n"), vec!["no-matching-call", "undeclared-name"]);
 }
 
 #[test]

@@ -45,7 +45,13 @@ fn sexpr(e: &Expr) -> String {
         Expr::Key { obj, key, .. } => format!("(key {} .{})", sexpr(obj), key.name),
         Expr::Index { obj, index, .. } => format!("(index {} {})", sexpr(obj), sexpr(index)),
         Expr::Call { callee, args, .. } => {
-            let args: Vec<_> = args.iter().map(sexpr).collect();
+            let args: Vec<String> = args
+                .iter()
+                .map(|a| match &a.name {
+                    Some(name) => format!("{name}={}", sexpr(&a.value)),
+                    None => sexpr(&a.value),
+                })
+                .collect();
             format!("(call {}{}{})", sexpr(callee), if args.is_empty() { "" } else { " " }, args.join(" "))
         }
         Expr::Unary { op, operand, .. } => format!("({op} {})", sexpr(operand)),
@@ -331,12 +337,30 @@ fn parameters_may_be_by_reference_or_defaulted() {
     // `&name` requires the call to pass a reference; `name := expr` gives it a
     // default evaluated in the function's own scope.
     assert_eq!(first_expr("f := fn(&list, value) value\n"), "(fn (&list value) value)");
-    assert_eq!(first_expr("f := fn(a, b := 1) a\n"), "(fn (a b:=1) a)");
-    assert_eq!(first_expr("f := fn(a := \"x\") a\n"), "(fn (a:=\"x\") a)");
+    assert_eq!(first_expr("f := fn(a, b = 1) a\n"), "(fn (a b:=1) a)");
+    assert_eq!(first_expr("f := fn(a = \"x\") a\n"), "(fn (a:=\"x\") a)");
 
     // A default is a value, so it cannot also be a reference.
-    assert!(parse("f := fn(&a := 1) a\n", "t.hy").is_err());
-    // Positional filling only, so a defaulted parameter cannot come first.
-    assert!(parse("f := fn(a := 1, b) a\n", "t.hy").is_err());
+    assert!(parse("f := fn(&a = 1) a\n", "t.hy").is_err());
+    // Defaults come after the parameters without them.
+    assert!(parse("f := fn(a = 1, b) a\n", "t.hy").is_err());
     assert!(parse("f := fn(a, a) a\n", "t.hy").is_err());
+}
+
+#[test]
+fn arguments_may_be_named() {
+    assert_eq!(first_expr("x := f(1, width = 2)\n"), "(call f 1 width=2)");
+    assert_eq!(first_expr("x := f(a = 1, b = 2)\n"), "(call f a=1 b=2)");
+    // `name = value` is unambiguous: assignment is a statement, not an
+    // expression, so it cannot appear in an argument anyway (§3).
+    assert_eq!(first_expr("x := f(a == 1)\n"), "(call f (== a 1))");
+    // Named arguments come last, and each parameter is named once.
+    assert!(parse("x := f(a = 1, 2)\n", "t.hy").is_err());
+    assert!(parse("x := f(a = 1, a = 2)\n", "t.hy").is_err());
+    // A keyword is not a name — which is why the builtin's parameter is
+    // `terminator` and not `end` (hydra_stdlib.md §2).
+    let err = parse("x := f(end = 1)\n", "t.hy").unwrap_err();
+    assert!(err.message.contains("`end` is a keyword"), "{}", err.message);
+    let err = parse("f := fn(end) end\n", "t.hy").unwrap_err();
+    assert!(err.message.contains("`end` is a keyword"), "{}", err.message);
 }

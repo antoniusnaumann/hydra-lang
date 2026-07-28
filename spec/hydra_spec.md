@@ -146,7 +146,9 @@ stmt       = use | fndecl | decl | assign | if | for | while
 use        = "use" ident ;
 fndecl     = "fn" ident "(" [ params ] ")" NEWLINE block "end" ;
 params     = param { "," param } ;
-param      = [ "&" ] ident [ ":=" expr ] ;
+param      = [ "&" ] ident [ "=" expr ] ;
+args       = arg { "," arg } ;
+arg        = [ ident "=" ] expr ;
 
 decl       = ident ":=" expr ;
 dict       = "{" [ dictent { "," dictent } ] "}" ;
@@ -183,16 +185,46 @@ closure    = "fn" "(" [ params ] ")" ( expr | NEWLINE block "end" ) ;
 whether anything follows the `)` **on the same line**.
 
 **[D] Parameters.** `&name` requires the *call* to pass a reference; see §5.1.
-`name := expr` gives the parameter a default, evaluated in the **function's own
+`name = expr` gives the parameter a default, evaluated in the **function's own
 scope** at each call where the argument is missing, so a later default may refer
-to an earlier parameter. Filling is positional, so a parameter with a default
-may not be followed by one without, and a `&` parameter may not have a default —
-a default is a value, and a reference has to come from a call site.
+to an earlier parameter. Parameters with defaults come **after** those without,
+and a `&` parameter may not have a default — a default is a value, and a
+reference has to come from a call site.
 
-**[O]** Whether a call may name an argument — `print(v, end := "")` — instead of
-relying on position. Recommended **[P]**: not yet. Positional defaults cover the
-cases the standard library needs, and naming is a separate feature with its own
-questions (does it apply to every call, can it reorder, what does `check` say).
+**[D] Named arguments.** `f(a, width = 2)` fills a parameter by name. Named
+arguments come after the positional ones, and no parameter may be filled twice.
+There is no ambiguity with assignment: assignment is a *statement*, so it can
+never appear inside an argument list.
+
+A **keyword is not a name**, so neither a parameter nor an argument may be
+called `end`, `in`, `as` or any other keyword.
+
+**[D] Resolution.** A name can mean more than one function — `:=` shadows (§6),
+imports stack (§7), and the builtins sit under both. A call tries each in that
+order — innermost binding first, then the most recent `use`, then the builtin —
+and takes **the first that accepts it**. A candidate *rejects* a call when it
+has too many arguments, a name the candidate does not have, a parameter filled
+twice, or one it needs and did not get. Only when nothing accepts is it a crash
+(§8), and the diagnostic lists what was tried.
+
+Shadowing a function with one of a different shape therefore does not hide the
+original:
+
+```hydra
+fn f(a)
+	return "one"
+end
+f := fn(a, b) "two"
+f(1)         // "one" — the shadowing one rejects a single argument
+f(1, 2)      // "two"
+```
+
+**[D]** A **`&` mismatch is not a rejection.** It is reported against the
+candidate that accepted the call, because a missing `&` is a mistake to fix,
+not a reason to quietly run something else.
+
+**[D]** A **qualified** call — `mod::f(…)` or `::f(…)` — names one function, so
+there is nothing to fall through to.
 
 ### Operator precedence **[D]**
 
@@ -452,9 +484,9 @@ rather than looping forever.
 **[D]** There are no exceptions and no catch. Failure is an ordinary value —
 by convention a symbol such as `.failed`.
 
-**[D]** A **crash** (missing field, bad operand, `=` to an undeclared name,
-arity mismatch, an argument a `&` parameter needs and did not get, explicit
-abort) terminates the program — *unless* it happens in
+**[D]** A **crash** (missing field, bad operand, `=` to an undeclared name, a
+call no candidate accepts, an argument a `&` parameter needs and did not get,
+explicit abort) terminates the program — *unless* it happens in
 a dead trail (§9.5), in which case it is isolated to that trail.
 
 **[D]** When a **live** trail crashes: mark every sibling cancelled, let each
@@ -593,7 +625,7 @@ maybe-list would be enormous and would be ignored within a week.
 | `&` applied to something that is not an lvalue | §5.1 |
 | Duplicate key in one dict literal | grammar |
 | `_private` name reached through `::` | §7 |
-| Arity mismatch against a statically known function | call graph |
+| A call no statically known candidate accepts | call graph |
 | An argument for a `&` parameter that is not a reference | §5.1 |
 | `parallel` / `race` written syntactically inside a cell | §4 |
 | Rows of a block with differing separator counts | §4 |

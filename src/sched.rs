@@ -96,9 +96,10 @@ pub struct Frame {
     /// A module's toplevel (including the main program's): its final scope is
     /// the namespace `use` exports from (§7).
     pub is_module_body: bool,
-    /// How many arguments the call supplied, so the prologue knows which
-    /// defaults to evaluate.
-    pub argc: usize,
+    /// Which parameters the call supplied, so the prologue knows which
+    /// defaults to evaluate. Named arguments can leave holes, so this is a
+    /// mask and not a count.
+    pub provided: Vec<bool>,
 }
 
 impl Frame {

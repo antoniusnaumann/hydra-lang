@@ -274,6 +274,20 @@ impl Native {
         }
     }
 
+    /// Parameter names, so a call can name its arguments (§3).
+    pub fn param_names(self) -> &'static [&'static str] {
+        match self {
+            Native::Alive => &[],
+            // Not `end`: that keyword closes every block, so it can never be a
+            // name. `terminator` follows Swift's print (see hydra_stdlib.md §2).
+            Native::Print => &["value", "terminator"],
+            Native::Has => &["container", "key"],
+            Native::Get => &["container", "key", "fallback"],
+            Native::Len => &["value"],
+            Native::Push => &["list", "value"],
+        }
+    }
+
     /// Which parameters the call must mark with `&` (§5.1).
     pub fn by_ref(self) -> &'static [bool] {
         match self {
@@ -285,7 +299,7 @@ impl Native {
     pub fn signature(self) -> &'static str {
         match self {
             Native::Alive => "alive()",
-            Native::Print => "print(value, end := \"\\n\")",
+            Native::Print => "print(value, terminator = \"\\n\")",
             Native::Has => "has(container, key)",
             Native::Get => "get(container, key, fallback)",
             Native::Len => "len(value)",

@@ -89,20 +89,37 @@ cargo run -- run examples/trails.hy --dump-scope
   file's bindings are unknowable, so name-resolution diagnostics are dropped and
   a warning says why.
 
-## The standard library is deliberately absent
+## The standard library
 
-Per the note at the top of the spec, the implementor does not design the
-language. `alive()` is the only primitive this implementation defines. Calling
-any other undefined name crashes, exactly as it should.
+Five builtins are specified in [`spec/hydra_stdlib.md`](spec/hydra_stdlib.md)
+and implemented: `print(value, terminator = "\n")`, `has(container, key)`,
+`get(container, key, fallback)`, `len(value)` and `push(&list, value)`.
 
-That has a sharp consequence: **a Hydra program currently cannot say what it
-computed.** There is no `print`. `hydra run --dump-scope` prints the program's
-toplevel bindings when it finishes, as a stopgap for exactly this — it is a
-debugging affordance in the tool, not a language feature.
+`push`'s signature is the interesting one. Value semantics mean `push(rows, x)`
+hands the callee a copy, so appending would be a silent no-op that looks like
+working code — the `&list` in the signature makes leaving the `&` out a crash,
+and `check` reports it statically. Three language features came from these five:
+`&name` parameters, `name = default` parameters with named arguments, and
+resolution by shape.
 
-It also means `examples/deploy.hy` — the spec's own reference program — parses,
-checks and formats but does not run. `hydra check --extern name,name` lets you
-name host-provided globals so placeholders are not reported as undeclared.
+**Resolution.** Unqualified lookup is scope chain, then imports, then builtins.
+A call tries each candidate in that order and takes the first that **accepts its
+argument count and names**, so shadowing one shape leaves the others reachable —
+a local `len := fn(a, b) …` takes two-argument calls and the builtin takes the
+rest. `::len` is the qualified form and names the builtin outright; being
+qualified it is also statically known, so `check` still reports a missing `&` on
+`::push(rows, x)` in a file whose modules it could not resolve.
+
+A missing `&` is *not* a rejection: it is reported against the candidate that
+accepted the call, because it is a mistake to fix rather than a reason to
+quietly run something else.
+
+Everything else the spec's examples lean on is still a placeholder, so
+`examples/deploy.hy` — the spec's own reference program — parses, checks and
+formats but does not run. `hydra check --extern` lets you name host-provided
+globals so placeholders are not reported as undeclared, and
+`hydra run --dump-scope` prints a program's toplevel bindings, which is useful
+when what you want to see is state rather than output.
 
 See [`QUESTIONS.md`](QUESTIONS.md) for every point where the spec left a hole,
 what this implementation does in the meantime, and what it costs to change.

@@ -74,7 +74,12 @@ pub enum Instr {
     /// `or`: truthy short-circuits and keeps its value.
     OrJump(usize),
 
-    Call(usize),
+    /// Call the value on the stack under the arguments: one candidate only,
+    /// because the callee was written as something other than a bare name.
+    Call { positional: usize, names: Rc<Vec<Rc<str>>> },
+    /// Call by name: every function bound to that name is a candidate, and the
+    /// first that accepts the argument count and names is the one (§3).
+    CallName { name: Rc<str>, positional: usize, names: Rc<Vec<Rc<str>>> },
     Return,
     ReturnNull,
 
@@ -245,7 +250,12 @@ impl Compiler {
                 self.emit(Instr::Declare(Rc::from(name.as_str())), *pos);
             }
             Stmt::Decl { name, value, pos } => {
-                self.expr(value)?;
+                // A closure declared as `f := fn(…)` answers to `f` in
+                // diagnostics; it has no name of its own otherwise.
+                match value {
+                    Expr::Closure(def) => self.closure(def, name, def.pos)?,
+                    other => self.expr(other)?,
+                }
                 self.emit(Instr::Declare(Rc::from(name.as_str())), *pos);
             }
             Stmt::Assign { target, value, pos } => {
@@ -569,11 +579,28 @@ impl Compiler {
                 self.emit(Instr::GetMember, *pos);
             }
             Expr::Call { callee, args, pos } => {
-                self.expr(callee)?;
-                for arg in args {
-                    self.expr(arg)?;
+                let names: Rc<Vec<Rc<str>>> = Rc::new(
+                    args.iter().filter_map(|a| a.name.as_deref().map(Rc::from)).collect(),
+                );
+                let positional = args.iter().filter(|a| a.name.is_none()).count();
+                match callee.as_ref() {
+                    Expr::Name { name, .. } => {
+                        for arg in args {
+                            self.expr(&arg.value)?;
+                        }
+                        self.emit(
+                            Instr::CallName { name: Rc::from(name.as_str()), positional, names },
+                            *pos,
+                        );
+                    }
+                    _ => {
+                        self.expr(callee)?;
+                        for arg in args {
+                            self.expr(&arg.value)?;
+                        }
+                        self.emit(Instr::Call { positional, names }, *pos);
+                    }
                 }
-                self.emit(Instr::Call(args.len()), *pos);
             }
             Expr::Unary { op, operand, pos } => {
                 self.expr(operand)?;
