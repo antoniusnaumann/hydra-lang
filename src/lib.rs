@@ -5,6 +5,11 @@
 //! formatter (§12).
 
 pub mod ast;
+pub mod compile;
 pub mod errors;
 pub mod lexer;
 pub mod parser;
+pub mod scope;
+pub mod sched;
+pub mod value;
+pub mod vm;
