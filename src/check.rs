@@ -316,7 +316,7 @@ impl<'a> Checker<'a> {
         }
         match value {
             Expr::Closure(def) => binding.arity = Some(def.params.len()),
-            Expr::Dict { entries, .. } => {
+            Expr::Dict { entries, .. } if entries.iter().all(|(k, _)| k.is_static()) => {
                 binding.keys = Some(entries.iter().map(|(k, _)| k.name.clone()).collect())
             }
             _ => {}
@@ -610,7 +610,11 @@ impl<'a> Checker<'a> {
 
     fn expr(&mut self, expr: &Expr) {
         match expr {
-            Expr::Num { .. } | Expr::Str { .. } | Expr::Sym(_) => {}
+            Expr::Num { .. } => {}
+            // §11: an undeclared name used inside a `\(…)` interpolation is a
+            // hard error like any other, which is why this walks the parts.
+            Expr::Str { parts, .. } => self.str_parts(parts),
+            Expr::Sym(sym) => self.str_parts(&sym.parts),
             Expr::List { items, .. } => {
                 for item in items {
                     self.expr(item);
@@ -619,6 +623,13 @@ impl<'a> Checker<'a> {
             Expr::Dict { entries, pos } => {
                 let mut seen: HashMap<&str, Pos> = HashMap::new();
                 for (key, value) in entries {
+                    self.str_parts(&key.parts);
+                    // A key built by interpolation is not known here, so it
+                    // cannot be a *provable* duplicate.
+                    if !key.is_static() {
+                        self.expr(value);
+                        continue;
+                    }
                     if let Some(first) = seen.insert(&key.name, key.pos) {
                         self.error(
                             format!(
@@ -655,13 +666,18 @@ impl<'a> Checker<'a> {
             Expr::Namespace { module, name, pos } => self.namespace(module, name, *pos),
             Expr::Key { obj, key, pos } => {
                 self.expr(obj);
-                self.check_known_key(obj, &key.name, *pos);
+                self.str_parts(&key.parts);
+                if key.is_static() {
+                    self.check_known_key(obj, &key.name, *pos);
+                }
             }
             Expr::Index { obj, index, pos } => {
                 self.expr(obj);
                 self.expr(index);
                 if let Expr::Sym(sym) = index.as_ref() {
-                    self.check_known_key(obj, &sym.name, *pos);
+                    if sym.is_static() {
+                        self.check_known_key(obj, &sym.name, *pos);
+                    }
                 }
             }
             Expr::Call { callee, args, pos } => {
@@ -704,6 +720,15 @@ impl<'a> Checker<'a> {
                 self.expr(target);
             }
             Expr::Closure(def) => self.closure(def),
+        }
+    }
+
+    /// Walk the expressions inside a string or symbol's interpolations.
+    fn str_parts(&mut self, parts: &[StrPart]) {
+        for part in parts {
+            if let StrPart::Expr(expr) = part {
+                self.expr(expr);
+            }
         }
     }
 
@@ -764,7 +789,9 @@ impl<'a> Checker<'a> {
     /// A key read on a dict literal that provably lacks the key (§11).
     fn check_known_key(&mut self, obj: &Expr, key: &str, pos: Pos) {
         let keys: Option<Vec<String>> = match obj {
-            Expr::Dict { entries, .. } => Some(entries.iter().map(|(k, _)| k.name.clone()).collect()),
+            Expr::Dict { entries, .. } if entries.iter().all(|(k, _)| k.is_static()) => {
+                Some(entries.iter().map(|(k, _)| k.name.clone()).collect())
+            }
             Expr::Name { name, .. } => self.lookup(name).and_then(|b| b.keys.clone()),
             _ => None,
         };
@@ -917,7 +944,7 @@ fn walk_closure_stmts(expr: &Expr, f: &mut impl FnMut(&Stmt)) {
     }
 }
 
-fn walk_exprs(body: &[Stmt], f: &mut impl FnMut(&Expr)) {
+fn walk_exprs(body: &[Stmt], f: &mut dyn FnMut(&Expr)) {
     walk_stmts(body, &mut |stmt| walk_stmt_exprs(stmt, &mut |expr| walk_expr(expr, f)));
 }
 
@@ -948,20 +975,36 @@ fn walk_stmt_exprs(stmt: &Stmt, f: &mut impl FnMut(&Expr)) {
     }
 }
 
-fn walk_expr(expr: &Expr, f: &mut impl FnMut(&Expr)) {
+/// A `dyn` callback rather than a generic one: an interpolation holds
+/// expressions, so this recurses through itself and a generic closure would
+/// monomorphise without bound.
+fn walk_expr(expr: &Expr, f: &mut dyn FnMut(&Expr)) {
     f(expr);
+    fn walk_parts(parts: &[StrPart], f: &mut dyn FnMut(&Expr)) {
+        for part in parts {
+            if let StrPart::Expr(inner) = part {
+                walk_expr(inner, f);
+            }
+        }
+    }
     match expr {
+        Expr::Str { parts, .. } => walk_parts(parts, f),
+        Expr::Sym(sym) => walk_parts(&sym.parts, f),
         Expr::List { items, .. } => {
             for item in items {
                 walk_expr(item, f);
             }
         }
         Expr::Dict { entries, .. } => {
-            for (_, value) in entries {
+            for (key, value) in entries {
+                walk_parts(&key.parts, f);
                 walk_expr(value, f);
             }
         }
-        Expr::Key { obj, .. } => walk_expr(obj, f),
+        Expr::Key { obj, key, .. } => {
+            walk_expr(obj, f);
+            walk_parts(&key.parts, f);
+        }
         Expr::Index { obj, index, .. } => {
             walk_expr(obj, f);
             walk_expr(index, f);

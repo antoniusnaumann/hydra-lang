@@ -227,7 +227,22 @@ impl Native {
 #[derive(Clone, Debug, PartialEq)]
 pub enum PathSeg {
     Key(Sym),
-    Index(usize),
+    /// Negative counts from the end and is resolved against the list's length
+    /// by [`resolve_index`].
+    Index(isize),
+}
+
+/// Resolve a list index against a length: 0-based, and a negative index counts
+/// from the end, so `a[-1]` is the last element. Anything still outside the
+/// list crashes, the way a missing key does (§5, §15.2).
+pub fn resolve_index(raw: isize, len: usize) -> Result<usize, Crash> {
+    let resolved = if raw < 0 { raw + len as isize } else { raw };
+    if resolved < 0 || resolved as usize >= len {
+        return Err(Crash::new(format!(
+            "list index {raw} is out of range for a list of {len} element(s)"
+        )));
+    }
+    Ok(resolved as usize)
 }
 
 /// `&lvalue`: the root variable's cell plus the path from it (§5.1).
@@ -353,15 +368,10 @@ pub fn path_segment(key: &Value) -> Result<PathSeg, Crash> {
                     num_to_text(*n)
                 )));
             }
-            if *n < 0.0 {
-                // QUESTIONS.md §2: negative indices do not wrap; indices start
-                // at 0 and anything outside crashes like a missing key does.
-                return Err(Crash::new(format!(
-                    "list index {} is out of range: indices start at 0",
-                    num_to_text(*n)
-                )));
-            }
-            Ok(PathSeg::Index(*n as usize))
+            // A negative index counts from the end (§15.2, decided by the
+            // language owner). Resolving it needs the length, so it is carried
+            // as-is and resolved where the list is in hand.
+            Ok(PathSeg::Index(*n as isize))
         }
         other => Err(Crash::new(format!(
             "a key must be a symbol and a list index a number, got a {}",
@@ -382,13 +392,8 @@ pub fn get_member(container: &Value, key: &Value) -> Result<Value, Crash> {
         },
         (Value::List(rc), PathSeg::Index(i)) => {
             let data = rc.borrow();
-            match data.items.get(i) {
-                Some(v) => read_through(v),
-                None => Err(Crash::new(format!(
-                    "list index {i} is out of range for a list of {} element(s)",
-                    data.items.len()
-                ))),
-            }
+            let at = resolve_index(i, data.items.len())?;
+            read_through(&data.items[at])
         }
         (Value::List(_), PathSeg::Key(s)) => {
             Err(Crash::new(format!("a list has no key .{}; index it with a number", s.name())))
@@ -498,12 +503,8 @@ fn write_slot(slot: &mut Value, path: &[PathSeg], value: Value) -> Result<(), Cr
                 .try_borrow_mut()
                 .map_err(|_| Crash::new("a value that contains itself was assigned into"))?;
             let len = data.items.len();
-            if *i >= len {
-                return Err(Crash::new(format!(
-                    "list index {i} is out of range for a list of {len} element(s)"
-                )));
-            }
-            write_slot(&mut data.items[*i], &path[1..], value)
+            let at = resolve_index(*i, len)?;
+            write_slot(&mut data.items[at], &path[1..], value)
         }
         other => Err(Crash::new(format!("cannot assign into a {}", other.kind()))),
     }
@@ -695,9 +696,23 @@ pub fn binary_op(op: &str, a: &Value, b: &Value) -> Result<Value, Crash> {
         _ => {}
     }
 
-    // `+` concatenates when either side is a string (QUESTIONS.md §3).
-    if op == "+" && (matches!(a, Value::Str(_)) || matches!(b, Value::Str(_))) {
-        return Ok(Value::Str(Rc::from(format!("{}{}", to_text(a), to_text(b)).as_str())));
+    // `+` concatenates two strings. It does *not* convert: interpolation is how
+    // a value is rendered, so `"n = " + 3` is a bad operand rather than a
+    // silent conversion — write `"n = \(3)"`.
+    if op == "+" {
+        match (a, b) {
+            (Value::Str(x), Value::Str(y)) => {
+                return Ok(Value::Str(Rc::from(format!("{x}{y}").as_str())))
+            }
+            (Value::Str(_), other) | (other, Value::Str(_)) => {
+                return Err(Crash::new(format!(
+                    "`+` joins two strings or adds two numbers, got a string and a {}; \
+                     interpolate instead, as in \"…\\(x)…\"",
+                    other.kind()
+                )))
+            }
+            _ => {}
+        }
     }
 
     match op {

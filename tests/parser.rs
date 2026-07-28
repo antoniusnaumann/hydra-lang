@@ -7,7 +7,31 @@ use hydra::parser::parse;
 fn sexpr(e: &Expr) -> String {
     match e {
         Expr::Num { raw, .. } => raw.clone(),
-        Expr::Str { value, .. } => format!("{value:?}"),
+        Expr::Str { parts, .. } => {
+            if let [StrPart::Text(text)] = &parts[..] {
+                format!("{text:?}")
+            } else {
+                let pieces: Vec<String> = parts
+                    .iter()
+                    .map(|p| match p {
+                        StrPart::Text(text) => format!("{text:?}"),
+                        StrPart::Expr(expr) => sexpr(expr),
+                    })
+                    .collect();
+                format!("(str {})", pieces.join(" "))
+            }
+        }
+        Expr::Sym(s) if !s.is_static() => {
+            let pieces: Vec<String> = s
+                .parts
+                .iter()
+                .map(|p| match p {
+                    StrPart::Text(text) => format!("{text:?}"),
+                    StrPart::Expr(expr) => sexpr(expr),
+                })
+                .collect();
+            format!("(sym {})", pieces.join(" "))
+        }
         Expr::Sym(s) => format!(".{}", s.name),
         Expr::List { items, .. } => {
             format!("(list {})", items.iter().map(sexpr).collect::<Vec<_>>().join(" "))

@@ -16,7 +16,7 @@ Companion to the implementation spec.
 | Deep equality | `a == b` | Identity first, then structural walk |
 | Identity | `a === b`, `a !== b` | By identity |
 | Reference | `f(&a)`, `{ .b : &a }` | Opt out of copying |
-| Concatenation | `"hi " + name` | No interpolation |
+| Interpolation | `"hi \(name)"` | Any expression; `+` joins two strings |
 | Trail separator | `\|\|` | Inside `parallel` / `race` blocks only |
 | Bitwise | `\| & ^ ~ << >> >>>` | 32-bit, JS semantics; `\|\|` lexes first |
 | Logic | `and`, `or`, `not` | Words, so `!` and `&` stay free |
@@ -35,7 +35,7 @@ Never split them across a line or a `||`.
 
 ```hydra
 num    := 3.0                    // 64-bit float, 32-bit for bitwise ops
-text   := "hi " + name
+text   := "hi \(name), \(a + b)"
 list   := [5, 17]
 dict   := { .a : 5, ."x-id" : 17 }   // keys are symbols, quotable
 symbol := .null
@@ -56,7 +56,9 @@ symbol := .null
 - `===` currently reports COW storage, so an untouched copy still compares
   identical to its source. It is not a reliable aliasing test.
 - Reading a missing key **crashes**; writing one creates it.
-- `."content-type"` is a symbol that isn't a valid identifier.
+- Lists are 0-based and `a[-1]` is the last element.
+- `."content-type"` is a symbol that isn't a valid identifier; `."\(x)-id"`
+  builds one from data.
 
 ---
 

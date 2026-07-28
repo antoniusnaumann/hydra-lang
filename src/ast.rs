@@ -25,18 +25,44 @@ impl BlockKind {
     }
 }
 
-/// `.name`, or `."not an identifier"` (§2).
-#[derive(Clone, Debug, PartialEq)]
+/// One piece of a string literal or a quoted symbol.
+#[derive(Clone, Debug)]
+pub enum StrPart {
+    Text(String),
+    /// A `\(…)` interpolation (§1). The expression was lexed and parsed
+    /// recursively, so it can be anything, including further strings.
+    Expr(Expr),
+}
+
+/// `.name`, `."not an identifier"`, or `."\(prefix)-id"` (§2).
+///
+/// `name` is the literal text when the symbol does not interpolate; when it
+/// does, the symbol is built at run time and `name` is empty.
+#[derive(Clone, Debug)]
 pub struct SymLit {
     pub name: String,
     pub quoted: bool,
+    pub parts: Vec<StrPart>,
     pub pos: Pos,
+}
+
+impl SymLit {
+    /// A symbol known at compile time. Interpolation is what gives the language
+    /// dynamic symbol construction without a `sym(str)` builtin (§2).
+    pub fn is_static(&self) -> bool {
+        !self.parts.iter().any(|p| matches!(p, StrPart::Expr(_)))
+    }
+
+    pub fn plain(name: impl Into<String>, quoted: bool, pos: Pos) -> SymLit {
+        let name = name.into();
+        SymLit { parts: vec![StrPart::Text(name.clone())], name, quoted, pos }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub enum Expr {
     Num { value: f64, raw: String, pos: Pos },
-    Str { value: Rc<str>, raw: String, pos: Pos },
+    Str { parts: Vec<StrPart>, pos: Pos },
     Sym(SymLit),
     List { items: Vec<Expr>, pos: Pos },
     Dict { entries: Vec<(SymLit, Expr)>, pos: Pos },

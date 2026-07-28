@@ -27,11 +27,17 @@ whitespace entirely. Blocks are closed by `end`.
 
 **[D]** No block comments. No line-continuation character; a statement is one line.
 
-**[D]** String literals are double-quoted. **There is no interpolation** —
-`+` concatenates, which covers the same ground. Escapes: `\" \\ \n \t \r \0`.
+**[D]** String literals are double-quoted. **Interpolation is `\(expr)`** —
+the expression is lexed and parsed recursively, so it may contain parentheses,
+calls, and further strings with their own interpolations. Escapes:
+`\" \\ \n \t \r \0 \(`.
 
-Consequence for every tool: a string literal may still contain `||`, `end`, or
-a comment marker, so anything that scans a line (the parallel-row splitter, the
+**[D]** `+` also **concatenates two strings**, and does not convert: a string
+and a non-string is a bad operand. Interpolation is how a value is rendered,
+so `"n = " + count` is an error and `"n = \(count)"` is the way to write it.
+
+Consequence for every tool: a string literal is no longer an opaque run of
+characters. Anything that scans a line (the parallel-row splitter, the
 formatter, `check`'s name resolution) must operate on **tokens**, not text.
 
 ---
@@ -88,7 +94,7 @@ it is never exported by `use` and never reachable through `::`.
 
 ```hydra
 42        3.0                        // numbers
-"text"    "hi " + name               // string, concatenated with +
+"text"    "hi \(name), \(a + b)"     // string, with interpolation
 [1, 2, 3]                            // list
 { .a : 5, ."x-req-id" : 17 }         // dict — keys are symbols
 .null  .false  .true  .whatever      // symbols
@@ -104,9 +110,8 @@ a symbol.
 identifier. It works in every position a bare symbol does, including lookup:
 `headers."content-type"` is `headers[."content-type"]`.
 
-**[O]** With interpolation gone, a quoted symbol is always a literal, so there
-is no longer a spelling for a **dynamically constructed symbol**. Decoded input
-cannot be turned into a key without a `sym(str)` in the stdlib.
+**[D]** A quoted symbol may interpolate — `."\(prefix)-id"` — which gives
+dynamic symbol construction without a separate `sym(str)` builtin.
 
 **[D] Interning.** Symbols are interned and compared by identity. Because input
 data can now mint them, the intern table must be collectable (weak entries or
@@ -146,7 +151,7 @@ decl       = ident ":=" expr ;
 dict       = "{" [ dictent { "," dictent } ] "}" ;
 dictent    = symbol ":" expr ;
 symbol     = "." ident | "." string ;
-string     = '"' { char } '"' ;
+string     = '"' { char | "\\(" expr ")" } '"' ;
 assign     = lvalue "=" expr ;
 lvalue     = ident | postfix "." ident | postfix "[" expr "]" ;
 
@@ -247,7 +252,7 @@ hard error with that suggestion.
 | Kind | Notes |
 |---|---|
 | number | 64-bit float; 32-bit for bitwise ops |
-| string | immutable; `+` concatenates |
+| string | immutable; supports `\(expr)` interpolation, and `+` concatenates two strings |
 | list | mutable, **value semantics** (§5.1) |
 | dict | mutable, **symbol keys only**, **value semantics** |
 | symbol | interned tag, e.g. `.null` |
@@ -351,8 +356,9 @@ therefore compare equal, and comparison always terminates.
 Fast paths worth having: identical references short-circuit to `.true` before
 anything else, and the set is only allocated once recursion passes a small depth.
 
-**[O]** List indexing (`a[i]`): 0- or 1-based, negative indices, out-of-range
-behaviour (crash, consistent with missing keys).
+**[D]** List indexing (`a[i]`) is **0-based**, and a **negative index counts
+from the end**, so `a[-1]` is the last element. An index still outside the list
+after that crashes, consistently with a missing key.
 
 **[D] Key writes create.** Reading a missing key crashes, but `d.k = v` and
 `d[k] = v` **create** the key. Without this a dict can never be built
@@ -551,6 +557,7 @@ maybe-list would be enormous and would be ignored within a week.
 | `break` / `continue` with an unresolvable label | label table |
 | `break` / `continue` outside any loop (except `break trail` inside a trail) | §9.6 |
 | Key read on a dict literal that provably lacks the key | local dataflow |
+| Undeclared name used inside a `\(…)` interpolation | token-level resolution |
 | Non-symbol key in a dict literal | grammar |
 | `&` applied to something that is not an lvalue | §5.1 |
 | Duplicate key in one dict literal | grammar |
@@ -584,8 +591,10 @@ maybe-list would be enormous and would be ignored within a week.
    none between `&` and its lvalue — `&a`, never `& a`.
 3. Compound keywords normalise to exactly one space and are **never** wrapped.
 3a. Dict literals normalise to `{ .a : 1, .b : 2 }` — spaces inside the braces
-   and around the colon. A quoted symbol whose content is a valid identifier is
-   rewritten bare: `."name"` becomes `.name`. **[D]**, one line each to change.
+   and around the colon. Interpolations normalise like ordinary expressions:
+   `\(a + b)`, never `\( a+b )`. A quoted symbol whose content is a valid
+   identifier is rewritten bare: `."name"` becomes `.name`. **[D]**, one line
+   each to change.
 4. Never move a line break, since a newline terminates a statement — the
    formatter must not join or split statement lines.
 5. Inside a `parallel` block:
@@ -649,7 +658,7 @@ manifest := json::decode(read_file("deploy.json"))
 img := manifest.image        // same as manifest[.image]
 
 for name in REGIONS
-	print("target " + name + " -> " + img)
+	print("target \(name) -> \(img)")
 end
 
 eu := .null
@@ -671,7 +680,7 @@ end
 if down > 0
 	rollback()
 end
-print((3 - down) + "/3 regions live")
+print("\(3 - down)/3 regions live")
 ```
 
 Note the trails use `=`, not `:=` — `:=` inside a trail would declare a
@@ -685,14 +694,9 @@ proposed stdlib. See the note at the top of this document.
 
 ## 15. Still open
 
-1. Reading a maybe-missing key — `has` / `get`, and how to spell a symbol that
-   isn't a valid identifier. Blocks any program that parses JSON.
-   **Highest priority.**
-1a. What `+` does with a string and a non-string. If it does not convert, the
-   language has no way at all to render a number as text now that
-   interpolation is gone, and `print(count + " done")` does not work.
-1b. How to build a symbol from a string, now that `."\(x)"` is gone.
-2. List indexing base and out-of-range behaviour.
+1. Reading a maybe-missing key — `has` / `get`. Blocks any program that parses
+   JSON. **Highest priority.** A symbol that isn't a valid identifier is
+   spelled `."like-this"`, and built from data with `."\(x)"`.
 2a. Whether `===` keeps reporting COW storage or gains a real identity stamp.
 3. Whether `race`'s `end` waits for in-flight losers, and whether program exit
    waits for orphaned trails.

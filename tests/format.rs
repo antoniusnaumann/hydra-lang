@@ -138,6 +138,21 @@ fn a_cell_holding_a_block_keeps_its_rows() {
 }
 
 #[test]
+fn interpolations_normalise_like_ordinary_expressions() {
+    // §12 rule 3a: `\(a + b)`, never `\( a+b )`.
+    assert_eq!(fmt_idempotent("x := \"n \\( a+b )\"\n"), "x := \"n \\(a + b)\"\n");
+    assert_eq!(fmt_idempotent("x := \"\\(f( 1,2 ))\"\n"), "x := \"\\(f(1, 2))\"\n");
+    assert_eq!(fmt_idempotent("x := .\"\\( prefix )-id\"\n"), "x := .\"\\(prefix)-id\"\n");
+    // A string nested inside an interpolation normalises too.
+    assert_eq!(
+        fmt_idempotent("x := \"a \\(f(\"b \\( c )\"))\"\n"),
+        "x := \"a \\(f(\"b \\(c)\"))\"\n"
+    );
+    // An interpolated symbol can never be rewritten bare.
+    assert_eq!(fmt_idempotent("d := { .\"\\(k)\" : 1 }\n"), "d := { .\"\\(k)\" : 1 }\n");
+}
+
+#[test]
 fn a_string_that_looks_like_syntax_is_left_alone() {
     let src = "x := \"a || b end // not a comment\"\n";
     assert_eq!(fmt_idempotent(src), "x := \"a || b end // not a comment\"\n");

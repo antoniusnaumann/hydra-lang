@@ -12,9 +12,10 @@
 //!   preceding token, which is why that decision lives here and not in the
 //!   parser.
 //!
-//! Strings are plain: there is no interpolation, `+` concatenates. They can
-//! still contain `||`, `end` or `//`, so everything downstream works on tokens
-//! rather than on text.
+//! * **Strings are not opaque.** `\(expr)` is lexed *recursively*, so a string
+//!   token carries a token stream for each interpolation. That is what §1 means
+//!   when it says every tool has to work on tokens: a string can contain `||`,
+//!   `end`, `//`, and a whole expression with strings of its own.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -55,18 +56,60 @@ pub const TRAIL_SEP: &str = "||";
 /// `break trail` targets the innermost trail; `trail` is a reserved label.
 pub const TRAIL_LABEL: &str = "trail";
 
+/// One piece of a string literal or a quoted symbol.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StrPiece {
+    /// A literal run. `raw` is how it was spelled, so a format pass puts the
+    /// escapes back exactly as they were written.
+    Text { value: String, raw: String },
+    /// A `\(…)` interpolation, lexed recursively (§1).
+    Expr { tokens: Vec<Token>, pos: Pos },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tok {
     Newline,
     Eof,
     Ident(String),
     Num { value: f64, raw: String },
-    /// `raw` is the spelling *between* the quotes, so a format pass can put the
-    /// escapes back exactly as they were written.
-    Str { value: String, raw: String },
-    Sym { name: String, quoted: bool },
+    Str { parts: Vec<StrPiece> },
+    Sym { parts: Vec<StrPiece>, quoted: bool },
     Kw(&'static str),
     Op(&'static str),
+}
+
+/// The literal text of `parts`, or `None` if any of it is interpolated.
+pub fn static_text(parts: &[StrPiece]) -> Option<String> {
+    let mut out = String::new();
+    for part in parts {
+        match part {
+            StrPiece::Text { value, .. } => out.push_str(value),
+            StrPiece::Expr { .. } => return None,
+        }
+    }
+    Some(out)
+}
+
+/// The source spelling of `parts`, between the quotes.
+pub fn raw_text(parts: &[StrPiece]) -> String {
+    let mut out = String::new();
+    for part in parts {
+        match part {
+            StrPiece::Text { raw, .. } => out.push_str(raw),
+            StrPiece::Expr { tokens, .. } => {
+                out.push_str("\\(");
+                for tok in tokens.iter().filter(|t| !t.is_eof()) {
+                    out.push_str(&tok.text());
+                }
+                out.push(')');
+            }
+        }
+    }
+    out
+}
+
+pub fn text_piece(value: &str) -> StrPiece {
+    StrPiece::Text { value: value.to_string(), raw: escape_string(value) }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -111,6 +154,15 @@ impl Token {
         }
     }
 
+    /// The literal text of a string or symbol token, when it does not
+    /// interpolate.
+    pub fn static_str(&self) -> Option<String> {
+        match &self.kind {
+            Tok::Str { parts } | Tok::Sym { parts, .. } => static_text(parts),
+            _ => None,
+        }
+    }
+
     /// The canonical spelling of this token, which is what the formatter emits.
     pub fn text(&self) -> String {
         match &self.kind {
@@ -118,14 +170,13 @@ impl Token {
             Tok::Eof => String::new(),
             Tok::Ident(name) => name.clone(),
             Tok::Num { raw, .. } => raw.clone(),
-            Tok::Str { raw, .. } => format!("\"{raw}\""),
-            Tok::Sym { name, quoted } => {
+            Tok::Str { parts } => format!("\"{}\"", raw_text(parts)),
+            Tok::Sym { parts, quoted } => {
                 // §12 rule 3a: a quoted symbol whose content is a valid
-                // identifier is rewritten bare.
-                if *quoted && !is_identifier(name) {
-                    format!(".\"{}\"", escape_string(name))
-                } else {
-                    format!(".{name}")
+                // identifier is rewritten bare. An interpolated one never is.
+                match static_text(parts) {
+                    Some(name) if !*quoted || is_identifier(&name) => format!(".{name}"),
+                    _ => format!(".\"{}\"", raw_text(parts)),
                 }
             }
             Tok::Kw(k) => (*k).to_string(),
@@ -255,7 +306,25 @@ impl<'a> Lexer<'a> {
 
     pub fn run(mut self) -> Result<Lexed> {
         let mut out: Vec<Token> = Vec::new();
+        self.scan(&mut out, false)?;
 
+        // A file that does not end in a newline still ends its last statement.
+        if matches!(out.last(), Some(t) if !t.is_newline()) {
+            out.push(Token::new(Tok::Newline, self.pos()));
+        }
+        let line_count = self.line.saturating_sub(if self.col == 1 { 1 } else { 0 }).max(1);
+        out.push(Token::new(Tok::Eof, self.pos()));
+
+        Ok(Lexed { tokens: out, comments: self.comments, line_count })
+    }
+
+    /// Lex into `out`.
+    ///
+    /// With `interpolation` set, the scan stops at the `)` that closes a
+    /// `\(…)` — leaving the cursor on it — and a newline before that point is
+    /// an error, since a statement is one line (§1).
+    fn scan(&mut self, out: &mut Vec<Token>, interpolation: bool) -> Result<()> {
+        let mut depth = 0i32;
         while !self.at_end() {
             let before = self.i;
             let produced = out.len();
@@ -267,10 +336,15 @@ impl<'a> Lexer<'a> {
             }
 
             if c == '\n' {
+                if interpolation {
+                    return Err(
+                        self.err("unterminated interpolation: newline inside \\(…)", self.pos())
+                    );
+                }
                 let pos = self.pos();
                 self.bump();
                 out.push(Token::new(Tok::Newline, pos));
-                set_len(&mut out, produced, 1);
+                set_len(out, produced, 1);
                 continue;
             }
 
@@ -288,49 +362,56 @@ impl<'a> Lexer<'a> {
                 continue;
             }
 
+            if interpolation && c == ')' && depth == 0 {
+                return Ok(());
+            }
+
             let pos = self.pos();
 
             if c == '"' {
-                let (value, raw) = self.string()?;
-                out.push(Token::new(Tok::Str { value, raw }, pos));
-                set_len(&mut out, produced, self.i - before);
+                let parts = self.string()?;
+                out.push(Token::new(Tok::Str { parts }, pos));
+                set_len(out, produced, self.i - before);
                 continue;
             }
 
             if c.is_ascii_digit() {
                 out.push(self.number(pos));
-                set_len(&mut out, produced, self.i - before);
+                set_len(out, produced, self.i - before);
                 continue;
             }
 
             if is_ident_start(c) {
                 out.push(self.word(pos));
-                set_len(&mut out, produced, self.i - before);
+                set_len(out, produced, self.i - before);
                 continue;
             }
 
             if c == '.' {
                 let tok = self.dot(pos, out.last())?;
                 out.push(tok);
-                set_len(&mut out, produced, self.i - before);
+                set_len(out, produced, self.i - before);
                 continue;
             }
 
             match self.operator() {
-                Some(op) => out.push(Token::new(Tok::Op(op), pos)),
+                Some(op) => {
+                    match op {
+                        "(" => depth += 1,
+                        ")" => depth -= 1,
+                        _ => {}
+                    }
+                    out.push(Token::new(Tok::Op(op), pos))
+                }
                 None => return Err(self.err(format!("unexpected character `{c}`"), pos)),
             }
-            set_len(&mut out, produced, self.i - before);
+            set_len(out, produced, self.i - before);
         }
 
-        // A file that does not end in a newline still ends its last statement.
-        if matches!(out.last(), Some(t) if !t.is_newline()) {
-            out.push(Token::new(Tok::Newline, self.pos()));
+        if interpolation {
+            return Err(self.err("unterminated interpolation: missing `)`", self.pos()));
         }
-        let line_count = self.line.saturating_sub(if self.col == 1 { 1 } else { 0 }).max(1);
-        out.push(Token::new(Tok::Eof, self.pos()));
-
-        Ok(Lexed { tokens: out, comments: self.comments, line_count })
+        Ok(())
     }
 
     fn operator(&mut self) -> Option<&'static str> {
@@ -429,20 +510,23 @@ impl<'a> Lexer<'a> {
 
         self.bump(); // the dot
         if self.peek() == Some('"') {
-            let (value, _) = self.string()?;
-            return Ok(Token::new(Tok::Sym { name: value, quoted: true }, pos));
+            // `."\(prefix)-id"` is how a symbol is built from data (§2).
+            let parts = self.string()?;
+            return Ok(Token::new(Tok::Sym { parts, quoted: true }, pos));
         }
         if !matches!(self.peek(), Some(c) if is_ident_start(c)) {
             return Err(self.err("expected a name or a quoted string after `.`", pos));
         }
         let name = self.take_ident();
-        Ok(Token::new(Tok::Sym { name, quoted: false }, pos))
+        Ok(Token::new(Tok::Sym { parts: vec![text_piece(&name)], quoted: false }, pos))
     }
 
-    /// Escapes are `\" \\ \n \t \r \0` (§1).
-    fn string(&mut self) -> Result<(String, String)> {
+    /// Escapes are `\" \\ \n \t \r \0 \(` (§1); `\(` opens an interpolation,
+    /// which is lexed recursively and may contain strings of its own.
+    fn string(&mut self) -> Result<Vec<StrPiece>> {
         let start = self.pos();
         self.bump(); // opening quote
+        let mut parts: Vec<StrPiece> = Vec::new();
         let mut value = String::new();
         let mut raw = String::new();
         loop {
@@ -458,6 +542,24 @@ impl<'a> Lexer<'a> {
             }
             if c == '\\' {
                 let esc_pos = self.pos();
+                if self.peek_at(1) == Some('(') {
+                    if !value.is_empty() || !raw.is_empty() {
+                        parts.push(StrPiece::Text {
+                            value: std::mem::take(&mut value),
+                            raw: std::mem::take(&mut raw),
+                        });
+                    }
+                    self.bump_n(2); // the `\(`
+                    let mut tokens: Vec<Token> = Vec::new();
+                    self.scan(&mut tokens, true)?;
+                    if self.peek() != Some(')') {
+                        return Err(self.err("unterminated interpolation: missing `)`", esc_pos));
+                    }
+                    self.bump(); // the `)`
+                    tokens.push(Token::new(Tok::Eof, self.pos()));
+                    parts.push(StrPiece::Expr { tokens, pos: esc_pos });
+                    continue;
+                }
                 let decoded = match self.peek_at(1) {
                     Some('"') => '"',
                     Some('\\') => '\\',
@@ -477,7 +579,10 @@ impl<'a> Lexer<'a> {
             value.push(c);
             raw.push(self.bump().unwrap());
         }
-        Ok((value, raw))
+        if !value.is_empty() || !raw.is_empty() || parts.is_empty() {
+            parts.push(StrPiece::Text { value, raw });
+        }
+        Ok(parts)
     }
 }
 

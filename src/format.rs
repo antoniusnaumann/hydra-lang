@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use crate::ast::*;
 use crate::errors::Result;
-use crate::lexer::{tokenize, Tok, Token};
+use crate::lexer::{is_identifier, static_text, tokenize, StrPiece, Tok, Token};
 use crate::parser::parse;
 
 /// Format a source file. The output is canonical and formatting it again
@@ -295,16 +295,48 @@ fn render(tokens: &[Token]) -> String {
     out
 }
 
-/// A key written as a quoted string — `headers."name"` — is the same rewrite
-/// rule 3a applies to a quoted symbol, but the lexer produced a lookup dot and
-/// a string rather than one symbol token, so it is handled here.
+/// Render a token, normalising the two things a token's own `text()` cannot:
+/// the expressions inside its interpolations (rule 3a), and a key written as a
+/// quoted string — `headers."name"` — which the lexer produced as a lookup dot
+/// followed by a string rather than as one symbol token.
 fn text_of(tok: &Token, prev: Option<&Token>) -> String {
-    if let (Tok::Str { value, .. }, Some(prev)) = (&tok.kind, prev) {
-        if prev.is_op(".") && crate::lexer::is_identifier(value) {
-            return value.clone();
+    match &tok.kind {
+        Tok::Str { parts } => {
+            if let (Some(prev), Some(literal)) = (prev, static_text(parts)) {
+                if prev.is_op(".") && is_identifier(&literal) {
+                    return literal;
+                }
+            }
+            format!("\"{}\"", render_parts(parts))
+        }
+        Tok::Sym { parts, quoted } => match static_text(parts) {
+            // Rule 3a: a quoted symbol whose content is a valid identifier is
+            // rewritten bare. One that interpolates never can be.
+            Some(name) if !*quoted || is_identifier(&name) => format!(".{name}"),
+            _ => format!(".\"{}\"", render_parts(parts)),
+        },
+        _ => tok.text(),
+    }
+}
+
+/// The inside of a string: literal runs as written, and interpolations
+/// normalised like any other expression — `\(a + b)`, never `\( a+b )` (§12
+/// rule 3a).
+fn render_parts(parts: &[StrPiece]) -> String {
+    let mut out = String::new();
+    for part in parts {
+        match part {
+            StrPiece::Text { raw, .. } => out.push_str(raw),
+            StrPiece::Expr { tokens, .. } => {
+                let inner: Vec<Token> =
+                    tokens.iter().filter(|t| !t.is_eof() && !t.is_newline()).cloned().collect();
+                out.push_str("\\(");
+                out.push_str(&render(&inner));
+                out.push(')');
+            }
         }
     }
-    tok.text()
+    out
 }
 
 fn needs_space(prev: &Token, cur: &Token, prev_is_prefix: bool) -> bool {

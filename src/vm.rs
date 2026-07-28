@@ -29,7 +29,7 @@ use crate::sched::{
 };
 use crate::value::{
     binary_op, boolean, copy_value, deref, get_member, new_dict, new_list, path_segment, read_place,
-    unary_op, write_place, Cell, Closure, Native, PathSeg, RefValue, Value,
+    sym, to_text, unary_op, write_place, Cell, Closure, Native, PathSeg, RefValue, Sym, Value,
 };
 
 #[derive(Clone, Debug)]
@@ -269,19 +269,46 @@ impl Vm {
                 let items: Vec<Value> = task.stack.split_off(at);
                 task.push(new_list(items));
             }
-            Instr::MakeDict(keys) => {
-                let at = task.stack.len() - keys.len();
-                let values: Vec<Value> = task.stack.split_off(at);
-                let entries: Vec<_> =
-                    keys.iter().cloned().zip(values).fold(Vec::new(), |mut acc, (k, v)| {
-                        // A later duplicate wins; `check` reports the literal.
-                        match acc.iter().position(|(key, _): &(_, Value)| *key == k) {
-                            Some(i) => acc[i].1 = v,
-                            None => acc.push((k, v)),
-                        }
-                        acc
-                    });
+            Instr::MakeDict(n) => {
+                let at = task.stack.len() - n * 2;
+                let flat: Vec<Value> = task.stack.split_off(at);
+                let mut entries: Vec<(Sym, Value)> = Vec::with_capacity(n);
+                let mut pairs = flat.into_iter();
+                while let (Some(key), Some(value)) = (pairs.next(), pairs.next()) {
+                    let Value::Sym(key) = key else {
+                        return Err(Crash::new(format!(
+                            "a dict key must be a symbol, got a {}",
+                            key.kind()
+                        )));
+                    };
+                    // A later duplicate wins; `check` reports the literal.
+                    match entries.iter().position(|(k, _)| *k == key) {
+                        Some(i) => entries[i].1 = value,
+                        None => entries.push((key, value)),
+                    }
+                }
                 task.push(new_dict(entries));
+            }
+            Instr::Interpolate(n) => {
+                let at = task.stack.len() - n;
+                let parts: Vec<Value> = task.stack.split_off(at);
+                let mut text = String::new();
+                for part in &parts {
+                    text.push_str(&to_text(part));
+                }
+                task.push(Value::Str(Rc::from(text.as_str())));
+            }
+            Instr::MakeSym => {
+                let value = task.pop();
+                match &value {
+                    Value::Str(text) => task.push(Value::Sym(sym(text))),
+                    other => {
+                        return Err(Crash::new(format!(
+                            "a symbol is built from a string, got a {}",
+                            other.kind()
+                        )))
+                    }
+                }
             }
             Instr::MakeClosure { name, params, chunk } => {
                 let scope = task.scope().clone();

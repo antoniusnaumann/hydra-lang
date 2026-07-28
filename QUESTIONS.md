@@ -34,32 +34,29 @@ code.
 
 ---
 
-## 2. List indexing (spec §15.2, §5)
+## 2. List indexing — **DECIDED by the owner** (spec §15.2, §5)
 
-Not specified: base, negative indices, out-of-range behaviour.
+**Ruling:** 0-based, and a **negative index counts from the end**, so `a[-1]` is
+the last element. A non-integer index crashes; an index still outside the list
+after wrapping crashes, consistent with a missing dict key. Implemented in
+`resolve_index` in `src/value.rs`.
 
-**Chosen:** 0-based. A non-integer index crashes. A negative or out-of-range
-index crashes, consistent with a missing dict key. `a[i] = v` requires an
-existing index and never extends a list — without a stdlib there is no `push`,
-so lists can currently only be built as literals.
-
-**Cost if changed:** `path_segment` and `list_index` in `src/value.rs`, plus
-`check`'s constant-index diagnostic.
+`a[i] = v` still requires an existing index and never extends a list — until
+there is a `push`, lists can only be built as literals.
 
 ---
 
-## 3. Value-to-string conversion — **near-blocking** (spec §15.1a)
+## 3. Value-to-string conversion — **DECIDED by the owner** (spec §1)
 
-Interpolation is gone and `+` concatenates in its place. For that swap to be
-even, `+` has to accept a string and a non-string: otherwise nothing in the
-language can render a number as text, and `print(count + " done")` — the
-straightforward replacement for `print("\(count) done")` — does not work.
+The first spec update removed interpolation on the grounds that `+` covered it.
+It did not: without conversion nothing could render a number as text, and with
+conversion `+` becomes silently lossy.
 
-**Chosen:** if **either** operand of `+` is a string, the result is a string and
-the other operand is converted. This follows JavaScript, which the spec follows
-for numbers elsewhere. Every other arithmetic operator stays numbers-only.
+**Ruling:** interpolation is back, and `+` does **not** convert. `+` joins two
+strings or adds two numbers; a string and a non-string is a bad operand, and the
+crash says to interpolate instead. `"n = \(count)"` is how a value is rendered.
 
-The conversions, again following the spec's JavaScript alignment for numbers:
+Interpolation is therefore where the text form of a value is defined:
 
 | Value | Text |
 |---|---|
@@ -72,16 +69,19 @@ The conversions, again following the spec's JavaScript alignment for numbers:
 
 **Cost if changed:** `to_text` in `src/value.rs`.
 
+A list or dict renders as its literal form, which round-trips through the
+parser. Nothing in the spec asks for that, but it makes `"\(d)"` useful for
+debugging while there is no standard library.
+
 ---
 
-## 3a. Building a symbol from a string — **BLOCKING for decoded data** (§15.1b)
+## 3a. Building a symbol from a string — **RESOLVED** (§2)
 
-`."\(prefix)-id"` used to be the way to mint a symbol at runtime. With
-interpolation gone there is no spelling for it at all, so a program that decodes
-JSON cannot turn a decoded key into a dict key.
+`."\(prefix)-id"` is the spelling, and it works again now that interpolation is
+back: the symbol is built and interned at run time. No `sym(str)` is needed.
 
-**Chosen:** nothing — this one has no workaround that is not language design.
-A `sym(str)` in the stdlib is the obvious fix.
+Symbols minted this way are exactly why §2 requires the intern table to be
+collectable; it is, by weak entries.
 
 ---
 
@@ -90,8 +90,8 @@ A `sym(str)` in the stdlib is the obvious fix.
 The spec gives `+ - * / %` and `< > <= >=` without saying what they accept, and
 "bad operand" is listed as a crash.
 
-**Chosen:** `+` concatenates when either side is a string (see §3 above);
-everything else is **numbers only** and anything else crashes. `%` follows
+**Chosen:** `+` concatenates two strings and adds two numbers (see §3 above);
+every operator is otherwise **numbers only** and anything else crashes. `%` follows
 C/JavaScript (`fmod`, sign of the dividend), not Python's floored `%`. Division
 by zero yields `Infinity`/`NaN` like every other f64 operation rather than
 crashing, since the spec makes numbers IEEE doubles.

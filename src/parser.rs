@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 use crate::ast::*;
 use crate::errors::{HydraError, Pos, Result};
-use crate::lexer::{tokenize, Tok, Token, TRAIL_LABEL, TRAIL_SEP};
+use crate::lexer::{static_text, tokenize, StrPiece, Tok, Token, TRAIL_LABEL, TRAIL_SEP};
 
 /// Keywords that end a block body without being part of it.
 const BLOCK_ENDERS: &[&str] = &["end", "else", "else if"];
@@ -581,6 +581,42 @@ impl<'a> Parser<'a> {
         Ok(cells)
     }
 
+    // --- string interpolation (§1) -----------------------------------------
+
+    /// Parse the pieces of a string or quoted symbol. Each `\(…)` was lexed
+    /// recursively, so each one is parsed here as an ordinary expression.
+    fn str_parts(&self, pieces: &[StrPiece]) -> Result<Vec<StrPart>> {
+        let mut parts = Vec::new();
+        for piece in pieces {
+            match piece {
+                StrPiece::Text { value, .. } => {
+                    if !value.is_empty() {
+                        parts.push(StrPart::Text(value.clone()));
+                    }
+                }
+                StrPiece::Expr { tokens, pos } => {
+                    let mut sub = Parser::new(tokens.clone(), self.file, self.in_cell);
+                    let expr = sub.parse_expr()?;
+                    if !sub.peek().is_eof() {
+                        return self.err(
+                            format!("unexpected {} in an interpolation", sub.peek()),
+                            sub.pos(),
+                        );
+                    }
+                    let _ = pos;
+                    parts.push(StrPart::Expr(expr));
+                }
+            }
+        }
+        Ok(parts)
+    }
+
+    fn sym_lit(&self, pieces: &[StrPiece], quoted: bool, pos: Pos) -> Result<SymLit> {
+        let parts = self.str_parts(pieces)?;
+        let name = static_text(pieces).unwrap_or_default();
+        Ok(SymLit { name, quoted, parts, pos })
+    }
+
     // --- expressions (§3 precedence table) ---------------------------------
 
     pub fn parse_expr(&mut self) -> Result<Expr> {
@@ -719,8 +755,10 @@ impl<'a> Parser<'a> {
             if self.peek().is_op(".") {
                 self.advance();
                 let key = match &self.peek().kind {
-                    Tok::Ident(name) => SymLit { name: name.clone(), quoted: false, pos },
-                    Tok::Str { value, .. } => SymLit { name: value.clone(), quoted: true, pos },
+                    Tok::Ident(name) => SymLit::plain(name.clone(), false, pos),
+                    // `headers."content-type"` is `headers[."content-type"]`,
+                    // and it may interpolate like any other quoted symbol (§2).
+                    Tok::Str { parts } => self.sym_lit(parts, true, pos)?,
                     _ => return self.err(
                         format!("expected a key name after `.`, found {}", self.peek()),
                         self.pos(),
@@ -752,13 +790,15 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok(Expr::Num { value, raw, pos })
             }
-            Tok::Str { value, raw } => {
+            Tok::Str { parts } => {
+                let parts = self.str_parts(&parts)?;
                 self.advance();
-                Ok(Expr::Str { value: Rc::from(value.as_str()), raw, pos })
+                Ok(Expr::Str { parts, pos })
             }
-            Tok::Sym { name, quoted } => {
+            Tok::Sym { parts, quoted } => {
+                let sym = self.sym_lit(&parts, quoted, pos)?;
                 self.advance();
-                Ok(Expr::Sym(SymLit { name, quoted, pos }))
+                Ok(Expr::Sym(sym))
             }
             Tok::Ident(name) => {
                 self.advance();
@@ -797,7 +837,7 @@ impl<'a> Parser<'a> {
             loop {
                 let key_pos = self.pos();
                 let key = match &self.peek().kind {
-                    Tok::Sym { name, quoted } => SymLit { name: name.clone(), quoted: *quoted, pos: key_pos },
+                    Tok::Sym { parts, quoted } => self.sym_lit(parts, *quoted, key_pos)?,
                     _ => {
                         return self.err(
                             format!(

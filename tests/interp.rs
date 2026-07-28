@@ -74,13 +74,42 @@ fn bitwise_is_32_bit_javascript() {
 }
 
 #[test]
-fn strings_concatenate_with_plus() {
+fn strings_concatenate_with_plus_but_never_convert() {
     assert_eq!(expr("\"hi \" + \"there\""), "hi there");
-    // QUESTIONS.md §3: a string and a non-string converts, which is what makes
-    // `+` a replacement for the interpolation the owner removed.
-    assert_eq!(expr("\"n = \" + 3"), "n = 3");
-    assert_eq!(expr("3 + \" apples\""), "3 apples");
-    assert_eq!(expr("\"tag \" + .ok"), "tag .ok");
+    // `+` joins two strings or adds two numbers. A string and a non-string is
+    // a bad operand, not a silent conversion: interpolation is how a value is
+    // rendered (QUESTIONS.md §3).
+    assert!(crash_of("x := \"n = \" + 3\n").contains("interpolate"));
+    assert!(crash_of("x := 3 + \" apples\"\n").contains("interpolate"));
+    assert!(crash_of("x := \"tag \" + .ok\n").contains("interpolate"));
+}
+
+#[test]
+fn interpolation_renders_any_expression() {
+    assert_eq!(eval("name := \"world\"\nx := \"hi \\(name)\"\n", "x"), "hi world");
+    assert_eq!(expr("\"\\(1 + 2) apples\""), "3 apples");
+    assert_eq!(expr("\"tag \\(.ok)\""), "tag .ok");
+    assert_eq!(expr("\"\\([1, 2])\""), "[1, 2]");
+    assert_eq!(expr("\"\\({ .a : 1 })\""), "{ .a : 1 }");
+    // Nested: an interpolation may contain a string with its own.
+    assert_eq!(eval("n := 2\nx := \"a \\(\"b \\(n)\")\"\n", "x"), "a b 2");
+    // §14's line, now that it works again.
+    assert_eq!(eval("down := 1\nx := \"\\(3 - down)/3 regions live\"\n", "x"), "2/3 regions live");
+}
+
+#[test]
+fn a_symbol_can_be_built_by_interpolation() {
+    // §2: dynamic symbol construction without a separate `sym(str)` builtin.
+    let src = "
+prefix := \"x\"
+key := .\"\\(prefix)-id\"
+d := { .\"\\(prefix)-id\" : 7 }
+seen := d[key]
+same := key === .\"x-id\"
+";
+    assert_eq!(eval(src, "seen"), "7");
+    assert_eq!(eval(src, "same"), ".true");
+    assert_eq!(eval(src, "key"), ".\"x-id\"");
 }
 
 #[test]
@@ -120,8 +149,12 @@ fn list_indexing() {
     // QUESTIONS.md §2: 0-based, whole numbers, out of range crashes.
     assert_eq!(expr("[10, 20, 30][0]"), "10");
     assert_eq!(expr("[10, 20, 30][2]"), "30");
+    // A negative index counts from the end (§15.2, ruled on by the owner).
+    assert_eq!(expr("[10, 20, 30][0 - 1]"), "30");
+    assert_eq!(expr("[10, 20, 30][0 - 3]"), "10");
+    assert_eq!(eval("a := [1, 2]\na[0 - 1] = 9\nx := a[1]\n", "x"), "9");
     assert!(crash_of("x := [1, 2][2]\n").contains("out of range"));
-    assert!(crash_of("x := [1, 2][0 - 1]\n").contains("out of range"));
+    assert!(crash_of("x := [1, 2][0 - 3]\n").contains("out of range"));
     assert!(crash_of("x := [1, 2][0.5]\n").contains("whole number"));
 }
 

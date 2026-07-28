@@ -41,7 +41,14 @@ pub enum Instr {
     PushStr(Rc<str>),
     PushSym(Sym),
     MakeList(usize),
-    MakeDict(Rc<Vec<Sym>>),
+    /// Pops `n` key/value pairs. Keys are values rather than a static table
+    /// because a key may be built at run time: `{ ."\(prefix)-id" : 1 }`.
+    MakeDict(usize),
+    /// Pops `n` values and concatenates their text forms: one `"…\(x)…"` (§1).
+    Interpolate(usize),
+    /// Pops a string and interns it as a symbol — the runtime half of a
+    /// symbol built by interpolation (§2).
+    MakeSym,
     MakeClosure { name: Rc<str>, params: Rc<Vec<Rc<str>>>, chunk: Rc<Chunk> },
     Pop,
 
@@ -503,12 +510,8 @@ impl Compiler {
             Expr::Num { value, pos, .. } => {
                 self.emit(Instr::PushNum(*value), *pos);
             }
-            Expr::Str { value, pos, .. } => {
-                self.emit(Instr::PushStr(value.clone()), *pos);
-            }
-            Expr::Sym(s) => {
-                self.emit(Instr::PushSym(sym(&s.name)), s.pos);
-            }
+            Expr::Str { parts, pos } => self.interpolated(parts, *pos)?,
+            Expr::Sym(s) => self.symbol(s)?,
             Expr::List { items, pos } => {
                 for item in items {
                     self.expr(item)?;
@@ -516,11 +519,11 @@ impl Compiler {
                 self.emit(Instr::MakeList(items.len()), *pos);
             }
             Expr::Dict { entries, pos } => {
-                let keys: Vec<Sym> = entries.iter().map(|(k, _)| sym(&k.name)).collect();
-                for (_, value) in entries {
+                for (key, value) in entries {
+                    self.symbol(key)?;
                     self.expr(value)?;
                 }
-                self.emit(Instr::MakeDict(Rc::new(keys)), *pos);
+                self.emit(Instr::MakeDict(entries.len()), *pos);
             }
             Expr::Name { name, pos } => {
                 self.emit(Instr::Load(Root::Name(Rc::from(name.as_str()))), *pos);
@@ -536,7 +539,7 @@ impl Compiler {
             }
             Expr::Key { obj, key, pos } => {
                 self.expr(obj)?;
-                self.emit(Instr::PushSym(sym(&key.name)), key.pos);
+                self.symbol(key)?;
                 self.emit(Instr::GetMember, *pos);
             }
             Expr::Index { obj, index, pos } => {
@@ -582,6 +585,41 @@ impl Compiler {
             },
             Expr::Closure(def) => self.closure(def, "", def.pos)?,
         }
+        Ok(())
+    }
+
+    /// A string literal: one instruction when it is literal, a concatenation
+    /// of its pieces when it interpolates (§1).
+    fn interpolated(&mut self, parts: &[StrPart], pos: Pos) -> Result<()> {
+        if parts.is_empty() {
+            self.emit(Instr::PushStr(Rc::from("")), pos);
+            return Ok(());
+        }
+        if let [StrPart::Text(text)] = parts {
+            self.emit(Instr::PushStr(Rc::from(text.as_str())), pos);
+            return Ok(());
+        }
+        for part in parts {
+            match part {
+                StrPart::Text(text) => {
+                    self.emit(Instr::PushStr(Rc::from(text.as_str())), pos);
+                }
+                StrPart::Expr(expr) => self.expr(expr)?,
+            }
+        }
+        self.emit(Instr::Interpolate(parts.len()), pos);
+        Ok(())
+    }
+
+    /// A symbol: interned at compile time, or built and interned at run time
+    /// when it interpolates.
+    fn symbol(&mut self, symbol: &SymLit) -> Result<()> {
+        if symbol.is_static() {
+            self.emit(Instr::PushSym(sym(&symbol.name)), symbol.pos);
+            return Ok(());
+        }
+        self.interpolated(&symbol.parts, symbol.pos)?;
+        self.emit(Instr::MakeSym, symbol.pos);
         Ok(())
     }
 
@@ -646,9 +684,7 @@ impl Compiler {
         let count = segs.len();
         for seg in segs.into_iter().rev() {
             match seg {
-                Expr::Key { key, .. } => {
-                    self.emit(Instr::PushSym(sym(&key.name)), key.pos);
-                }
+                Expr::Key { key, .. } => self.symbol(key)?,
                 Expr::Index { index, .. } => {
                     self.expr(index)?;
                 }

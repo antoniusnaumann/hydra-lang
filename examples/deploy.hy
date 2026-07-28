@@ -25,7 +25,7 @@ manifest := json::decode(read_file("deploy.json"))
 img := manifest.image // same as manifest[.image]
 
 for name in REGIONS
-	print("target " + name + " -> " + img)
+	print("target \(name) -> \(img)")
 end
 
 eu := .null
@@ -47,4 +47,4 @@ end
 if down > 0
 	rollback()
 end
-print((3 - down) + "/3 regions live")
+print("\(3 - down)/3 regions live")

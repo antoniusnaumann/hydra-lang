@@ -30,7 +30,7 @@ third := .null
 
 parallel
 	first = "eu" || second = "us"             || third = "ap"
-	             || second = second + "-east" ||
+	             || second = "\(second)-east" ||
 end
 
 regions := [first, second, third]
