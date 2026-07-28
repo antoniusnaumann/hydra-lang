@@ -43,7 +43,7 @@ index crashes, consistent with a missing dict key. `a[i] = v` requires an
 existing index and never extends a list — without a stdlib there is no `push`,
 so lists can currently only be built as literals.
 
-**Cost if changed:** one function (`index_of`) in `hydra/values.py`, plus
+**Cost if changed:** `path_segment` and `list_index` in `src/value.rs`, plus
 `check`'s constant-index diagnostic.
 
 ---
@@ -70,7 +70,7 @@ The conversions, again following the spec's JavaScript alignment for numbers:
 | dict | `{ .a : 1 }` |
 | closure | `fn(a, b)` |
 
-**Cost if changed:** `to_text` in `hydra/values.py`.
+**Cost if changed:** `to_text` in `src/value.rs`.
 
 ---
 
@@ -96,7 +96,7 @@ C/JavaScript (`fmod`, sign of the dividend), not Python's floored `%`. Division
 by zero yields `Infinity`/`NaN` like every other f64 operation rather than
 crashing, since the spec makes numbers IEEE doubles.
 
-**Cost if changed:** `binary_op` in `hydra/values.py`.
+**Cost if changed:** `binary_op` in `src/value.rs`.
 
 ---
 
@@ -172,8 +172,10 @@ meaningful per file. Imported names bind to the *module's own storage cell*, so
 
 Implemented exactly as recommended, listed so they are easy to revisit:
 
-- §9.1 coroutines on one OS thread; preemption at statement boundaries and every
-  N interpreter steps (`--step-budget`, default 256).
+- §9.1 green threads on one OS thread; preemption at every statement boundary
+  and at every loop iteration (`--step-budget`, default 1 statement per slice,
+  raisable). Round-robin, so a schedule is reproducible and a test can assert
+  on it.
 - §9.4 `race`'s `end` releases control immediately; orphaned losers keep running
   and the program waits for them at exit.
 - §4 a `parallel`/`race` block may not appear syntactically inside a cell;
@@ -191,3 +193,54 @@ Implemented exactly as recommended, listed so they are easy to revisit:
 - §5.1/§15.2a whether `===` gains a real identity stamp. **Chosen:** COW storage,
   as §5.1 says, including the documented consequence that an untouched copy
   reports identical.
+
+---
+
+## 13. A label on a `parallel` / `race` block (spec §9.6)
+
+"A loop or block may be labelled with `as name`, and `break name` /
+`continue name` target it." What `break name` means when `name` labels a
+*block* rather than a loop is not stated, and a trail cannot cancel its
+siblings — "cancelling siblings is `race`'s job alone".
+
+**Chosen:** `break <block label>` from inside a trail ends **that trail**,
+exactly like `break trail`. `continue <block label>` is rejected: there is no
+next iteration of a block.
+
+---
+
+## 14. What `parallel while` / `race while` spawn (spec §3, §9)
+
+The grammar has the form but no semantics beyond the block kinds.
+
+**Chosen:** the condition is evaluated in the *parent*, and each time it is
+truthy the body is spawned as one more trail; the block then joins (or decides,
+for `race`) as usual. So `parallel while` is `while`, with each iteration's body
+becoming a trail instead of running inline.
+
+Left unresolved: whether a `race while` should stop spawning as soon as the race
+is decided. It currently spawns while the condition holds; trails spawned after
+the decision are born cancelled and so run no statement at all.
+
+---
+
+## 15. Rooting an assignment or a `&`
+
+§5.1 allows `&` on "a variable, a dict key, a list element", and the §3 grammar
+writes an lvalue as `postfix "." ident`, which would also admit `f().x = 1`.
+
+**Chosen:** an assignment target and a `&` target must be rooted at a **name**
+(possibly `mod::name`). `f().x = 1` is a compile error, since it could only ever
+write into a temporary.
+
+---
+
+## 16. `break trail` is lexical (spec §9.6)
+
+"`break trail` ends the innermost trail from any depth." Block depth and call
+depth are both "depth".
+
+**Chosen:** block depth. `break trail` is valid anywhere lexically inside a
+trail body, including inside loops and `if`s, but not inside a function the
+trail calls — a function does not know it is running in a trail, and making it
+know would need the dynamic trail stack that `alive()` deliberately replaces.

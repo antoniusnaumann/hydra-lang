@@ -18,6 +18,12 @@ use crate::value::{Cell, Value};
 
 pub type ScopeRef = Rc<Scope>;
 
+impl std::fmt::Debug for Scope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Scope{:?}", self.names())
+    }
+}
+
 pub struct Scope {
     vars: RefCell<HashMap<Rc<str>, Cell>>,
     parent: Option<ScopeRef>,

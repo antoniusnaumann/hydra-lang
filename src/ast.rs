@@ -76,9 +76,13 @@ impl Expr {
     }
 
     /// Only a variable, a dict key or a list element may be assigned to or
-    /// referenced with `&` (§5.1).
+    /// referenced with `&` (§5.1). A name selected out of a module is a
+    /// variable too, so `mod::x = 1` is allowed (QUESTIONS.md §15).
     pub fn is_lvalue(&self) -> bool {
-        matches!(self, Expr::Name { .. } | Expr::Key { .. } | Expr::Index { .. })
+        matches!(
+            self,
+            Expr::Name { .. } | Expr::Key { .. } | Expr::Index { .. } | Expr::Namespace { .. }
+        )
     }
 
     /// The variable an lvalue is rooted at, if it is rooted at one at all.

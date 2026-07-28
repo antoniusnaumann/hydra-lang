@@ -39,7 +39,12 @@ pub struct Options {
     pub strict: bool,
     /// Dead-trail crashes are reported on stderr by default; silenceable.
     pub report_dead_crashes: bool,
-    /// Preemption granularity: statement boundaries and every N steps (§9.1).
+    /// How many statement boundaries a trail runs before the scheduler looks
+    /// at the others. §9.1 asks for a preemption check at every statement
+    /// boundary, so 1 is the finest — and the default: it makes a trail's
+    /// progress independent of how long its siblings are, and keeps a runaway
+    /// loop from starving the block it is in. A larger value trades
+    /// interleaving for scheduler overhead.
     pub step_budget: u32,
     pub search_path: Vec<PathBuf>,
 }
@@ -49,7 +54,7 @@ impl Default for Options {
         let search_path = std::env::var("HYDRA_PATH")
             .map(|v| v.split(':').filter(|s| !s.is_empty()).map(PathBuf::from).collect())
             .unwrap_or_default();
-        Options { strict: false, report_dead_crashes: true, step_budget: 256, search_path }
+        Options { strict: false, report_dead_crashes: true, step_budget: 1, search_path }
     }
 }
 
@@ -86,6 +91,7 @@ pub struct Vm {
     pub dead_crashes: Vec<Crash>,
 }
 
+#[derive(Debug)]
 pub struct RunResult {
     pub crash: Option<Crash>,
     pub dead_crashes: Vec<Crash>,
