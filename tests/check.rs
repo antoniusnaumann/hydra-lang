@@ -274,20 +274,28 @@ fn a_reference_crossing_into_a_trail() {
 }
 
 #[test]
-fn the_reference_program_checks_clean_with_its_placeholders_declared() {
+fn the_reference_program_reports_no_errors() {
+    // §14's program imports `fmt`, `http` and `json`, which do not exist, so
+    // name resolution switches off and the placeholders it calls cannot be
+    // called guaranteed-crashes. What is left is warnings.
     let src = std::fs::read_to_string("examples/deploy.hy").expect("example");
     let program = parse(&src, "examples/deploy.hy").expect("parses");
-    let externs = [
-        "print", "read_file", "lease", "push", "wait_ready", "healthy", "drain", "smoke", "live",
-        "rollback", "decode",
-    ];
-    let report = check_program(
-        &program,
-        &CheckOptions {
-            externs: externs.iter().map(|s| s.to_string()).collect(),
-            search_path: Vec::new(),
-        },
-    );
+    let report = check_program(&program, &options());
     let errors: Vec<_> = report.errors().collect();
     assert!(errors.is_empty(), "the spec's own program should check clean: {errors:?}");
+    assert!(report.codes().contains(&"unresolved-module"));
+}
+
+#[test]
+fn externs_stand_in_for_the_missing_standard_library() {
+    // With every module resolvable, a placeholder call *is* a guaranteed
+    // crash — unless the host is known to supply it (QUESTIONS.md §1).
+    let src = "use json
+print(json::decode(\"x\"))\n";
+    let program = parse(src, "tests/fixtures/t.hy").expect("parses");
+    assert_eq!(check_program(&program, &options()).codes(), vec!["undeclared-name"]);
+
+    let with_extern =
+        CheckOptions { externs: vec!["print".into()], search_path: Vec::new() };
+    assert!(check_program(&program, &with_extern).codes().is_empty());
 }

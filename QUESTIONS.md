@@ -244,3 +244,32 @@ depth are both "depth".
 trail body, including inside loops and `if`s, but not inside a function the
 trail calls — a function does not know it is running in a trail, and making it
 know would need the dynamic trail stack that `alive()` deliberately replaces.
+
+---
+
+## 17. Trailing comments and cells (spec §12)
+
+§12's rules cover indentation, spacing, dict literals and column padding, but
+say nothing about comments or about the inside of a cell.
+
+**Chosen:**
+
+- A trailing comment is separated from the code by exactly one space. The
+  alignment in the spec's own §14 listing is therefore not preserved — it is
+  the kind of thing rule 5 says the formatter owns.
+- A cell's contents are rendered with the ordinary spacing rules but with **no
+  indentation of their own**, even when a cell holds an `if` spanning three
+  rows. Tabs inside a padded column would break the alignment the same rule
+  demands, and the alternative — padding with spaces inside cells — makes the
+  block's own indentation ambiguous.
+
+---
+
+## 18. How a program reports anything at all
+
+Not a spec hole so much as the sharpest edge of §1 above, listed separately
+because it affects the tools rather than the language.
+
+`hydra run --dump-scope` prints the toplevel bindings a program ends with. It
+exists so that the interpreter can be demonstrated and tested at all, and it is
+a flag on the tool, not a builtin: nothing in the language can reach it.

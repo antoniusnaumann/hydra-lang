@@ -232,9 +232,13 @@ impl Vm {
                 crash.site = Site::new(frame.chunk.file.to_string(), pos);
             }
         }
-        for frame in task.frames.iter().rev().skip(1) {
+        // A frame records where it was called *from*, which is a position in
+        // the frame below it, so that is the file to name.
+        for i in (1..task.frames.len()).rev() {
+            let frame = &task.frames[i];
             if frame.call_site.is_known() {
-                crash.trace.push(Site::new(frame.chunk.file.to_string(), frame.call_site));
+                let caller = &task.frames[i - 1];
+                crash.trace.push(Site::new(caller.chunk.file.to_string(), frame.call_site));
             }
         }
         crash
