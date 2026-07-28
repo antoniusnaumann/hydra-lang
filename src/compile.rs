@@ -49,7 +49,7 @@ pub enum Instr {
     /// Pops a string and interns it as a symbol — the runtime half of a
     /// symbol built by interpolation (§2).
     MakeSym,
-    MakeClosure { name: Rc<str>, params: Rc<Vec<Rc<str>>>, chunk: Rc<Chunk> },
+    MakeClosure { name: Rc<str>, params: Rc<Vec<ParamInfo>>, chunk: Rc<Chunk> },
     Pop,
 
     /// Read a variable: dereference a `&` transparently, then copy (§5.1).
@@ -90,6 +90,11 @@ pub enum Instr {
     /// stops (§9.1, §9.5).
     Tick,
 
+    /// Jump past a parameter's default when the call supplied that argument.
+    /// Defaults are evaluated in the *function's* scope, so a later one can
+    /// refer to an earlier parameter.
+    SkipIfProvided { index: usize, target: usize },
+
     /// Open a `parallel` / `race` block.
     BeginBlock { kind: BlockKind, label: Option<Rc<str>> },
     /// Start one trail of the open block. With `var`, the top of the stack
@@ -103,6 +108,15 @@ pub enum Instr {
     Use(Rc<str>),
 }
 
+/// What a call has to supply for one parameter.
+#[derive(Clone, Debug)]
+pub struct ParamInfo {
+    pub name: Rc<str>,
+    /// `&name`: the argument must be a reference (§5.1).
+    pub by_ref: bool,
+    pub has_default: bool,
+}
+
 /// A compiled body: a function, a module, a trail, or a closure.
 pub struct Chunk {
     pub name: String,
@@ -110,7 +124,13 @@ pub struct Chunk {
     pub code: Vec<Instr>,
     /// One position per instruction, for crash diagnostics.
     pub pos: Vec<Pos>,
-    pub params: Vec<Rc<str>>,
+    pub params: Vec<ParamInfo>,
+}
+
+impl Chunk {
+    pub fn required(&self) -> usize {
+        self.params.iter().filter(|p| !p.has_default).count()
+    }
 }
 
 impl std::fmt::Debug for Chunk {
@@ -164,7 +184,7 @@ impl Compiler {
         }
     }
 
-    fn finish(self, name: String, params: Vec<Rc<str>>) -> Chunk {
+    fn finish(self, name: String, params: Vec<ParamInfo>) -> Chunk {
         Chunk { name, file: self.file, code: self.code, pos: self.pos, params }
     }
 
@@ -184,7 +204,8 @@ impl Compiler {
             | Instr::JumpIfFalse(t)
             | Instr::AndJump(t)
             | Instr::OrJump(t)
-            | Instr::IterNext { exit: t, .. } => *t = target,
+            | Instr::IterNext { exit: t, .. }
+            | Instr::SkipIfProvided { target: t, .. } => *t = target,
             other => panic!("cannot patch {other:?}"),
         }
     }
@@ -625,6 +646,15 @@ impl Compiler {
 
     fn closure(&mut self, def: &Rc<ClosureDef>, name: &str, pos: Pos) -> Result<()> {
         let mut sub = Compiler::new(&self.file, self.in_trail);
+        // The prologue fills in the parameters the call did not supply.
+        for (index, param) in def.params.iter().enumerate() {
+            let Some(default) = &param.default else { continue };
+            let skip = sub.emit(Instr::SkipIfProvided { index, target: 0 }, param.pos);
+            sub.expr(default)?;
+            sub.emit(Instr::Declare(Rc::from(param.name.as_str())), param.pos);
+            let after = sub.here();
+            sub.patch(skip, after);
+        }
         match &def.body {
             ClosureBody::Expr(expr) => {
                 sub.expr(expr)?;
@@ -638,7 +668,15 @@ impl Compiler {
                 sub.emit(Instr::ReturnNull, def.end_pos);
             }
         }
-        let params: Vec<Rc<str>> = def.params.iter().map(|p| Rc::from(p.as_str())).collect();
+        let params: Vec<ParamInfo> = def
+            .params
+            .iter()
+            .map(|p| ParamInfo {
+                name: Rc::from(p.name.as_str()),
+                by_ref: p.by_ref,
+                has_default: p.default.is_some(),
+            })
+            .collect();
         let display = if name.is_empty() { "fn".to_string() } else { name.to_string() };
         let chunk = Rc::new(sub.finish(display, params.clone()));
         self.emit(

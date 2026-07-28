@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use crate::ast::*;
 use crate::errors::{Diagnostic, Pos, Report, Site};
 use crate::lexer::{is_private, Tok};
+use crate::value::Native;
 use crate::parser::parse;
 
 #[derive(Clone, Debug, Default)]
@@ -38,11 +39,49 @@ impl CheckOptions {
     }
 }
 
+/// What a call to a known function has to supply.
+#[derive(Clone, Debug, PartialEq)]
+struct Signature {
+    required: usize,
+    total: usize,
+    /// Which parameters the call must mark with `&` (§5.1).
+    by_ref: Vec<bool>,
+    label: String,
+}
+
+impl Signature {
+    fn of(def: &ClosureDef, name: &str) -> Signature {
+        Signature {
+            required: def.required(),
+            total: def.params.len(),
+            by_ref: def.params.iter().map(|p| p.by_ref).collect(),
+            label: name.to_string(),
+        }
+    }
+
+    fn native(native: Native) -> Signature {
+        Signature {
+            required: native.required(),
+            total: native.total(),
+            by_ref: native.by_ref().to_vec(),
+            label: native.signature().to_string(),
+        }
+    }
+
+    fn wanted(&self) -> String {
+        if self.required == self.total {
+            format!("{}", self.required)
+        } else {
+            format!("{} to {}", self.required, self.total)
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct Binding {
     pos: Pos,
-    /// Set when the name is bound to a function whose arity is knowable.
-    arity: Option<usize>,
+    /// Set when the name is bound to a function whose signature is knowable.
+    arity: Option<Signature>,
     /// Set when the name is bound to a dict literal and never written to, so
     /// its key set is exactly known.
     keys: Option<Vec<String>>,
@@ -74,7 +113,7 @@ struct Label {
 }
 
 struct ModuleInfo {
-    exports: HashMap<String, Option<usize>>,
+    exports: HashMap<String, Option<Signature>>,
 }
 
 pub fn check_program(program: &Program, options: &CheckOptions) -> Report {
@@ -119,8 +158,8 @@ struct Checker<'a> {
     read: HashSet<String>,
     externs: HashSet<String>,
     modules: HashMap<String, ModuleInfo>,
-    /// Names `use` brought in: name -> (module alias, arity).
-    imports: HashMap<String, (String, Option<usize>)>,
+    /// Names `use` brought in: name -> (module alias, signature).
+    imports: HashMap<String, (String, Option<Signature>)>,
     /// False as soon as one `use` cannot be resolved: then no name-resolution
     /// diagnostic is trustworthy, so none are emitted.
     names_are_knowable: bool,
@@ -248,7 +287,7 @@ impl<'a> Checker<'a> {
                 );
             }
             for (export, arity) in &exports {
-                self.imports.insert(export.clone(), (name.clone(), *arity));
+                self.imports.insert(export.clone(), (name.clone(), arity.clone()));
             }
             self.modules.insert(name.clone(), ModuleInfo { exports });
         }
@@ -285,7 +324,7 @@ impl<'a> Checker<'a> {
         self.lookup(name).is_some()
             || self.imports.contains_key(name)
             || self.externs.contains(name)
-            || name == "alive"
+            || Native::lookup(name).is_some()
     }
 
     fn trail_local_pos(&self, name: &str) -> Option<Pos> {
@@ -297,9 +336,10 @@ impl<'a> Checker<'a> {
     fn hoist(&mut self, body: &[Stmt]) {
         for stmt in body {
             match stmt {
-                Stmt::FnDecl { name, def, pos } => {
-                    self.declare(name, Binding { pos: *pos, arity: Some(def.params.len()), keys: None })
-                }
+                Stmt::FnDecl { name, def, pos } => self.declare(
+                    name,
+                    Binding { pos: *pos, arity: Some(Signature::of(def, name)), keys: None },
+                ),
                 Stmt::Decl { name, value, pos } => {
                     let binding = self.binding_for(name, value, *pos);
                     self.declare(name, binding);
@@ -315,7 +355,7 @@ impl<'a> Checker<'a> {
             return binding;
         }
         match value {
-            Expr::Closure(def) => binding.arity = Some(def.params.len()),
+            Expr::Closure(def) => binding.arity = Some(Signature::of(def, name)),
             Expr::Dict { entries, .. } if entries.iter().all(|(k, _)| k.is_static()) => {
                 binding.keys = Some(entries.iter().map(|(k, _)| k.name.clone()).collect())
             }
@@ -343,7 +383,10 @@ impl<'a> Checker<'a> {
         match stmt {
             Stmt::Use { .. } => {}
             Stmt::FnDecl { name, def, pos } => {
-                self.declare(name, Binding { pos: *pos, arity: Some(def.params.len()), keys: None });
+                self.declare(
+                    name,
+                    Binding { pos: *pos, arity: Some(Signature::of(def, name)), keys: None },
+                );
                 self.closure(def);
             }
             Stmt::Decl { name, value, pos } => {
@@ -685,7 +728,7 @@ impl<'a> Checker<'a> {
                 for arg in args {
                     self.expr(arg);
                 }
-                self.check_arity(callee, args.len(), *pos);
+                self.check_call(callee, args, *pos);
             }
             Expr::Unary { operand, .. } => self.expr(operand),
             Expr::Binary { left, right, .. } => {
@@ -741,7 +784,10 @@ impl<'a> Checker<'a> {
 
         self.push_scope();
         for param in &def.params {
-            self.declare(param, Binding { pos: def.pos, arity: None, keys: None });
+            if let Some(default) = &param.default {
+                self.expr(default);
+            }
+            self.declare(&param.name, Binding { pos: param.pos, arity: None, keys: None });
         }
         match &def.body {
             ClosureBody::Expr(expr) => self.expr(expr),
@@ -811,34 +857,66 @@ impl<'a> Checker<'a> {
         );
     }
 
-    /// Arity mismatch against a statically known function (§11).
-    fn check_arity(&mut self, callee: &Expr, argc: usize, pos: Pos) {
-        let (name, arity) = match callee {
+    /// Arity mismatch, and a missing `&`, against a statically known function
+    /// (§11, §5.1).
+    fn check_call(&mut self, callee: &Expr, args: &[Expr], pos: Pos) {
+        let (name, signature) = match callee {
             Expr::Name { name, .. } => {
-                let local = self.lookup(name).and_then(|b| b.arity);
-                let imported = self.imports.get(name).and_then(|(_, a)| *a);
-                (name.clone(), local.or(imported))
+                let local = self.lookup(name).and_then(|b| b.arity.clone());
+                let imported = self.imports.get(name).and_then(|(_, a)| a.clone());
+                let known = if self.lookup(name).is_some() || self.imports.contains_key(name) {
+                    local.or(imported)
+                } else if self.names_are_knowable {
+                    // Only when every `use` resolved: an unresolvable module
+                    // could export a `push` of its own, and §11 reports what is
+                    // guaranteed, not what is likely.
+                    Native::lookup(name).map(Signature::native)
+                } else {
+                    None
+                };
+                (name.clone(), known)
             }
             Expr::Namespace { module, name, .. } => {
-                let arity = self
+                let signature = self
                     .modules
                     .get(module)
-                    .and_then(|m| m.exports.get(name).copied())
+                    .and_then(|m| m.exports.get(name).cloned())
                     .flatten();
-                (format!("{module}::{name}"), arity)
+                (format!("{module}::{name}"), signature)
             }
             _ => return,
         };
-        let Some(arity) = arity else { return };
+        let Some(signature) = signature else { return };
         if self.mutated.contains(&name) {
             return;
         }
-        if arity != argc {
+        if args.len() < signature.required || args.len() > signature.total {
             self.error(
-                format!("`{name}` takes {arity} argument(s), called with {argc}"),
+                format!(
+                    "`{name}` takes {} argument(s), called with {}",
+                    signature.wanted(),
+                    args.len()
+                ),
                 pos,
                 "arity",
             );
+            return;
+        }
+        // A by-reference parameter passed by value is a guaranteed crash — and
+        // before it was one, it was a silent no-op (§5.1).
+        for (i, arg) in args.iter().enumerate() {
+            if signature.by_ref.get(i) == Some(&true) && !matches!(arg, Expr::Ref { .. }) {
+                self.error(
+                    format!(
+                        "`{}` takes argument {} by reference; write `&` before it, \
+                         or it is handed a copy",
+                        signature.label,
+                        i + 1
+                    ),
+                    arg.pos(),
+                    "missing-reference",
+                );
+            }
         }
     }
 }
@@ -883,21 +961,21 @@ fn collect_uses(body: &[Stmt], out: &mut Vec<(String, Pos)>) {
 }
 
 /// A module's public toplevel names, with arities where they are functions.
-fn module_exports(path: &Path) -> Option<HashMap<String, Option<usize>>> {
+fn module_exports(path: &Path) -> Option<HashMap<String, Option<Signature>>> {
     let src = std::fs::read_to_string(path).ok()?;
     let program = parse(&src, &path.display().to_string()).ok()?;
-    let mut exports: HashMap<String, Option<usize>> = HashMap::new();
+    let mut exports: HashMap<String, Option<Signature>> = HashMap::new();
     for stmt in &program.body {
         match stmt {
             Stmt::FnDecl { name, def, .. } if !is_private(name) => {
-                exports.insert(name.clone(), Some(def.params.len()));
+                exports.insert(name.clone(), Some(Signature::of(def, name)));
             }
             Stmt::Decl { name, value, .. } if !is_private(name) => {
-                let arity = match value {
-                    Expr::Closure(def) => Some(def.params.len()),
+                let signature = match value {
+                    Expr::Closure(def) => Some(Signature::of(def, name)),
                     _ => None,
                 };
-                exports.insert(name.clone(), arity);
+                exports.insert(name.clone(), signature);
             }
             _ => {}
         }

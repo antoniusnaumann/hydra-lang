@@ -15,21 +15,32 @@ fn stderr(out: &Output) -> String {
 }
 
 #[test]
-fn run_executes_a_program_and_can_show_what_it_left() {
-    let out = hydra(&["run", "examples/trails.hy", "--dump-scope"]);
+fn run_executes_a_program_and_it_can_print() {
+    let out = hydra(&["run", "examples/trails.hy"]);
     assert!(out.status.success(), "{}", stderr(&out));
     let text = stdout(&out);
-    // Value semantics: the callee could not touch the caller's value, but the
-    // reference could (§5.1).
-    assert!(text.contains("by_value = 0"), "{text}");
-    assert!(text.contains("by_reference = 1"), "{text}");
-    // The copy split from its source on the first write (§5.1).
-    assert!(text.contains("same_buffer = .false"), "{text}");
-    assert!(text.contains("untouched = 0"), "{text}");
+    // Value semantics: the copy split from its source on the first write, and
+    // only the reference reached the caller's value (§5.1).
+    assert!(text.contains("original is 0, the copy is 1"), "{text}");
+    assert!(text.contains("through a reference: 1"), "{text}");
     // Every trail of the `parallel` block ran (§9.3).
-    assert!(text.contains("regions = [eu, us-east, ap]"), "{text}");
+    assert!(text.contains("regions: [eu, us-east, ap]"), "{text}");
+    assert!(text.contains("3 trails reported"), "{text}");
     // `alive()` is true outside any trail (§9.5).
-    assert!(text.contains("outside = .true"), "{text}");
+    assert!(text.contains("outside a trail, alive() is .true"), "{text}");
+}
+
+#[test]
+fn print_ends_with_a_newline_unless_told_otherwise() {
+    let out = hydra(&["run", "tests/fixtures/printing.hy"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "one\ntwo three\n");
+}
+
+#[test]
+fn dump_scope_still_shows_the_bindings() {
+    let out = hydra(&["run", "tests/fixtures/printing.hy", "--dump-scope"]);
+    assert!(stdout(&out).contains("greeting = one"), "{}", stdout(&out));
 }
 
 #[test]
@@ -55,9 +66,18 @@ fn check_reports_findings_and_exits_non_zero_on_errors() {
 
 #[test]
 fn check_is_quiet_on_a_clean_file() {
-    let out = hydra(&["check", "examples/trails.hy"]);
+    let out = hydra(&["check", "tests/fixtures/printing.hy"]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(stdout(&out).contains("no findings"));
+}
+
+#[test]
+fn check_warns_about_a_reference_crossing_into_a_trail() {
+    // The example does it deliberately: it is the only way two trails can fill
+    // one list, and §11 wants a second look at every one (§9.2).
+    let out = hydra(&["check", "examples/trails.hy"]);
+    assert!(out.status.success(), "warnings are not errors: {}", stderr(&out));
+    assert!(stdout(&out).contains("ref-into-trail"), "{}", stdout(&out));
 }
 
 #[test]
@@ -68,7 +88,7 @@ fn check_takes_the_hosts_names() {
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains("undeclared-name"), "{}", stderr(&out));
 
-    let out = hydra(&["check", "tests/fixtures/uses_extern.hy", "--extern", "print"]);
+    let out = hydra(&["check", "tests/fixtures/uses_extern.hy", "--extern", "read_file"]);
     assert!(out.status.success(), "{}", stderr(&out));
 }
 

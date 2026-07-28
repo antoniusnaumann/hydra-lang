@@ -53,10 +53,23 @@ fn sexpr(e: &Expr) -> String {
         Expr::Binary { op, left, right, .. } => {
             format!("({op} {} {})", sexpr(left), sexpr(right))
         }
-        Expr::Closure(def) => match &def.body {
-            ClosureBody::Expr(x) => format!("(fn ({}) {})", def.params.join(" "), sexpr(x)),
-            ClosureBody::Block(b) => format!("(fn ({}) block[{}])", def.params.join(" "), b.len()),
-        },
+        Expr::Closure(def) => {
+            let params: Vec<String> = def
+                .params
+                .iter()
+                .map(|p| {
+                    let mark = if p.by_ref { "&" } else { "" };
+                    match &p.default {
+                        Some(d) => format!("{mark}{}:={}", p.name, sexpr(d)),
+                        None => format!("{mark}{}", p.name),
+                    }
+                })
+                .collect();
+            match &def.body {
+                ClosureBody::Expr(x) => format!("(fn ({}) {})", params.join(" "), sexpr(x)),
+                ClosureBody::Block(b) => format!("(fn ({}) block[{}])", params.join(" "), b.len()),
+            }
+        }
     }
 }
 
@@ -311,4 +324,19 @@ fn positions_point_at_the_original_source() {
 fn reference_program_parses() {
     let src = std::fs::read_to_string("examples/deploy.hy").expect("example exists");
     parse(&src, "examples/deploy.hy").expect("the spec's reference program parses");
+}
+
+#[test]
+fn parameters_may_be_by_reference_or_defaulted() {
+    // `&name` requires the call to pass a reference; `name := expr` gives it a
+    // default evaluated in the function's own scope.
+    assert_eq!(first_expr("f := fn(&list, value) value\n"), "(fn (&list value) value)");
+    assert_eq!(first_expr("f := fn(a, b := 1) a\n"), "(fn (a b:=1) a)");
+    assert_eq!(first_expr("f := fn(a := \"x\") a\n"), "(fn (a:=\"x\") a)");
+
+    // A default is a value, so it cannot also be a reference.
+    assert!(parse("f := fn(&a := 1) a\n", "t.hy").is_err());
+    // Positional filling only, so a defaulted parameter cannot come first.
+    assert!(parse("f := fn(a := 1, b) a\n", "t.hy").is_err());
+    assert!(parse("f := fn(a, a) a\n", "t.hy").is_err());
 }

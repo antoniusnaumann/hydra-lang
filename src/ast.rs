@@ -129,13 +129,44 @@ pub enum ClosureBody {
     Block(Vec<Stmt>),
 }
 
+/// One parameter.
+///
+/// `&name` requires the *call* to pass a reference: the caller still writes the
+/// `&`, so §5.1's "the caller marks it, never the callee" holds — the signature
+/// only says that marking it is not optional. Without that, value semantics
+/// make `push(rows, x)` a silent no-op that looks like working code.
+///
+/// `name := expr` gives the parameter a default, evaluated in the function's
+/// own scope when the argument is missing.
+#[derive(Clone, Debug)]
+pub struct Param {
+    pub name: String,
+    pub by_ref: bool,
+    pub default: Option<Expr>,
+    pub pos: Pos,
+}
+
+impl Param {
+    pub fn plain(name: impl Into<String>, pos: Pos) -> Param {
+        Param { name: name.into(), by_ref: false, default: None, pos }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ClosureDef {
     pub name: String,
-    pub params: Vec<String>,
+    pub params: Vec<Param>,
     pub body: ClosureBody,
     pub pos: Pos,
     pub end_pos: Pos,
+}
+
+impl ClosureDef {
+    /// Parameters that must be supplied, which is every one before the first
+    /// with a default.
+    pub fn required(&self) -> usize {
+        self.params.iter().filter(|p| p.default.is_none()).count()
+    }
 }
 
 #[derive(Clone, Debug)]

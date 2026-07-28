@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::rc::{Rc, Weak};
 
-use crate::compile::Chunk;
+use crate::compile::{Chunk, ParamInfo};
 use crate::errors::Crash;
 use crate::scope::ScopeRef;
 
@@ -190,34 +190,106 @@ pub fn new_dict(entries: Vec<(Sym, Value)>) -> Value {
 /// A closure captures its enclosing **scope**, not a copy of it (§5).
 pub struct Closure {
     pub name: String,
-    pub params: Vec<Rc<str>>,
+    pub params: Vec<ParamInfo>,
     pub chunk: Rc<Chunk>,
     pub scope: ScopeRef,
 }
 
-impl fmt::Debug for Closure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "fn {}({})", self.name, self.params.join(", "))
+impl Closure {
+    pub fn required(&self) -> usize {
+        self.params.iter().filter(|p| !p.has_default).count()
+    }
+
+    /// How a call is described in a diagnostic: `f(&list, value)`.
+    pub fn signature(&self) -> String {
+        let params: Vec<String> = self
+            .params
+            .iter()
+            .map(|p| format!("{}{}", if p.by_ref { "&" } else { "" }, p.name))
+            .collect();
+        let name = if self.name.is_empty() { "fn" } else { &self.name };
+        format!("{name}({})", params.join(", "))
     }
 }
 
-/// The language primitives. `alive()` is the only one (§9.5); everything else
-/// in the spec's examples is a placeholder awaiting the standard library.
+impl fmt::Debug for Closure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "fn {}", self.signature())
+    }
+}
+
+/// The builtins: `alive()`, which is the language primitive of §9.5, and the
+/// standard library of `spec/hydra_stdlib.md`.
+///
+/// They are global names looked up *after* the scope chain, so a program can
+/// shadow one — they are not reserved words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Native {
     Alive,
+    Print,
+    Has,
+    Get,
+    Len,
+    Push,
 }
 
+pub const NATIVES: &[Native] =
+    &[Native::Alive, Native::Print, Native::Has, Native::Get, Native::Len, Native::Push];
+
 impl Native {
+    pub fn lookup(name: &str) -> Option<Native> {
+        NATIVES.iter().copied().find(|n| n.name() == name)
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Native::Alive => "alive",
+            Native::Print => "print",
+            Native::Has => "has",
+            Native::Get => "get",
+            Native::Len => "len",
+            Native::Push => "push",
         }
     }
 
-    pub fn arity(self) -> usize {
+    /// Arguments that must be supplied.
+    pub fn required(self) -> usize {
         match self {
             Native::Alive => 0,
+            Native::Len => 1,
+            Native::Print | Native::Has | Native::Push => 1 + usize::from(self != Native::Print),
+            Native::Get => 3,
+        }
+    }
+
+    /// Arguments it accepts at most; the difference from [`Native::required`]
+    /// is the defaults.
+    pub fn total(self) -> usize {
+        match self {
+            Native::Alive => 0,
+            Native::Len => 1,
+            Native::Print => 2,
+            Native::Has | Native::Push => 2,
+            Native::Get => 3,
+        }
+    }
+
+    /// Which parameters the call must mark with `&` (§5.1).
+    pub fn by_ref(self) -> &'static [bool] {
+        match self {
+            Native::Push => &[true, false],
+            _ => &[false, false, false],
+        }
+    }
+
+    pub fn signature(self) -> &'static str {
+        match self {
+            Native::Alive => "alive()",
+            Native::Print => "print(value, end := \"\\n\")",
+            Native::Has => "has(container, key)",
+            Native::Get => "get(container, key, fallback)",
+            Native::Len => "len(value)",
+            Native::Push => "push(&list, value)",
         }
     }
 }
@@ -402,6 +474,93 @@ pub fn get_member(container: &Value, key: &Value) -> Result<Value, Crash> {
             Err(Crash::new(format!("a dict has no index {i}; its keys are symbols")))
         }
         (other, _) => Err(Crash::new(format!("cannot index a {}", other.kind()))),
+    }
+}
+
+/// `container[key]`, or `None` when the key or index is simply absent.
+///
+/// Reading a missing key crashes (§5); `has` and `get` are how a program asks
+/// without crashing, so they need a lookup that can answer "no".
+pub fn member_opt(container: &Value, key: &Value) -> Result<Option<Value>, Crash> {
+    let container = deref(container)?;
+    match (&container, path_segment(key)?) {
+        (Value::Dict(rc), PathSeg::Key(s)) => match rc.borrow().get(&s) {
+            Some(v) => read_through(v).map(Some),
+            None => Ok(None),
+        },
+        (Value::List(rc), PathSeg::Index(i)) => {
+            let data = rc.borrow();
+            match resolve_index(i, data.items.len()) {
+                Ok(at) => read_through(&data.items[at]).map(Some),
+                Err(_) => Ok(None),
+            }
+        }
+        (Value::List(_), PathSeg::Key(s)) => {
+            Err(Crash::new(format!("a list has no key .{}; index it with a number", s.name())))
+        }
+        (Value::Dict(_), PathSeg::Index(i)) => {
+            Err(Crash::new(format!("a dict has no index {i}; its keys are symbols")))
+        }
+        (other, _) => Err(Crash::new(format!("cannot index a {}", other.kind()))),
+    }
+}
+
+/// Append to the list at `root` + `path`, path-copying shared nodes on the way,
+/// and answer the new length. This is what `push(&list, v)` does.
+pub fn push_place(root: &Cell, path: &[PathSeg], value: Value) -> Result<usize, Crash> {
+    let mut guard = root
+        .try_borrow_mut()
+        .map_err(|_| Crash::new("a reference cycle was followed while appending"))?;
+    push_slot(&mut guard, path, value)
+}
+
+fn push_slot(slot: &mut Value, path: &[PathSeg], value: Value) -> Result<usize, Crash> {
+    if let Value::Ref(r) = slot {
+        let root = r.root.clone();
+        let mut full = r.path.as_ref().clone();
+        full.extend_from_slice(path);
+        return push_place(&root, &full, value);
+    }
+
+    unshare(slot);
+    let Some(seg) = path.first() else {
+        return match slot {
+            Value::List(rc) => {
+                let mut data = rc
+                    .try_borrow_mut()
+                    .map_err(|_| Crash::new("a list that contains itself was appended to"))?;
+                data.items.push(value);
+                Ok(data.items.len())
+            }
+            other => Err(Crash::new(format!("`push` appends to a list, got a {}", other.kind()))),
+        };
+    };
+
+    match slot {
+        Value::Dict(rc) => {
+            let PathSeg::Key(key) = seg else {
+                return Err(Crash::new("a dict is keyed by symbols, not by index"));
+            };
+            let mut data = rc
+                .try_borrow_mut()
+                .map_err(|_| Crash::new("a value that contains itself was appended to"))?;
+            match data.position(key) {
+                Some(i) => push_slot(&mut data.entries[i].1, &path[1..], value),
+                None => Err(Crash::new(format!("no key .{} in this dict", key.name()))),
+            }
+        }
+        Value::List(rc) => {
+            let PathSeg::Index(i) = seg else {
+                return Err(Crash::new("a list is indexed by number"));
+            };
+            let mut data = rc
+                .try_borrow_mut()
+                .map_err(|_| Crash::new("a value that contains itself was appended to"))?;
+            let len = data.items.len();
+            let at = resolve_index(*i, len)?;
+            push_slot(&mut data.items[at], &path[1..], value)
+        }
+        other => Err(Crash::new(format!("cannot append inside a {}", other.kind()))),
     }
 }
 
@@ -657,7 +816,7 @@ fn to_text_at(v: &Value, depth: u32) -> String {
                 .collect();
             format!("{{ {} }}", entries.join(", "))
         }
-        Value::Fn(c) => format!("fn {}({})", c.name, c.params.join(", ")),
+        Value::Fn(c) => format!("fn {}", c.signature()),
         Value::Native(n) => format!("fn {}()", n.name()),
         Value::Ref(r) => match read_place(&r.root, &r.path) {
             Ok(v) => to_text(&v),

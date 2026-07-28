@@ -1,3 +1,4 @@
 use json
 
-print(json::decode("x"))
+body := read_file("x")
+print(json::decode(body))

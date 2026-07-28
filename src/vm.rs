@@ -14,6 +14,7 @@
 //!   everything it invokes — runs to the end and no frame is abandoned.
 
 use std::cell::RefCell;
+use std::io::Write;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -28,8 +29,9 @@ use crate::sched::{
     BlockCtx, CancelFlag, Frame, IterState, OnReturn, RunQueue, ScopeSlot, Task, TaskId, TaskState,
 };
 use crate::value::{
-    binary_op, boolean, copy_value, deref, get_member, new_dict, new_list, path_segment, read_place,
-    sym, to_text, unary_op, write_place, Cell, Closure, Native, PathSeg, RefValue, Sym, Value,
+    binary_op, boolean, copy_value, deref, get_member, member_opt, new_dict, new_list, path_segment,
+    push_place, read_place, sym, to_text, unary_op, write_place, Cell, Closure, Native, PathSeg,
+    RefValue, Sym, Value,
 };
 
 #[derive(Clone, Debug)]
@@ -164,6 +166,7 @@ impl Vm {
                 on_return: OnReturn::PushValue,
                 call_site: Pos::NONE,
                 is_module_body: true,
+                argc: 0,
             }],
             stack: Vec::new(),
             cancel: self.root_cancel.clone(),
@@ -467,6 +470,11 @@ impl Vm {
                 task.frame_mut().iters.pop();
             }
 
+            Instr::SkipIfProvided { index, target } => {
+                if index < task.frame().argc {
+                    task.frame_mut().ip = target;
+                }
+            }
             Instr::Tick => {
                 // A statement boundary: where a cancelled trail stops, and the
                 // scheduling point (§9.1, §9.5).
@@ -517,17 +525,33 @@ impl Vm {
     fn call(&mut self, task: &mut Task, callee: Value, args: Vec<Value>) -> Result<Flow, Crash> {
         match callee {
             Value::Fn(closure) => {
-                if args.len() != closure.params.len() {
+                let (required, total) = (closure.required(), closure.params.len());
+                if args.len() < required || args.len() > total {
+                    let wanted = if required == total {
+                        format!("{required}")
+                    } else {
+                        format!("{required} to {total}")
+                    };
                     return Err(Crash::new(format!(
-                        "`{}` takes {} argument(s), got {}",
-                        if closure.name.is_empty() { "fn" } else { &closure.name },
-                        closure.params.len(),
+                        "`{}` takes {wanted} argument(s), got {}",
+                        closure.signature(),
                         args.len()
                     )));
                 }
                 let scope = Scope::child(&closure.scope);
+                let argc = args.len();
                 for (param, arg) in closure.params.iter().zip(args) {
-                    scope.declare(param, arg);
+                    // `&name` in the signature says the caller must mark it, and
+                    // the caller is the only one who can (§5.1). Without this,
+                    // a mutating helper called by value is a silent no-op.
+                    if param.by_ref && !matches!(arg, Value::Ref(_)) {
+                        return Err(Crash::new(format!(
+                            "`{}` takes `{}` by reference: write `&…` at the call site",
+                            closure.signature(),
+                            param.name
+                        )));
+                    }
+                    scope.declare(&param.name, arg);
                 }
                 let call_site = {
                     let frame = task.frame();
@@ -545,29 +569,84 @@ impl Vm {
                     on_return: OnReturn::PushValue,
                     call_site,
                     is_module_body: false,
+                    argc,
                 });
                 Ok(Flow::Next)
             }
             Value::Native(native) => {
-                if args.len() != native.arity() {
+                if args.len() < native.required() || args.len() > native.total() {
                     return Err(Crash::new(format!(
                         "`{}` takes {} argument(s), got {}",
-                        native.name(),
-                        native.arity(),
+                        native.signature(),
+                        if native.required() == native.total() {
+                            format!("{}", native.required())
+                        } else {
+                            format!("{} to {}", native.required(), native.total())
+                        },
                         args.len()
                     )));
                 }
-                match native {
-                    // Dynamic, no token threading, `.true` outside any trail —
-                    // and false during crash shutdown too (§9.5).
-                    Native::Alive => {
-                        let alive = !task.cancel.is_cancelled();
-                        task.push(boolean(alive));
+                for (i, arg) in args.iter().enumerate() {
+                    if native.by_ref().get(i) == Some(&true) && !matches!(arg, Value::Ref(_)) {
+                        return Err(Crash::new(format!(
+                            "`{}` takes its first argument by reference: \
+                             write `&…` at the call site, or the append happens to a copy",
+                            native.signature()
+                        )));
                     }
                 }
+                let value = self.native(task, native, args)?;
+                task.push(value);
                 Ok(Flow::Next)
             }
             other => Err(Crash::new(format!("cannot call a {}", other.kind()))),
+        }
+    }
+
+    /// The builtins of `spec/hydra_stdlib.md`, plus `alive()` (§9.5).
+    fn native(&mut self, task: &Task, native: Native, args: Vec<Value>) -> Result<Value, Crash> {
+        let arg = |i: usize| args.get(i).cloned().unwrap_or_else(Value::null);
+        match native {
+            // Dynamic, no token threading, `.true` outside any trail — and
+            // false during crash shutdown too (§9.5).
+            Native::Alive => Ok(boolean(!task.cancel.is_cancelled())),
+            Native::Print => {
+                let end = match args.get(1) {
+                    Some(end) => to_text(&deref(end)?),
+                    None => "\n".to_string(),
+                };
+                let mut out = std::io::stdout().lock();
+                // One `print` is one write, so two trails interleave by line
+                // and never mid-line.
+                let _ = write!(out, "{}{end}", to_text(&deref(&arg(0))?));
+                let _ = out.flush();
+                Ok(Value::null())
+            }
+            Native::Has => Ok(boolean(member_opt(&arg(0), &arg(1))?.is_some())),
+            Native::Get => Ok(member_opt(&arg(0), &arg(1))?.unwrap_or_else(|| arg(2))),
+            Native::Len => {
+                let value = deref(&arg(0))?;
+                let len = match &value {
+                    Value::List(rc) => rc.borrow().items.len(),
+                    Value::Dict(rc) => rc.borrow().entries.len(),
+                    // Characters, not bytes: source is UTF-8 (§1).
+                    Value::Str(text) => text.chars().count(),
+                    other => {
+                        return Err(Crash::new(format!(
+                            "`len` counts a list, a dict or a string, got a {}",
+                            other.kind()
+                        )))
+                    }
+                };
+                Ok(Value::Num(len as f64))
+            }
+            Native::Push => {
+                let Value::Ref(target) = arg(0) else {
+                    unreachable!("checked by the by-reference rule above")
+                };
+                let len = push_place(&target.root, &target.path, arg(1))?;
+                Ok(Value::Num(len as f64))
+            }
         }
     }
 
@@ -646,12 +725,12 @@ impl Vm {
         let cell = match root {
             Root::Name(name) => match self.lookup(task, name) {
                 Some(cell) => cell,
-                // `alive()` is the only primitive (§9.5); a program may shadow
-                // it, which is why the scope chain is consulted first.
-                None if &**name == "alive" => return Ok(Value::Native(Native::Alive)),
-                None => {
-                    return Err(Crash::new(format!("`{name}` is not declared")));
-                }
+                // A builtin is a global name consulted *after* the scope
+                // chain, so a program can shadow one.
+                None => match Native::lookup(name) {
+                    Some(native) => return Ok(Value::Native(native)),
+                    None => return Err(Crash::new(format!("`{name}` is not declared"))),
+                },
             },
             Root::Ns { module, name } => self.lookup_ns(task, module, name)?,
         };
@@ -692,6 +771,7 @@ impl Vm {
                 on_return: OnReturn::PushValue,
                 call_site: Pos::NONE,
                 is_module_body: false,
+                argc: 0,
             }],
             stack: Vec::new(),
             cancel: CancelFlag::child(&task.cancel),
@@ -811,6 +891,7 @@ impl Vm {
             on_return: OnReturn::BindModule { alias: Rc::from(name), module: id },
             call_site: Pos::NONE,
             is_module_body: true,
+            argc: 0,
         });
         Ok(Flow::Next)
     }

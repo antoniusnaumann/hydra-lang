@@ -145,7 +145,8 @@ stmt       = use | fndecl | decl | assign | if | for | while
 
 use        = "use" ident ;
 fndecl     = "fn" ident "(" [ params ] ")" NEWLINE block "end" ;
-params     = ident { "," ident } ;
+params     = param { "," param } ;
+param      = [ "&" ] ident [ ":=" expr ] ;
 
 decl       = ident ":=" expr ;
 dict       = "{" [ dictent { "," dictent } ] "}" ;
@@ -180,6 +181,18 @@ closure    = "fn" "(" [ params ] ")" ( expr | NEWLINE block "end" ) ;
 
 **[D]** Whether a closure is single-expression or multi-line is decided by
 whether anything follows the `)` **on the same line**.
+
+**[D] Parameters.** `&name` requires the *call* to pass a reference; see §5.1.
+`name := expr` gives the parameter a default, evaluated in the **function's own
+scope** at each call where the argument is missing, so a later default may refer
+to an earlier parameter. Filling is positional, so a parameter with a default
+may not be followed by one without, and a `&` parameter may not have a default —
+a default is a value, and a reference has to come from a call site.
+
+**[O]** Whether a call may name an argument — `print(v, end := "")` — instead of
+relying on position. Recommended **[P]**: not yet. Positional defaults cover the
+cases the standard library needs, and naming is a separate feature with its own
+questions (does it apply to every call, can it reorder, what does `check` say).
 
 ### Operator precedence **[D]**
 
@@ -286,6 +299,13 @@ list := [&a, &b]
 
 **[D]** Only an **lvalue** may be referenced: a variable, a dict key, a list
 element. `&(a + b)` and `&f()` are errors.
+
+**[D] A parameter may require it.** `fn push(&list, value)` says the call must
+mark the argument; `push(rows, x)` **crashes**. This does not move the marking
+to the callee — the caller still writes `&`, and can still see it at the call
+site — it only makes leaving it out an error instead of a silent no-op. Without
+it, a mutating helper called by value appends to a *copy*, which looks exactly
+like working code.
 
 **[D] Copy-on-write is required**, not optional. The deep copy is a semantic
 guarantee; implementations must make it cheap rather than literal. Expected
@@ -423,7 +443,8 @@ rather than looping forever.
 by convention a symbol such as `.failed`.
 
 **[D]** A **crash** (missing field, bad operand, `=` to an undeclared name,
-arity mismatch, explicit abort) terminates the program — *unless* it happens in
+arity mismatch, an argument a `&` parameter needs and did not get, explicit
+abort) terminates the program — *unless* it happens in
 a dead trail (§9.5), in which case it is isolated to that trail.
 
 **[D]** When a **live** trail crashes: mark every sibling cancelled, let each
@@ -563,6 +584,7 @@ maybe-list would be enormous and would be ignored within a week.
 | Duplicate key in one dict literal | grammar |
 | `_private` name reached through `::` | §7 |
 | Arity mismatch against a statically known function | call graph |
+| An argument for a `&` parameter that is not a reference | §5.1 |
 | `parallel` / `race` written syntactically inside a cell | §4 |
 | Rows of a block with differing separator counts | §4 |
 | Compound keyword split across lines or across `\|\|` | §2 |
@@ -707,8 +729,7 @@ proposed stdlib. See the note at the top of this document.
    single-OS-thread coroutine runtime, the preemption points, whether `race`'s
    `end` releases control immediately, and whether a `parallel` block may be
    written syntactically inside a cell.
-7. The standard library, in full — **owner's to specify, not the implementor's**.
-   Every helper the examples lean on is undefined, and value semantics make this
-   urgent: a mutating helper now needs its argument marked at the call site
-   (`push(&rows, x)`), so the stdlib's signatures determine where `&` appears in
-   ordinary code.
+7. The standard library. `print`, `has`, `get`, `len` and `push` are specified
+   in `hydra_stdlib.md`; everything else the examples lean on is still
+   undefined. `push(&list, value)` set the precedent value semantics demanded:
+   a mutating helper takes `&` first and crashes without it.

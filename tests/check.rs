@@ -290,12 +290,50 @@ fn the_reference_program_reports_no_errors() {
 fn externs_stand_in_for_the_missing_standard_library() {
     // With every module resolvable, a placeholder call *is* a guaranteed
     // crash — unless the host is known to supply it (QUESTIONS.md §1).
-    let src = "use json
-print(json::decode(\"x\"))\n";
+    // `print` is a builtin now, so the placeholder here is one that is not.
+    let src = "use json\nbody := read_file(\"x\")\nprint(json::decode(body))\n";
     let program = parse(src, "tests/fixtures/t.hy").expect("parses");
     assert_eq!(check_program(&program, &options()).codes(), vec!["undeclared-name"]);
 
     let with_extern =
-        CheckOptions { externs: vec!["print".into()], search_path: Vec::new() };
+        CheckOptions { externs: vec!["read_file".into()], search_path: Vec::new() };
     assert!(check_program(&program, &with_extern).codes().is_empty());
+}
+
+#[test]
+fn a_by_reference_parameter_passed_by_value() {
+    // §5.1 makes this a guaranteed crash, and before it was one it was a
+    // silent no-op: the callee appends to a copy.
+    let src = "rows := []\npush(rows, 1)\n";
+    assert_eq!(codes(src), vec!["missing-reference"]);
+    assert_eq!(codes("rows := []\npush(&rows, 1)\n"), Vec::<&str>::new());
+
+    // The same rule for a user function that declares one.
+    let src = "fn bump(&box)\n\tbox.n = 1\nend\nd := { .n : 0 }\nbump(d)\n";
+    assert_eq!(codes(src), vec!["missing-reference"]);
+    let src = "fn bump(&box)\n\tbox.n = 1\nend\nd := { .n : 0 }\nbump(&d)\n";
+    assert_eq!(codes(src), Vec::<&str>::new());
+}
+
+#[test]
+fn builtins_are_known_names_with_known_arities() {
+    assert_eq!(codes("print(\"hi\")\n"), Vec::<&str>::new());
+    assert_eq!(codes("print(\"hi\", \"\")\n"), Vec::<&str>::new());
+    assert_eq!(codes("print()\n"), vec!["arity"]);
+    assert_eq!(codes("print(\"a\", \"b\", \"c\")\n"), vec!["arity"]);
+    assert_eq!(codes("x := len([1], 2)\n"), vec!["arity"]);
+    assert_eq!(codes("x := get(d, .k)\n"), vec!["arity", "undeclared-name"]);
+
+    // A program may shadow a builtin, and then its own arity is what counts.
+    assert_eq!(codes("len := fn(a, b) a\nx := len(1, 2)\n"), Vec::<&str>::new());
+    assert_eq!(codes("len := fn(a, b) a\nx := len(1)\n"), vec!["arity"]);
+}
+
+#[test]
+fn an_unresolvable_module_also_silences_the_builtin_signatures() {
+    // That module might export a `push` of its own, so nothing about the
+    // unqualified name is guaranteed.
+    let src = "use no_such_module\nrows := []\npush(rows, 1)\n";
+    let report = check(src);
+    assert!(report.errors().next().is_none(), "{:?}", report.codes());
 }

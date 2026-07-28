@@ -1,8 +1,9 @@
-# Hydra — standard library, draft 1
+# Hydra — standard library
 
-**Status: proposed, not implemented.** This is the implementor's draft of the
-five builtins the language owner asked for. Nothing here is in the interpreter
-yet.
+**Status: implemented**, with the language owner's two corrections applied —
+`print` takes a defaulted `end`, and `push` declares `&list` in its signature.
+Both needed new language surface, now in the handoff: `&` parameters (§5.1) and
+default parameter values (§3).
 
 Same tags as the handoff: **[D]** decided, **[P]** proposed, **[O]** open.
 
@@ -20,18 +21,32 @@ outward walk implies. That keeps them from being reserved words.
 
 **[D]** They are ordinary values. `f := print` binds it, `f("hi")` calls it.
 
-**[D]** Arity is exact, as for any call (§8). There are no optional arguments,
-which is why `get` takes its default rather than defaulting it.
+**[D]** Arity is a range when a parameter has a default (§3), and exact
+otherwise. Filling is positional: there are no named arguments at call sites,
+so `print(v, "")` is how the second argument is supplied.
 
 ---
 
-## 2. `print(value)` → `.null`
+## 2. `print(value, end := "\n")` → `.null`
 
-**[P]** Writes the **text form** of `value` — the same rendering `\(value)`
-produces (§1) — followed by a newline, to standard output.
+**[D]** Writes the **text form** of `value` — the same rendering `\(value)`
+produces (§1) — followed by `end`, to standard output.
 
-One argument, not many: interpolation already composes, so `print("a \(b) c")`
-covers what a variadic `print` would, and Hydra has no variadic calls.
+`end` defaults to a newline, so `print(v)` writes a line and `print(v, "")`
+writes without one:
+
+```hydra
+print("no newline", "")
+print(" — and now one")
+```
+
+One *value* argument, not many: interpolation already composes, so
+`print("a \(b) c")` covers what a variadic `print` would, and Hydra has no
+variadic calls.
+
+**[O]** `end` can only be supplied positionally, because call sites cannot name
+arguments (§3). If naming is added later, `print(v, end := "")` reads better and
+this signature needs no change.
 
 **[D]** Returns `.null`, so it is a statement, not an expression to build with.
 
@@ -65,8 +80,10 @@ first line, because a missing-key *read* crashes and nothing can be caught.
 **[P]** The value at `key`, or `fallback` when it is missing. Same container and
 key rules as `has`.
 
-**[D]** `fallback` is **required**. With exact arity there is no way to make it
-optional, and requiring it makes the missing case visible at the call site.
+**[D]** `fallback` is **required** — deliberately, even though defaults now
+exist. There is no obvious value to default it to (`.null` is a legitimate
+thing to have stored), and requiring it makes the missing case visible at the
+call site.
 
 **[D]** The result copies, like every other read (§5.1). `get(d, .k, [])` hands
 back a fresh empty list, not a shared one.
@@ -95,8 +112,9 @@ invented, and there is nothing to count.
 
 **[P]** Appends `value` to `list` and returns the list's **new length**.
 
-**[D] The first argument must be a reference.** `push(rows, x)` — without the
-`&` — crashes.
+**[D] `&list` is in the signature**, which is what makes `push(rows, x)` — without
+the `&` — crash. The rule is general: any parameter written `&name` requires the
+call to pass a reference (§5.1).
 
 This is the rule the language's value semantics force, and it is worth being
 loud about. Passing `rows` by value hands `push` a *copy* (§5.1); appending to
@@ -114,8 +132,11 @@ push(&rows, 2)     // 2
 **[D]** `value` is copied in, like any insertion (§5.1). `push(&rows, &item)`
 inserts a reference instead, and is how a list of shared handles is built.
 
+**[D]** `push` splits a shared list before appending, like any other write, so
+a copy taken earlier does not see the new element (§5.1).
+
 **[P]** This makes `push` the shape every future mutating helper follows:
-**a mutating helper takes `&` first and says so by crashing.** Deciding that now
+**a mutating helper declares `&` and the call site shows it.** Deciding that now
 is what §15.7 means when it says the stdlib's signatures determine where `&`
 appears in ordinary code.
 
@@ -124,7 +145,7 @@ appears in ordinary code.
 ## 7. What this unblocks, and what it does not
 
 With these five, §14's reference program still needs `read_file`, `lease`,
-`push`(✓), `wait_ready`, `healthy`, `drain`, `smoke`, `live`, `rollback` and
+`wait_ready`, `healthy`, `drain`, `smoke`, `live`, `rollback` and
 `json::decode`. What it does unblock is everything a *test* needs: a program can
 finally report what it computed, and decoded data can be read without crashing.
 
@@ -137,16 +158,21 @@ just made.
 
 ## 8. `check` and the formatter
 
-**[P]** `check` gains three rules, all of which fit §11's "only what is
+**[P]** `check` gains two rules, both of which fit §11's "only what is
 guaranteed":
 
 | Diagnostic | Basis |
 |---|---|
-| `push` called with a non-reference first argument | the signature above — a guaranteed crash |
+| an argument for a `&` parameter that is not a reference | the signature — a guaranteed crash |
 | arity mismatch against any of the five | they are statically known functions |
-| shadowing one of the five with a different arity | the call that follows will crash |
 
 The five stop being undeclared names, so `hydra check --extern print,…` is no
-longer needed for them.
+longer needed for them. Both rules are switched off when a `use`d module cannot
+be resolved: that module might export a `push` of its own, and §11 reports what
+is guaranteed rather than what is likely.
+
+**[O] The name `push` is contested.** §14's reference program already calls
+`push(h, img)` to push an *image to a host*, which is a different operation with
+the same name. One of the two has to give.
 
 The formatter is unaffected: they are ordinary calls.

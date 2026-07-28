@@ -1,8 +1,12 @@
 // deploy.hy — warm three regions at once, then verify
 //
-// This is the reference program from spec §14. Every name in it except
-// `alive()` is a placeholder awaiting the standard library, so it parses,
-// checks and formats but does not run. See QUESTIONS.md §1.
+// This is the reference program from spec §14. Most names in it are still
+// placeholders awaiting the standard library, so it parses, checks and formats
+// but does not run. See QUESTIONS.md §1.
+//
+// Note `push(h, img)` on line 15: it means "push an image to a host", while
+// the standard library's `push(&list, value)` appends to a list. Same name,
+// different operation — see hydra_stdlib.md §8.
 
 use fmt
 use http

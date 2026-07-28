@@ -264,16 +264,36 @@ impl<'a> Parser<'a> {
         Ok(Stmt::FnDecl { name, def, pos })
     }
 
-    fn parse_params(&mut self) -> Result<Vec<String>> {
+    /// `param = [ "&" ] ident [ ":=" expr ]`.
+    fn parse_params(&mut self) -> Result<Vec<Param>> {
         self.expect_op("(")?;
-        let mut params = Vec::new();
+        let mut params: Vec<Param> = Vec::new();
         if !self.peek().is_op(")") {
             loop {
+                let by_ref = self.eat_op("&");
                 let (name, pos) = self.expect_ident("a parameter name")?;
-                if params.contains(&name) {
+                if params.iter().any(|p| p.name == name) {
                     return self.err(format!("duplicate parameter `{name}`"), pos);
                 }
-                params.push(name);
+                let default = if self.eat_op(":=") { Some(self.parse_expr()?) } else { None };
+
+                if by_ref && default.is_some() {
+                    return self.err(
+                        format!(
+                            "`&{name}` cannot have a default: a default is a value,                              and a reference has to come from a call site"
+                        ),
+                        pos,
+                    );
+                }
+                // Positional filling only, so a defaulted parameter cannot be
+                // followed by one that must be supplied.
+                if default.is_none() && params.iter().any(|p| p.default.is_some()) {
+                    return self.err(
+                        format!("`{name}` has no default but follows one that does"),
+                        pos,
+                    );
+                }
+                params.push(Param { name, by_ref, default, pos });
                 if !self.eat_op(",") {
                     break;
                 }

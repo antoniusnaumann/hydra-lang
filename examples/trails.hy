@@ -1,27 +1,33 @@
-// trails.hy — what the language does without a standard library.
+// trails.hy — the parts of the language that need no more than the five
+// builtins of spec/hydra_stdlib.md.
 //
-// There is no `print`: `alive()` is the only primitive the spec defines, so a
-// program cannot yet say what it computed (QUESTIONS.md §1). Run it with
-// `hydra run examples/trails.hy --dump-scope` to see the bindings it leaves.
+//	hydra run examples/trails.hy
 
 // Value semantics: everything copies, `&` opts out (§5.1).
 original := { .count : 0, .tag : .fresh }
 copy := original
 copy.count = 1
-untouched := original.count // 0 — the copy split on write
+print("the copy split on write: original is \(original.count), the copy is \(copy.count)")
 
-fn bump(box)
+fn bump(&box)
 	box.count = box.count + 1
 end
 
-bump(original) // a copy, so the caller is safe
-by_value := original.count // still 0
-bump(&original) // a reference: the caller marked it
-by_reference := original.count // 1
+bump(&original)
+print("through a reference: \(original.count)")
+
+// `&box` in the signature means the call must mark it. Without the `&` the
+// callee would work on a copy, so it crashes instead:
+//
+//	bump(original)   // crash: takes `box` by reference
 
 // Identity is the copy-on-write buffer, for now (§5.1).
-same_buffer := copy === original // .false, they have split
-self_same := original === original // .true
+print("copy === original: \(copy === original), and original === original: \(original === original)")
+
+// Reading a missing key crashes, so `has` and `get` are how you ask (§15.1).
+config := { .region : "eu" }
+print("region \(get(config, .region, "?")), retries \(get(config, .retries, 3))")
+print("has .retries: \(has(config, .retries))")
 
 // Trails share the parent scope; `:=` inside one is trail-local (§6, §9.2).
 first := .null
@@ -33,7 +39,15 @@ parallel
 	             || second = "\(second)-east" ||
 end
 
-regions := [first, second, third]
+print("regions: \([first, second, third])")
+
+// A `&` crossing into a trail is the only shared mutable state there is (§9.2),
+// and the only way two trails can fill one list.
+seen := []
+parallel for region in [first, second, third]
+	push(&seen, region)
+end
+print("\(len(seen)) trails reported")
 
 // A race is decided by the first trail to finish, and the losers are cancelled
 // before their next statement (§9.4, §9.5).
@@ -43,6 +57,7 @@ race
 	                 || slow = slow + 1
 	                 || winner = "long"
 end
+print("winner: \(winner)")
 
 // `alive()` is dynamic: any function can ask, at any depth (§9.5).
-outside := alive()
+print("outside a trail, alive() is \(alive())")
