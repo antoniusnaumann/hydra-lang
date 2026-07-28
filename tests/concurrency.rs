@@ -357,3 +357,25 @@ end
     assert_eq!(out.len(), 3, "every trail ran exactly once, got {out:?}");
     assert!(out.contains('i') && out.contains('j') && out.contains('o'), "{out:?}");
 }
+
+#[test]
+fn the_program_waits_for_an_orphaned_loser_at_exit() {
+    // §9.4's recommendation: `end` releases control at once, the runtime keeps
+    // orphaned trails alive to completion, and the program waits for them at
+    // exit. The loser here is suspended inside a call when the race is decided,
+    // so its remaining effects land after the parent has moved on.
+    let src = "
+log := \"\"
+fn slow()
+\tlog = log + \"1\"
+\tlog = log + \"2\"
+\treturn 1
+end
+race
+\tr := slow() || w := 1
+end
+done := \"after\"
+";
+    assert_eq!(eval(src, "log"), "12");
+    assert_eq!(eval(src, "done"), "after");
+}

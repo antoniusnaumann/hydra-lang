@@ -10,7 +10,7 @@
 //! lexer already decided.
 
 use crate::errors::Result;
-use crate::lexer::{is_identifier, tokenize, Tok, Token};
+use crate::lexer::{tokenize, Tok, Token};
 
 /// The classes of §13, with the reference Dark+ colours from the mock-ups.
 pub const CLASSES: &[(&str, &str, &str)] = &[
@@ -62,9 +62,9 @@ pub fn class_of(tok: &Token, prev: Option<&Token>, next: Option<&Token>) -> Opti
             "keyword.concurrency"
         } else if CONTROL.contains(kw) {
             "keyword.control"
-        } else if OTHER.contains(kw) {
-            "keyword.other"
         } else {
+            // §13 lists `fn use and or not as` here, and there is no keyword
+            // outside the three groups.
             "keyword.other"
         }),
         Tok::Op(op) => {
@@ -183,10 +183,4 @@ pub fn theme_json() -> String {
         })
         .collect();
     format!("{{\n  \"textMateRules\": [\n{}\n  ]\n}}\n", entries.join(",\n"))
-}
-
-/// Check that `is_identifier` stays the rule symbols are rendered by; used by
-/// the grammar's symbol pattern.
-pub fn symbol_needs_quotes(name: &str) -> bool {
-    !is_identifier(name)
 }

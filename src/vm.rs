@@ -128,7 +128,7 @@ impl Vm {
             imports: RefCell::new(HashMap::new()),
             aliases: RefCell::new(HashMap::new()),
         });
-        if path.as_os_str().len() > 0 {
+        if !path.as_os_str().is_empty() {
             self.module_by_path.insert(path, id);
         }
         id

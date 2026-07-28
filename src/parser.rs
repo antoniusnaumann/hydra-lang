@@ -7,7 +7,6 @@
 //! token keeps its original position, so a diagnostic from inside a trail
 //! points at the real source line and not at the transposed one (§4 step 6).
 
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ast::*;
@@ -652,8 +651,7 @@ impl<'a> Parser<'a> {
         next: fn(&mut Parser<'a>) -> Result<Expr>,
     ) -> Result<Expr> {
         let mut left = next(self)?;
-        loop {
-            let Tok::Op(op) = self.peek().kind else { break };
+        while let Tok::Op(op) = self.peek().kind {
             if !ops.contains(&op) {
                 break;
             }
@@ -889,13 +887,3 @@ pub fn split_lines(tokens: &[Token]) -> Vec<Vec<Token>> {
     lines
 }
 
-/// Convenience for tests and tools that want the comment table too.
-pub fn parse_file(path: &std::path::Path) -> Result<Program> {
-    let src = std::fs::read_to_string(path)
-        .map_err(|e| HydraError::new(format!("cannot read {}: {e}", path.display()), &path.display().to_string(), Pos::NONE))?;
-    parse(&src, &path.display().to_string())
-}
-
-/// Unused today, kept next to the parser because the formatter and `check`
-/// both need to know which comment belongs to which line.
-pub type Comments = HashMap<u32, (u32, String)>;

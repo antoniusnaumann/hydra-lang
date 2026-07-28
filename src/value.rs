@@ -338,22 +338,12 @@ fn unshare(slot: &mut Value) {
 
 // --- indexing ---------------------------------------------------------------
 
-/// List indexing (§15.2 is open; see QUESTIONS.md §2): 0-based, integers only,
-/// out of range crashes for the same reason a missing key does.
-pub fn list_index(raw: f64, len: usize) -> Result<usize, Crash> {
-    if !raw.is_finite() || raw.fract() != 0.0 {
-        return Err(Crash::new(format!("list index must be a whole number, got {}", num_to_text(raw))));
-    }
-    if raw < 0.0 || raw as usize >= len {
-        return Err(Crash::new(format!(
-            "list index {} is out of range for a list of {len} element(s)",
-            num_to_text(raw)
-        )));
-    }
-    Ok(raw as usize)
-}
-
-fn seg_of(key: &Value) -> Result<PathSeg, Crash> {
+/// Turn an evaluated key into a path segment.
+///
+/// `d.k` is exactly `d[.k]` (§5), so there is one code path here and not two.
+/// List indexing is 0-based and whole-numbers-only; §15.2 leaves the rest open,
+/// see QUESTIONS.md §2.
+pub fn path_segment(key: &Value) -> Result<PathSeg, Crash> {
     match key {
         Value::Sym(s) => Ok(PathSeg::Key(s.clone())),
         Value::Num(n) => {
@@ -378,12 +368,6 @@ fn seg_of(key: &Value) -> Result<PathSeg, Crash> {
             other.kind()
         ))),
     }
-}
-
-/// Turn an evaluated key into a path segment. `d.k` is exactly `d[.k]` (§5), so
-/// there is one code path here, not two.
-pub fn path_segment(key: &Value) -> Result<PathSeg, Crash> {
-    seg_of(key)
 }
 
 // --- reading and writing places --------------------------------------------
@@ -558,14 +542,6 @@ pub fn deep_equal(a: &Value, b: &Value) -> bool {
     deep_equal_inner(a, b, &mut visited, 0)
 }
 
-fn node_ptr(v: &Value) -> Option<usize> {
-    match v {
-        Value::List(rc) => Some(Rc::as_ptr(rc) as *const u8 as usize),
-        Value::Dict(rc) => Some(Rc::as_ptr(rc) as *const u8 as usize),
-        _ => None,
-    }
-}
-
 fn deep_equal_inner(a: &Value, b: &Value, visited: &mut Vec<(usize, usize)>, depth: u32) -> bool {
     if identical(a, b) {
         return true;
@@ -615,11 +591,9 @@ fn deep_equal_inner(a: &Value, b: &Value, visited: &mut Vec<(usize, usize)>, dep
             }
             equal
         }
-        // Closures have no structural equality; `==` falls back to identity (§5).
-        _ => {
-            let _ = node_ptr(a);
-            false
-        }
+        // Closures have no structural equality; `==` falls back to identity,
+        // which was already tried above (§5).
+        _ => false,
     }
 }
 
@@ -722,10 +696,8 @@ pub fn binary_op(op: &str, a: &Value, b: &Value) -> Result<Value, Crash> {
     }
 
     // `+` concatenates when either side is a string (QUESTIONS.md §3).
-    if op == "+" {
-        if matches!(a, Value::Str(_)) || matches!(b, Value::Str(_)) {
-            return Ok(Value::Str(Rc::from(format!("{}{}", to_text(a), to_text(b)).as_str())));
-        }
+    if op == "+" && (matches!(a, Value::Str(_)) || matches!(b, Value::Str(_))) {
+        return Ok(Value::Str(Rc::from(format!("{}{}", to_text(a), to_text(b)).as_str())));
     }
 
     match op {

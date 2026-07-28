@@ -69,10 +69,6 @@ impl Scope {
         None
     }
 
-    pub fn has(&self, name: &str) -> bool {
-        self.lookup(name).is_some()
-    }
-
     /// Bind an existing cell under a name — how `use` shares a module's own
     /// storage rather than a copy of it (§7).
     pub fn bind_cell(&self, name: &str, cell: Cell) {

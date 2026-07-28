@@ -827,18 +827,14 @@ fn collect_mutated(body: &[Stmt], out: &mut HashSet<String>) {
     let mut declared: HashSet<String> = HashSet::new();
     walk_stmts(body, &mut |stmt| match stmt {
         Stmt::Assign { target, .. } => {
-            if let Some(root) = target.lvalue_root() {
-                if let Expr::Name { name, .. } = root {
-                    out.insert(name.clone());
-                }
-            }
-        }
-        Stmt::Decl { name, .. } => {
-            // Two declarations of one name in a file: the second shadows, so
-            // nothing about the first is safe to assume elsewhere.
-            if !declared.insert(name.clone()) {
+            if let Some(Expr::Name { name, .. }) = target.lvalue_root() {
                 out.insert(name.clone());
             }
+        }
+        // Two declarations of one name in a file: the second shadows, so
+        // nothing about the first is safe to assume elsewhere.
+        Stmt::Decl { name, .. } if !declared.insert(name.clone()) => {
+            out.insert(name.clone());
         }
         _ => {}
     });

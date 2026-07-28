@@ -197,8 +197,4 @@ impl RunQueue {
     pub fn pop(&mut self) -> Option<TaskId> {
         self.queue.pop_front()
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
-    }
 }

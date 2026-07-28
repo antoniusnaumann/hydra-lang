@@ -4,7 +4,7 @@
 //! QUESTIONS.md §1). Tests therefore run a program and inspect the module
 //! scope it leaves behind.
 
-use hydra::value::{to_text, Value};
+use hydra::value::to_text;
 use hydra::vm::{run_source, Options, RunResult};
 
 fn opts() -> Options {
