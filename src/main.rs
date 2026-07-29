@@ -1,5 +1,6 @@
 //! The `hydra` command: the three tools the spec asks for.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -16,6 +17,9 @@ usage:
   hydra run FILE.hy [options]     run a program
   hydra check FILE.hy [options]   report what is guaranteed to crash
   hydra fmt FILE.hy [options]     print the canonical form
+  hydra fmt -                     format standard input onto standard output,
+                                  which is what an editor's format-on-save
+                                  hands it
   hydra tokens FILE.hy            print token classes for editor tooling (§13)
   hydra grammar [--theme]         print a TextMate grammar, or its colours
 
@@ -60,6 +64,7 @@ fn main() -> ExitCode {
         }
         "run" => command(&args[1..], run),
         "check" => command(&args[1..], check),
+        "fmt" if args[1..].iter().any(|a| a == "-") => fmt_stdin(&args[1..]),
         "fmt" => command(&args[1..], fmt),
         "tokens" => command(&args[1..], tokens),
         "grammar" => {
@@ -192,6 +197,42 @@ fn tokens(path: &Path, _args: &[String]) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// `hydra fmt -` reads the source on standard input and writes the canonical
+/// form to standard output. That is the shape an editor's format-on-save wants:
+/// the buffer goes in and comes back, and nothing on disk is touched — the
+/// buffer may not be on disk at all, or may not be what is.
+fn fmt_stdin(args: &[String]) -> ExitCode {
+    if flag(args, "--write") {
+        eprintln!("hydra: --write needs a file; standard input goes to standard output");
+        return ExitCode::from(2);
+    }
+
+    let mut src = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut src) {
+        eprintln!("hydra: cannot read standard input: {e}");
+        return ExitCode::from(2);
+    }
+
+    let formatted = match format_source(&src, "<stdin>") {
+        Ok(formatted) => formatted,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(2);
+        }
+    };
+
+    if flag(args, "--check") {
+        if formatted == src {
+            return ExitCode::SUCCESS;
+        }
+        eprintln!("<stdin>: not formatted");
+        return ExitCode::from(1);
+    }
+
+    print!("{formatted}");
+    ExitCode::SUCCESS
 }
 
 fn fmt(path: &Path, args: &[String]) -> ExitCode {

@@ -1,9 +1,23 @@
 //! End-to-end tests for the `hydra` command.
 
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 fn hydra(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_hydra")).args(args).output().expect("runs")
+}
+
+fn hydra_stdin(args: &[&str], input: &str) -> Output {
+    use std::io::Write;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hydra"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("runs");
+    child.stdin.take().expect("piped").write_all(input.as_bytes()).expect("writes");
+    child.wait_with_output().expect("finishes")
 }
 
 fn stdout(out: &Output) -> String {
@@ -115,6 +129,29 @@ fn fmt_prints_the_canonical_form_and_check_verifies_it() {
 
     let out = hydra(&["fmt", "tests/fixtures/unformatted.hy", "--check"]);
     assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn fmt_formats_standard_input_onto_standard_output() {
+    // What an editor's format-on-save hands the formatter: the buffer, not a
+    // path. Nothing on disk is touched.
+    let source = std::fs::read_to_string("tests/fixtures/unformatted.hy").expect("reads");
+    let out = hydra_stdin(&["fmt", "-"], &source);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "if a\n\tx := 1 + 2\n\td := { .k : &x }\nend\n");
+
+    let canonical = stdout(&out);
+
+    let out = hydra_stdin(&["fmt", "-", "--check"], &source);
+    assert_eq!(out.status.code(), Some(1));
+
+    let out = hydra_stdin(&["fmt", "-", "--check"], &canonical);
+    assert!(out.status.success(), "formatting is idempotent: {}", stderr(&out));
+
+    // There is no file to write back to.
+    let out = hydra_stdin(&["fmt", "-", "--write"], &source);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("--write needs a file"), "{}", stderr(&out));
 }
 
 #[test]
