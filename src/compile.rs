@@ -59,6 +59,11 @@ pub enum Instr {
     /// `place = v` — writes into the binding an outward search finds (§6),
     /// path-copying shared nodes and creating a missing final key (§5).
     Store { root: Root, segs: usize },
+    /// `place += v` — reads the place, applies `op`, and writes the result back
+    /// as **one** step, holding the lock the store takes for the read as well.
+    /// A load and a store would let another trail write in between and lose the
+    /// update (QUESTIONS.md §20).
+    Update { root: Root, segs: usize, op: &'static str },
     /// `&place` (§5.1).
     MakeRef { root: Root, segs: usize },
     /// `a[k]`, which is also what `a.k` compiles to (§5).
@@ -262,10 +267,17 @@ impl Compiler {
                 }
                 self.emit(Instr::Declare(Arc::from(name.as_str())), *pos);
             }
-            Stmt::Assign { target, value, pos } => {
+            Stmt::Assign { target, op, value, pos } => {
                 let (root, segs) = self.place(target)?;
                 self.expr(value)?;
-                self.emit(Instr::Store { root, segs }, *pos);
+                match op {
+                    None => self.emit(Instr::Store { root, segs }, *pos),
+                    // The target's own path segments were evaluated once, above,
+                    // and are shared by the read and the write — `a[next()] += 1`
+                    // calls `next` once, like the `a[i] = a[i] + 1` it stands for
+                    // and unlike the text of it.
+                    Some(op) => self.emit(Instr::Update { root, segs, op }, *pos),
+                };
             }
             Stmt::Expr { expr, .. } => {
                 self.expr(expr)?;

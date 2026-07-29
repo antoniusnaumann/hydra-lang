@@ -31,6 +31,10 @@
 //! Locks are taken **root to leaf and never re-entered**. A `&` that would send
 //! the walk back to another root unwinds first (see `Walk`), so the one way to
 //! build a cycle cannot deadlock.
+//!
+//! [`update_place`] is the one place that reads and writes under the same lock,
+//! which is what makes `a += 1` atomic with respect to `a` where §9.2 leaves a
+//! plain `a = a + 1` last-write-wins (QUESTIONS.md §20).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -666,6 +670,97 @@ fn write_slot(slot: &mut Value, path: &[PathSeg], value: Value) -> Result<Walk<(
             let len = data.items.len();
             let at = resolve_index(*i, len)?;
             write_slot(&mut data.items[at], &path[1..], value)
+        }
+        other => Err(Crash::new(format!("cannot assign into a {}", other.kind()))),
+    }
+}
+
+/// Apply `op` to the value at `root` + `path` and `operand`, and write the
+/// result back. This is what `place += v` does.
+///
+/// The read and the write are **one step**: the root binding's lock is taken
+/// once and held across both, so no other trail can write to that place in
+/// between. `a += 1` in two trails therefore adds two, where a `Load` followed
+/// by a `Store` would let one increment overwrite the other — the update is
+/// atomic with respect to the place it names.
+///
+/// This does not make the *statement* atomic, and nothing here promises more
+/// than the place: the operand was evaluated before the lock was taken, so
+/// `a += b` reads `b` as it was, and `a` and `b` are still last-write-wins with
+/// respect to each other (§9.2).
+pub fn update_place(
+    root: &Cell,
+    path: &[PathSeg],
+    op: &str,
+    operand: &Value,
+) -> Result<(), Crash> {
+    let mut root = root.clone();
+    let mut path = path.to_vec();
+    for _ in 0..MAX_REDIRECTS {
+        let step = {
+            let mut guard = root.write().unwrap_or_else(|e| e.into_inner());
+            update_slot(&mut guard, &path, op, operand)?
+        };
+        match step {
+            Walk::Done(()) => return Ok(()),
+            // A `&` in the way sends the update to another root. The lock here
+            // goes first, exactly as a write does, and the read-modify-write
+            // then happens whole under the lock of the root that really holds
+            // the value.
+            Walk::Redirect { root: next, path: rest } => {
+                root = next;
+                path = rest;
+            }
+        }
+    }
+    Err(Crash::new("a cycle of references was followed while updating"))
+}
+
+fn update_slot(
+    slot: &mut Value,
+    path: &[PathSeg],
+    op: &str,
+    operand: &Value,
+) -> Result<Walk<()>, Crash> {
+    if let Value::Ref(r) = slot {
+        return Ok(redirect(r, path));
+    }
+
+    let Some(seg) = path.first() else {
+        // The read and the write, with the lock on this slot's owner held
+        // across both. `binary_op` runs on the value that is there now, and
+        // nothing can look at the slot until the result is in it.
+        *slot = binary_op(op, &*slot, operand)?;
+        return Ok(Walk::Done(()));
+    };
+
+    unshare(slot);
+    match slot {
+        Value::Dict(rc) => {
+            let PathSeg::Key(key) = seg else {
+                return Err(Crash::new("a dict is keyed by symbols, not by index"));
+            };
+            let mut data = rc.write().unwrap_or_else(|e| e.into_inner());
+            match data.position(key) {
+                Some(i) => update_slot(&mut data.entries[i].1, &path[1..], op, operand),
+                // A plain `=` would create the key (§5); this one reads it
+                // first, and reading a missing key crashes — the same crash
+                // `d.k = d.k + 1` would raise on its way to the write.
+                None => Err(Crash::new(format!("no key .{} in this dict", key.name()))),
+            }
+        }
+        Value::List(rc) => {
+            let PathSeg::Index(i) = seg else {
+                let PathSeg::Key(k) = seg else { unreachable!() };
+                return Err(Crash::new(format!(
+                    "a list has no key .{}; index it with a number",
+                    k.name()
+                )));
+            };
+            let mut data = rc.write().unwrap_or_else(|e| e.into_inner());
+            let len = data.items.len();
+            let at = resolve_index(*i, len)?;
+            update_slot(&mut data.items[at], &path[1..], op, operand)
         }
         other => Err(Crash::new(format!("cannot assign into a {}", other.kind()))),
     }

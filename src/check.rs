@@ -444,8 +444,15 @@ impl<'a> Checker<'a> {
                 let binding = self.binding_for(name, value, *pos);
                 self.declare(name, binding);
             }
-            Stmt::Assign { target, value, pos } => {
+            Stmt::Assign { target, op, value, pos } => {
                 self.expr(value);
+                // `a += 1` reads `a` as well as writing it, so a private name
+                // that is only ever incremented is used, not unused (§11).
+                if op.is_some() {
+                    if let Some(Expr::Name { name, .. }) = target.lvalue_root() {
+                        self.read.insert(name.clone());
+                    }
+                }
                 self.assign_target(target, *pos);
             }
             Stmt::Expr { expr, pos } => {

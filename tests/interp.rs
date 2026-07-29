@@ -320,6 +320,100 @@ outer := x
 #[test]
 fn assigning_to_an_undeclared_name_crashes() {
     assert!(crash_of("x = 1\n").contains("not declared"));
+    // A compound assignment is an assignment: it reads the binding it writes,
+    // so there is even less for it to do without one.
+    assert!(crash_of("x += 1\n").contains("not declared"));
+}
+
+#[test]
+fn a_compound_assignment_applies_its_operator() {
+    let src = "
+n := 10
+n += 5
+n -= 3
+n *= 4
+n /= 6
+n %= 5
+";
+    assert_eq!(eval(src, "n"), "3");
+
+    // Every one of them is the binary operator of §3's table, with §2's
+    // semantics unchanged — `>>>` still widens back through an unsigned shift.
+    assert_eq!(eval("b := 1\nb <<= 4\n", "b"), "16");
+    assert_eq!(eval("b := 16\nb >>= 2\n", "b"), "4");
+    assert_eq!(eval("b := 0 - 8\nb >>>= 28\n", "b"), "15");
+    assert_eq!(eval("b := 4\nb |= 3\n", "b"), "7");
+    assert_eq!(eval("b := 6\nb &= 3\n", "b"), "2");
+    assert_eq!(eval("b := 6\nb ^= 3\n", "b"), "5");
+    // `+` joins two strings, so `+=` does too (QUESTIONS.md §4).
+    assert_eq!(eval("s := \"ab\"\ns += \"cd\"\n", "s"), "abcd");
+    assert!(crash_of("s := \"n = \"\ns += 3\n").contains("interpolate"));
+}
+
+#[test]
+fn a_compound_assignment_reaches_keys_and_elements() {
+    assert_eq!(eval("d := { .n : 1 }\nd.n += 41\n", "d"), "{ .n : 42 }");
+    assert_eq!(eval("l := [1, 2, 3]\nl[0] += 100\nl[-1] *= 2\n", "l"), "[101, 2, 6]");
+    assert_eq!(eval("d := { .l : [1] }\nd.l[0] -= 1\n", "d"), "{ .l : [0] }");
+
+    // Writing a missing key creates it (§5), but this one reads it first, and
+    // reading a missing key crashes — the same crash `d.b = d.b + 1` raises.
+    assert!(crash_of("d := { .a : 1 }\nd.b += 1\n").contains("no key .b"));
+    assert!(crash_of("l := [1]\nl[3] += 1\n").contains("out of range"));
+}
+
+#[test]
+fn a_compound_assignment_names_its_place_once() {
+    // `a[next()] += 1` is `a[i] = a[i] + 1`, not the text of it: the index is
+    // evaluated once, so `next` is called once and the update lands in the
+    // element it chose.
+    let src = "
+calls := 0
+fn next()
+\tcalls = calls + 1
+\treturn 0
+end
+a := [10, 20]
+a[next()] += 5
+";
+    assert_eq!(eval(src, "calls"), "1");
+    assert_eq!(eval(src, "a"), "[15, 20]");
+}
+
+#[test]
+fn a_compound_assignment_writes_through_a_reference() {
+    // A `&` in the binding is written *through*, exactly as `=` is
+    // (QUESTIONS.md §6), and the copy a plain read makes is not updated.
+    let src = "
+a := 1
+fn bump(x)
+\tx += 41
+end
+bump(&a)
+";
+    assert_eq!(eval(src, "a"), "42");
+
+    let src = "
+a := 1
+fn bump(x)
+\tx += 41
+end
+bump(a)
+";
+    assert_eq!(eval(src, "a"), "1");
+}
+
+#[test]
+fn a_compound_assignment_splits_a_shared_container_first() {
+    // Copy-on-write is invisible to it: `b` was a copy, so updating `b` leaves
+    // `a` alone (§5.1).
+    let src = "
+a := [1, 2]
+b := a
+b[0] += 100
+";
+    assert_eq!(eval(src, "a"), "[1, 2]");
+    assert_eq!(eval(src, "b"), "[101, 2]");
 }
 
 #[test]

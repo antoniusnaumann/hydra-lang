@@ -6,9 +6,9 @@
 //!
 //! The two rules that shape everything here:
 //!
-//! * **Store after check** (§9.5). `Declare` and `Store` ask whether the trail
-//!   is still live *after* evaluating and *before* writing, so a cancelled
-//!   trail's pending assignment simply does not happen.
+//! * **Store after check** (§9.5). `Declare`, `Store` and `Update` ask whether
+//!   the trail is still live *after* evaluating and *before* writing, so a
+//!   cancelled trail's pending assignment simply does not happen.
 //! * **A call is never interrupted** (§9.5). Cancellation is only noticed at a
 //!   statement boundary of the trail's *own* body, so an in-flight call — and
 //!   everything it invokes — runs to the end and no frame is abandoned.
@@ -30,8 +30,8 @@ use crate::sched::{
 };
 use crate::value::{
     binary_op, boolean, copy_value, deref, get_member, member_opt, new_dict, new_list, path_segment,
-    push_place, read_place, sym, to_text, unary_op, write_place, Cell, Closure, Native, PathSeg,
-    RefValue, Sym, Value,
+    push_place, read_place, sym, to_text, unary_op, update_place, write_place, Cell, Closure,
+    Native, PathSeg, RefValue, Sym, Value,
 };
 
 #[derive(Clone, Debug)]
@@ -475,6 +475,18 @@ impl Vm {
                 }
                 let cell = self.cell_for(task, root)?;
                 write_place(&cell, &path, value)?;
+            }
+            Instr::Update { root, segs, op } => {
+                let operand = task.pop();
+                let path = self.take_path(task, *segs)?;
+                // Evaluate → check the cancel flag → only then store (§9.5).
+                // A cancelled trail does not read its target either: the whole
+                // read-modify-write is the pending assignment.
+                if task.should_stop() {
+                    return Ok(Flow::Stop);
+                }
+                let cell = self.cell_for(task, root)?;
+                update_place(&cell, &path, op, &operand)?;
             }
             Instr::MakeRef { root, segs } => {
                 let path = self.take_path(task, *segs)?;

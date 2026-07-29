@@ -253,8 +253,15 @@ pub enum Stmt {
         pos: Pos,
     },
     /// `lvalue = expr` assigns to an existing binding (§6).
+    ///
+    /// `op` is the binary operator of a compound assignment — `Some("+")` for
+    /// `lvalue += expr` — and `None` for a plain `=`. A compound assignment
+    /// means what `lvalue = lvalue op expr` means, except that it names the
+    /// place once: the target is evaluated once, and the read and the write are
+    /// one indivisible step (QUESTIONS.md §20).
     Assign {
         target: Expr,
+        op: Option<&'static str>,
         value: Expr,
         pos: Pos,
     },

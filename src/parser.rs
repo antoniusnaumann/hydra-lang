@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use crate::ast::*;
 use crate::errors::{HydraError, Pos, Result};
-use crate::lexer::{static_text, tokenize, StrPiece, Tok, Token, TRAIL_LABEL, TRAIL_SEP};
+use crate::lexer::{
+    compound_assign, static_text, tokenize, StrPiece, Tok, Token, TRAIL_LABEL, TRAIL_SEP,
+};
 
 /// Keywords that end a block body without being part of it.
 const BLOCK_ENDERS: &[&str] = &["end", "else", "else if"];
@@ -215,18 +217,26 @@ impl<'a> Parser<'a> {
             };
         }
 
-        if self.peek().is_op("=") {
-            let op_pos = self.pos();
-            self.advance();
-            let value = self.parse_expr()?;
-            self.expect_end_of_statement()?;
-            if !expr.is_lvalue() {
-                return self.err(
-                    "the left of `=` must be a variable, a dict key or a list element",
-                    op_pos,
-                );
+        // `=`, and the compound assignments that carry an operator with them.
+        // They take the same target and the same rule about what a target may
+        // be, so they are one branch.
+        if let Tok::Op(spelling) = self.peek().kind {
+            let op = if spelling == "=" { Some(None) } else { compound_assign(spelling).map(Some) };
+            if let Some(op) = op {
+                let op_pos = self.pos();
+                self.advance();
+                let value = self.parse_expr()?;
+                self.expect_end_of_statement()?;
+                if !expr.is_lvalue() {
+                    return self.err(
+                        format!(
+                            "the left of `{spelling}` must be a variable, a dict key or a list element"
+                        ),
+                        op_pos,
+                    );
+                }
+                return Ok(Stmt::Assign { target: expr, op, value, pos });
             }
-            return Ok(Stmt::Assign { target: expr, value, pos });
         }
 
         self.expect_end_of_statement()?;

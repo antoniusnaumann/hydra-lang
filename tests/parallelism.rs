@@ -130,6 +130,78 @@ count := len(seen)
     }
 }
 
+/// Eight trails, each incrementing the same parent binding 500 times.
+///
+/// With real threads on real cores, a read and a write that are two steps
+/// interleave and lose updates; these are the programs that say whether they do.
+fn counting_trails(statement: &str) -> String {
+    format!(
+        "
+count := 0
+parallel for worker in [1, 2, 3, 4, 5, 6, 7, 8]
+\ti := 0
+\twhile i < 500
+\t\t{statement}
+\t\ti = i + 1
+\tend
+end
+"
+    )
+}
+
+#[test]
+fn a_compound_assignment_is_atomic_with_respect_to_its_target() {
+    // The point of `+=` being one instruction: the read and the write happen
+    // under one lock, so eight trails incrementing one binding add exactly
+    // 4000 and no increment is lost, whatever the pool does.
+    let src = counting_trails("count += 1");
+    for _ in 0..20 {
+        let result = run_with(&src, wide());
+        assert!(result.crash.is_none(), "{:?}", result.crash);
+        assert_eq!(read(&result, "count"), "4000");
+    }
+}
+
+#[test]
+fn writing_the_same_binding_in_two_steps_may_still_lose_updates() {
+    // The contrast, and why `+=` is worth having: `count = count + 1` is a read
+    // and a write with a gap in between, so §9.2's last-write-wins applies and
+    // an increment can be overwritten. Never *more* than 4000, and this asserts
+    // only that — how much is lost is the nondeterminism the spec embraces.
+    let src = counting_trails("count = count + 1");
+    for _ in 0..20 {
+        let result = run_with(&src, wide());
+        assert!(result.crash.is_none(), "{:?}", result.crash);
+        let count: f64 = read(&result, "count").parse().expect("a number");
+        assert!(count <= 4000.0, "a two-step update cannot add more than it counted: {count}");
+    }
+}
+
+#[test]
+fn a_compound_assignment_is_atomic_inside_a_shared_structure() {
+    // The same guarantee one level down: the lock the write takes is the one
+    // the read is made under, wherever in the structure the place is.
+    let src = "
+totals := { .hits : 0, .rows : [0] }
+parallel for worker in [1, 2, 3, 4, 5, 6, 7, 8]
+\ti := 0
+\twhile i < 200
+\t\ttotals.hits += 1
+\t\ttotals.rows[0] += 2
+\t\ti = i + 1
+\tend
+end
+hits := totals.hits
+rows := totals.rows[0]
+";
+    for _ in 0..20 {
+        let result = run_with(src, wide());
+        assert!(result.crash.is_none(), "{:?}", result.crash);
+        assert_eq!(read(&result, "hits"), "1600");
+        assert_eq!(read(&result, "rows"), "3200");
+    }
+}
+
 #[test]
 fn value_semantics_hold_across_workers() {
     // Each trail works on its own copy (§5.1), so none of them can see another

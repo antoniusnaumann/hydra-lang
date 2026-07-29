@@ -309,3 +309,61 @@ What is left, in the order it would pay:
   constantly; something cheaper than an `RwLock` would suit it.
 
 None of these change the language, so none of them is blocking.
+
+---
+
+## 20. Compound assignment — **NEEDS A RULING** (spec §3, §9.2)
+
+Not a hole in the spec: an **addition** to it. `+=` is nowhere in §3's grammar or
+its precedence table, and the language it describes is complete without it. It
+was asked for, so it is implemented, and it is recorded here because the owner
+has not ruled on it.
+
+**What was added.** One compound assignment per arithmetic and bitwise operator
+of §3's table — `+= -= *= /= %= |= &= ^= <<= >>= >>>=` — and none for the
+comparisons or for `and` / `or`, which answer a question rather than combining
+two operands into a new value. Each lexes as **one** operator, so §2's
+longest-match rule now also reads `>>>=` before `>>>` and `+=` before `+`.
+
+**It is a statement, not an expression.** §3 says assignment is a statement, and
+that is what keeps `f(a = 1)` unambiguously a named argument. `a += 1` is the
+same statement with an operator attached, so `f(a += 1)` is a syntax error and
+nothing new can appear inside an expression. The grammar addition is one line:
+
+```
+assign = lvalue ( "=" | compound ) expr ;
+```
+
+**What it means.** `place op= expr` means what `place = place op expr` means,
+with two differences, both deliberate:
+
+- **The place is named once.** `a[next()] += 1` calls `next` once. The path is
+  evaluated once and shared by the read and the write.
+- **The read and the write are one step**, which is the part that is not sugar
+  (below).
+
+Reading is still reading: `d.k += 1` on a dict with no `.k` **crashes**, where
+`d.k = 1` would create the key (§5). It is the crash `d.k = d.k + 1` raises on
+its way to the write, and creating the key would mean inventing an identity
+element per operator.
+
+**Atomicity.** §9.2 says concurrent writes to a parent binding are
+last-write-wins, and §9.1 says nothing is guaranteed atomic. A compound
+assignment is the one exception, and it is narrow: the read and the write happen
+under the **same lock**, so the update is atomic *with respect to the place it
+names*. Two trails running `count += 1` add two — no increment is lost. Nothing
+else changed: the operand was evaluated before the lock was taken, so `a += b`
+uses the `b` it read, and `a` and `b` are still last-write-wins with respect to
+one another. The statement is not atomic; the update to the place is.
+
+This is worth having precisely because §9.1 no longer gives it away for free.
+With trails on real threads, `count = count + 1` is a read and a write with a gap
+in between, and `tests/parallelism.rs` asserts on both halves of that: eight
+trails and 4000 increments land exactly 4000 through `+=`, and never more than
+4000 through the two-step form.
+
+**Cost if the owner says no:** delete `Instr::Update` and `update_place`; the
+lexer table, one parser branch and `Stmt::Assign`'s `op` field go with them.
+**Cost if the owner wants it to be an expression instead:** the named-argument
+disambiguation of §3 has to be decided first — `f(a += 1)` and `f(a = 1)` cannot
+both be what they look like.

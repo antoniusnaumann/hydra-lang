@@ -48,6 +48,17 @@ fn assignment_to_a_name_with_no_binding() {
     assert_eq!(codes("x := 1\nif .true\n\tx = 2\nend\n"), Vec::<&str>::new());
     // But an inner one does not escape.
     assert_eq!(codes("if .true\n\ty := 1\nend\ny = 2\n"), vec!["assign-undeclared"]);
+    // A compound assignment is an assignment and needs the same binding.
+    assert_eq!(codes("x += 1\n"), vec!["assign-undeclared"]);
+    assert_eq!(codes("x := 1\nx += 2\n"), Vec::<&str>::new());
+}
+
+#[test]
+fn a_compound_assignment_reads_the_name_it_writes() {
+    // `_hits = 1` writes a private and never reads it; `_hits += 1` reads it,
+    // so it is used and the unused-private warning would be wrong (§11).
+    assert_eq!(warnings("_hits := 0\n_hits = 1\n"), vec!["unused-private"]);
+    assert_eq!(warnings("_hits := 0\n_hits += 1\n"), Vec::<&str>::new());
 }
 
 #[test]

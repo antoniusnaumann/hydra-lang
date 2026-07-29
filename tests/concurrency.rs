@@ -200,6 +200,32 @@ end
 }
 
 #[test]
+fn a_cancelled_compound_assignment_does_not_read_either() {
+    // The same rule for `+=`: the read and the write together are the pending
+    // assignment, so a cancelled trail leaves the target exactly as it was —
+    // *evaluate → check the cancel flag → only then store* (§9.5).
+    let src = "
+log := \"\"
+total := 0
+fn work()
+\tlog = log + \"effect\"
+\treturn 5
+end
+race
+\ttotal += work() || log = log + \"w\"
+\ttotal += 100    ||
+end
+";
+    let result = run(src);
+    assert!(result.crash.is_none());
+    let read = |name: &str| {
+        to_text(&result.root_scope.lookup(name).expect("binding").read().unwrap().clone())
+    };
+    assert_eq!(read("log"), "weffect", "the call completed but the trail stopped after it");
+    assert_eq!(read("total"), "0", "the pending read-modify-write was discarded");
+}
+
+#[test]
 fn alive_goes_false_inside_a_cancelled_trail() {
     let src = "
 status := .null

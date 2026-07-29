@@ -102,8 +102,19 @@ cargo run -- run examples/trails.hy --dump-scope
   it. Wake tokens close the same race from the other side, for a parent that is
   about to block just as its last child finishes.
 
-- **Cancellation falls out of two instructions.** `Declare` and `Store` check
-  the trail's flag after evaluating and before writing, which is §9.5's
+- **`+=` is one instruction, and that is the whole point.** The compound
+  assignments (`+= -= *= /= %= |= &= ^= <<= >>= >>>=`) are an addition to the
+  spec, so QUESTIONS.md §20 records them for a ruling. `a += b` means what
+  `a = a + b` means, except that it names the place once and that the read and
+  the write happen under the same lock — the update is atomic **with respect to
+  the place it names**, so two trails running `count += 1` add two. A load and a
+  store would let one increment overwrite the other, which is what §9.2's
+  last-write-wins allows and what `tests/parallelism.rs` asserts on from both
+  sides. The statement is not atomic: the operand is read before the lock is
+  taken, and `a` and `b` still race with each other as §9.2 says they do.
+
+- **Cancellation falls out of the writing instructions.** `Declare`, `Store` and
+  `Update` check the trail's flag after evaluating and before writing, which is §9.5's
   *evaluate → check → store*; and the flag is only consulted at a statement
   boundary of the trail's own body, so an in-flight call — and everything it
   invokes — runs to the end.

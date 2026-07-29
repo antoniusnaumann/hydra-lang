@@ -40,15 +40,42 @@ pub const COMPOUND: &[(&str, &str, &str)] = &[
 
 /// Longest match wins, and the order matters (§2): `===` before `==` before
 /// `=`, `!==` before `!=`, `::` and `:=` before `:`, `||` before `|`, `>>>`
-/// before `>>` before `>`. The table is written longest-first so that the rule
-/// is visible rather than implied.
+/// before `>>` before `>`, and every compound assignment before the operator it
+/// is built from — `>>>=` before `>>>`, `+=` before `+`. The table is written
+/// longest-first so that the rule is visible rather than implied.
 pub const OPERATORS: &[&str] = &[
-    ">>>", "===", "!==", //
+    ">>>=", //
+    ">>>", "<<=", ">>=", "===", "!==", //
     "==", "!=", "<=", ">=", "<<", ">>", ":=", "::", "||", //
+    "+=", "-=", "*=", "/=", "%=", "|=", "&=", "^=", //
     "=", "<", ">", "+", "-", "*", "/", "%", //
     "|", "&", "^", "~", //
     "(", ")", "[", "]", "{", "}", ",", ".", ":",
 ];
+
+/// The compound assignments, each paired with the binary operator it applies.
+///
+/// One per arithmetic and bitwise operator of §3's table, and none for the
+/// comparisons or for `and` / `or`: `a <= b` and `a and b` answer a question
+/// rather than combining two operands into a new one.
+pub const COMPOUND_ASSIGN: &[(&str, &str)] = &[
+    ("+=", "+"),
+    ("-=", "-"),
+    ("*=", "*"),
+    ("/=", "/"),
+    ("%=", "%"),
+    ("|=", "|"),
+    ("&=", "&"),
+    ("^=", "^"),
+    ("<<=", "<<"),
+    (">>=", ">>"),
+    (">>>=", ">>>"),
+];
+
+/// The binary operator a compound assignment applies, if it is one.
+pub fn compound_assign(op: &str) -> Option<&'static str> {
+    COMPOUND_ASSIGN.iter().find(|(spelling, _)| *spelling == op).map(|(_, binary)| *binary)
+}
 
 /// The trail separator (§2). Not logical or — Hydra has no `||` operator.
 pub const TRAIL_SEP: &str = "||";

@@ -156,6 +156,27 @@ fn declaration_versus_assignment() {
 }
 
 #[test]
+fn a_compound_assignment_carries_its_operator() {
+    let program = parse("x += 1\nx >>>= 2\nd.k *= 3\nx = 4\n", "t.hy").unwrap();
+    let op_of = |i: usize| match &program.body[i] {
+        Stmt::Assign { op, .. } => *op,
+        other => panic!("expected an assignment, got {other:?}"),
+    };
+    assert_eq!(op_of(0), Some("+"));
+    assert_eq!(op_of(1), Some(">>>"));
+    assert_eq!(op_of(2), Some("*"));
+    // A plain `=` carries none: it does not read what it writes.
+    assert_eq!(op_of(3), None);
+
+    // The target rule is the one `=` has.
+    assert!(parse("f() += 1\n", "t.hy").is_err());
+    assert!(parse("1 += 2\n", "t.hy").is_err());
+    // Assignment is a statement (§3), so a compound one is not an argument
+    // either — `f(a += 1)` is not a named argument with a strange name.
+    assert!(parse("f(a += 1)\n", "t.hy").is_err());
+}
+
+#[test]
 fn if_else_if_chain() {
     let program = parse("if a\n\tx = 1\nelse if b\n\tx = 2\nelse\n\tx = 3\nend\n", "t.hy").unwrap();
     let Stmt::If { branches, .. } = &program.body[0] else { panic!("expected if") };

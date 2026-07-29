@@ -37,6 +37,12 @@ fn spacing_around_operators_and_after_commas() {
     assert_eq!(fmt_idempotent("x := a==b\n"), "x := a == b\n");
     assert_eq!(fmt_idempotent("x := not a and b\n"), "x := not a and b\n");
     assert_eq!(fmt_idempotent("x := a>>>b\n"), "x := a >>> b\n");
+    // A compound assignment is one operator and gets the spacing of one.
+    assert_eq!(fmt_idempotent("x+=1\n"), "x += 1\n");
+    assert_eq!(fmt_idempotent("x>>>=1\n"), "x >>>= 1\n");
+    assert_eq!(fmt_idempotent("d . k*=2\n"), "d.k *= 2\n");
+    // And what follows it is still an operand, so a minus there is a prefix.
+    assert_eq!(fmt_idempotent("x += -1\n"), "x += -1\n");
 }
 
 #[test]

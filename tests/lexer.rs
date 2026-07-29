@@ -37,6 +37,31 @@ fn longest_match_wins() {
 }
 
 #[test]
+fn a_compound_assignment_is_one_operator() {
+    // Each one is longer than both the operator it carries and the `=` it ends
+    // with, so longest match has to reach it first.
+    for (src, spelling) in [
+        ("a += b", "+="),
+        ("a -= b", "-="),
+        ("a *= b", "*="),
+        ("a /= b", "/="),
+        ("a %= b", "%="),
+        ("a |= b", "|="),
+        ("a &= b", "&="),
+        ("a ^= b", "^="),
+        ("a <<= b", "<<="),
+        ("a >>= b", ">>="),
+        ("a >>>= b", ">>>="),
+    ] {
+        assert_eq!(ops(src), vec![spelling], "for {src:?}");
+    }
+    // And the operators they are built from still lex as themselves.
+    assert_eq!(ops("a >= b"), vec![">="]);
+    assert_eq!(ops("a <= b"), vec!["<="]);
+    assert_eq!(ops("a = -b"), vec!["=", "-"]);
+}
+
+#[test]
 fn compound_keywords_are_one_token() {
     for (src, spelling) in [
         ("else if", "else if"),
