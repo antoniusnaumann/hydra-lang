@@ -19,7 +19,7 @@ print("through a reference: \(original.count)")
 // `&box` in the signature means the call must mark it. Without the `&` the
 // callee would work on a copy, so it crashes instead:
 //
-//	bump(original)   // crash: takes `box` by reference
+// bump(original)   // crash: takes `box` by reference
 
 // Identity is the copy-on-write buffer, for now (§5.1).
 print("copy === original: \(copy === original), and original === original: \(original === original)")
