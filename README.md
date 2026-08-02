@@ -43,7 +43,7 @@ cargo run -- run examples/trails.hy --dump-scope
 | `src/scope.rs` | §6: scopes as hash maps with parent pointers |
 | `src/compile.rs` | the tree lowered to instructions |
 | `src/vm.rs` | §5–§8: the evaluator, crashes, and `use` |
-| `src/sched.rs` | §9: trails, cancel flags, the run queue |
+| `src/sched.rs` | §9: trails, cancel flags, the run queue, and the per-block mailboxes |
 | `src/check.rs` | §11 |
 | `src/format.rs` | §12 |
 | `src/editor.rs` | §13: token classes, TextMate grammar, colours |
@@ -152,6 +152,50 @@ qualified it is also statically known, so `check` still reports a missing `&` on
 A missing `&` is *not* a rejection: it is reported against the candidate that
 accepted the call, because it is a mistake to fix rather than a reason to
 quietly run something else.
+
+**A concrete arity beats a variadic.** A `*` parameter accepts everything
+positional, so a variadic candidate is tried only after every candidate that
+takes the call exactly — otherwise a variadic shadow would swallow the narrower
+functions behind it.
+
+## Auto-channels
+
+Trails hand values to their siblings with no channel declared anywhere: the
+block *is* the channel set. Specified in
+[`spec/hydra_channels.md`](spec/hydra_channels.md), demonstrated by
+[`examples/channels.hy`](examples/channels.hy).
+
+```hydra
+parallel
+	send("ready") || msg, ch := receive()
+	              || print("got \(msg) from trail \(ch)")
+end
+```
+
+`send(value, to*, mode = .wait)` answers `.true` or `.false`; `.wait` parks
+until someone takes the value, `.detach` buffers, `.broadcast` buffers one copy
+per eligible trail. `receive(from*)` answers with the value **and** the trail
+that sent it, and both come back `.null` when no eligible sender is left — the
+one answer a sender cannot fake, because a real send always arrives with a real
+index behind it. `channel()` is a trail's own index.
+
+The three are lexically scoped: `check` rejects them outside a `parallel` or
+`race` body, including inside a function a trail calls. That is the deliberate
+contrast with `alive()`, which is dynamic at any depth.
+
+Two language features came out of their signatures:
+
+- **variadic parameters** — `name*` collects the rest of the positional
+  arguments into a list, a bare `*` collects nothing, and everything after
+  either can only be filled by name;
+- **multiple return values** — `value, ch := receive()`, from any function, not
+  just the builtins. Extras a binding does not name are dropped in silence;
+  naming more than arrive is a crash. A multi-value is not a value: it lives
+  only between a call and a binding site.
+
+A block whose every live trail is parked with nothing to send is a **crash**,
+not a hang, and a trail cancelled while parked wakes with the closed answer and
+then runs no further statement.
 
 Everything else the spec's examples lean on is still a placeholder, so
 `examples/deploy.hy` — the spec's own reference program — parses, checks and

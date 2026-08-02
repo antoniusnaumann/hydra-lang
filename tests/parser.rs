@@ -143,7 +143,7 @@ fn closures_single_expression_versus_block() {
 #[test]
 fn declaration_versus_assignment() {
     let program = parse("x := 1\nx = 2\nd.k = 3\nd[k] = 4\n", "t.hy").unwrap();
-    assert!(matches!(&program.body[0], Stmt::Decl { name, .. } if name == "x"));
+    assert!(matches!(&program.body[0], Stmt::Decl { names, .. } if names == &["x"]));
     assert!(matches!(&program.body[1], Stmt::Assign { .. }));
     assert!(matches!(&program.body[2], Stmt::Assign { .. }));
     assert!(matches!(&program.body[3], Stmt::Assign { .. }));
@@ -221,8 +221,13 @@ fn trail_sexprs(src: &str) -> Vec<Vec<String>> {
                 .iter()
                 .map(|s| match s {
                     Stmt::Expr { expr, .. } => sexpr(expr),
-                    Stmt::Assign { target, value, .. } => format!("(= {} {})", sexpr(target), sexpr(value)),
-                    Stmt::Decl { name, value, .. } => format!("(:= {name} {})", sexpr(value)),
+                    Stmt::Assign { targets, value, .. } => {
+                        let targets: Vec<String> = targets.iter().map(sexpr).collect();
+                        format!("(= {} {})", targets.join(" "), sexpr(value))
+                    }
+                    Stmt::Decl { names, value, .. } => {
+                        format!("(:= {} {})", names.join(" "), sexpr(value))
+                    }
                     Stmt::If { branches, .. } => format!("(if branches[{}])", branches.len()),
                     other => format!("{other:?}"),
                 })

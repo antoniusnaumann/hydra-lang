@@ -214,7 +214,7 @@ pub struct Closure {
 
 impl Closure {
     pub fn required(&self) -> usize {
-        self.params.iter().filter(|p| !p.has_default).count()
+        self.params.iter().filter(|p| !p.has_default && !p.variadic).count()
     }
 
     /// How a call is described in a diagnostic: `f(&list, value)`.
@@ -222,7 +222,14 @@ impl Closure {
         let params: Vec<String> = self
             .params
             .iter()
-            .map(|p| format!("{}{}", if p.by_ref { "&" } else { "" }, p.name))
+            .map(|p| {
+                format!(
+                    "{}{}{}",
+                    if p.by_ref { "&" } else { "" },
+                    p.name,
+                    if p.variadic { "*" } else { "" }
+                )
+            })
             .collect();
         let name = if self.name.is_empty() { "fn" } else { &self.name };
         format!("{name}({})", params.join(", "))
@@ -235,11 +242,14 @@ impl fmt::Debug for Closure {
     }
 }
 
-/// The builtins: `alive()`, which is the language primitive of §9.5, and the
-/// standard library of `spec/hydra_stdlib.md`.
+/// The builtins: `alive()`, which is the language primitive of §9.5, the three
+/// channel calls of `spec/hydra_channels.md`, and the standard library of
+/// `spec/hydra_stdlib.md`.
 ///
 /// They are global names looked up *after* the scope chain, so a program can
-/// shadow one — they are not reserved words.
+/// shadow one — they are not reserved words. The channel three are the
+/// exception in one respect only: `check` rejects them outside a `parallel` or
+/// `race` body, because they are lexically scoped to the block (channels §6.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Native {
     Alive,
@@ -248,10 +258,25 @@ pub enum Native {
     Get,
     Len,
     Push,
+    Send,
+    Receive,
+    Channel,
 }
 
-pub const NATIVES: &[Native] =
-    &[Native::Alive, Native::Print, Native::Has, Native::Get, Native::Len, Native::Push];
+pub const NATIVES: &[Native] = &[
+    Native::Alive,
+    Native::Print,
+    Native::Has,
+    Native::Get,
+    Native::Len,
+    Native::Push,
+    Native::Send,
+    Native::Receive,
+    Native::Channel,
+];
+
+/// The calls that only mean something inside a trail (channels §6.4).
+pub const CHANNEL_NATIVES: &[Native] = &[Native::Send, Native::Receive, Native::Channel];
 
 impl Native {
     pub fn lookup(name: &str) -> Option<Native> {
@@ -266,14 +291,28 @@ impl Native {
             Native::Get => "get",
             Native::Len => "len",
             Native::Push => "push",
+            Native::Send => "send",
+            Native::Receive => "receive",
+            Native::Channel => "channel",
+        }
+    }
+
+    /// Which parameter is the `*`, if any: it collects what is left of the
+    /// positional arguments, and everything after it is keyword-only
+    /// (channels §6.1).
+    pub fn variadic(self) -> Option<usize> {
+        match self {
+            Native::Send => Some(1),
+            Native::Receive => Some(0),
+            _ => None,
         }
     }
 
     /// Arguments that must be supplied.
     pub fn required(self) -> usize {
         match self {
-            Native::Alive => 0,
-            Native::Len | Native::Print => 1,
+            Native::Alive | Native::Channel | Native::Receive => 0,
+            Native::Len | Native::Print | Native::Send => 1,
             Native::Has | Native::Push => 2,
             Native::Get => 3,
         }
@@ -283,10 +322,10 @@ impl Native {
     /// is the defaults.
     pub fn total(self) -> usize {
         match self {
-            Native::Alive => 0,
-            Native::Len => 1,
+            Native::Alive | Native::Channel => 0,
+            Native::Len | Native::Receive => 1,
             Native::Print | Native::Has | Native::Push => 2,
-            Native::Get => 3,
+            Native::Get | Native::Send => 3,
         }
     }
 
@@ -301,6 +340,10 @@ impl Native {
             Native::Get => &["container", "key", "fallback"],
             Native::Len => &["value"],
             Native::Push => &["list", "value"],
+            // `to` and `from` are the `*`, so `mode` can only be named.
+            Native::Send => &["value", "to", "mode"],
+            Native::Receive => &["from"],
+            Native::Channel => &[],
         }
     }
 
@@ -320,6 +363,9 @@ impl Native {
             Native::Get => "get(container, key, fallback)",
             Native::Len => "len(value)",
             Native::Push => "push(&list, value)",
+            Native::Send => "send(value, to*, mode = .wait)",
+            Native::Receive => "receive(from*)",
+            Native::Channel => "channel()",
         }
     }
 }

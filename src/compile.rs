@@ -59,6 +59,14 @@ pub enum Instr {
     /// `place = v` — writes into the binding an outward search finds (§6),
     /// path-copying shared nodes and creating a missing final key (§5).
     Store { root: Root, segs: usize },
+    /// The same store, for one target of a multi-value binding: the path is on
+    /// top and the value sits *under* it, because the values arrived together
+    /// and cannot be re-ordered around each target's path (channels §6.2).
+    StoreUnder { root: Root, segs: usize },
+    /// Spread a call's answer across `n` targets: the first value is on the
+    /// stack and the rest are the frame's extras. Extras beyond `n` are
+    /// dropped; naming more than arrived is a crash (channels §6.2).
+    TakeValues(usize),
     /// `place += v` — reads the place, applies `op`, and writes the result back
     /// as **one** step, holding the lock the store takes for the read as well.
     /// A load and a store would let another trail write in between and lose the
@@ -85,7 +93,9 @@ pub enum Instr {
     /// Call by name: every function bound to that name is a candidate, and the
     /// first that accepts the argument count and names is the one (§3).
     CallName { name: Arc<str>, positional: usize, names: Arc<Vec<Arc<str>>> },
-    Return,
+    /// Return `n` values, the first of which is the meaningful one and the rest
+    /// additional information (channels §6.2).
+    Return(usize),
     ReturnNull,
 
     PushScope,
@@ -106,7 +116,10 @@ pub enum Instr {
     SkipIfProvided { index: usize, target: usize },
 
     /// Open a `parallel` / `race` block.
-    BeginBlock { kind: BlockKind, label: Option<Arc<str>> },
+    /// `arity` is how many trails the block will have, where that is known
+    /// before it runs: the row form always, the spawning forms never. It is
+    /// what lets a channel index that cannot exist crash (channels §6.7).
+    BeginBlock { kind: BlockKind, label: Option<Arc<str>>, arity: Option<usize> },
     /// Start one trail of the open block. With `var`, the top of the stack
     /// becomes that binding in the trail's scope (`parallel for`).
     SpawnTrail { body: Arc<Chunk>, var: Option<Arc<str>>, column: usize },
@@ -124,10 +137,15 @@ pub enum Instr {
 /// What a call has to supply for one parameter.
 #[derive(Clone, Debug)]
 pub struct ParamInfo {
+    /// Empty for the bare `*`, which binds nothing (channels §6.1).
     pub name: Arc<str>,
     /// `&name`: the argument must be a reference (§5.1).
     pub by_ref: bool,
     pub has_default: bool,
+    /// `name*`: collects what is left of the positional arguments into a list.
+    pub variadic: bool,
+    /// Declared after the variadic, so only a named argument can fill it.
+    pub keyword_only: bool,
 }
 
 /// A compiled body: a function, a module, a trail, or a closure.
@@ -258,44 +276,64 @@ impl Compiler {
                 self.closure(def, name, *pos)?;
                 self.emit(Instr::Declare(Arc::from(name.as_str())), *pos);
             }
-            Stmt::Decl { name, value, pos } => {
+            Stmt::Decl { names, value, pos } => {
                 // A closure declared as `f := fn(…)` answers to `f` in
                 // diagnostics; it has no name of its own otherwise.
-                match value {
-                    Expr::Closure(def) => self.closure(def, name, def.pos)?,
-                    other => self.expr(other)?,
+                match (names.as_slice(), value) {
+                    ([name], Expr::Closure(def)) => self.closure(def, name, def.pos)?,
+                    (_, other) => self.expr(other)?,
                 }
-                self.emit(Instr::Declare(Arc::from(name.as_str())), *pos);
+                if names.len() > 1 {
+                    self.emit(Instr::TakeValues(names.len()), *pos);
+                }
+                // The last name's value is on top, so the names are bound from
+                // the back.
+                for name in names.iter().rev() {
+                    self.emit(Instr::Declare(Arc::from(name.as_str())), *pos);
+                }
             }
-            Stmt::Assign { target, op, value, pos } => {
-                let (root, segs) = self.place(target)?;
-                self.expr(value)?;
-                match op {
-                    None => self.emit(Instr::Store { root, segs }, *pos),
-                    // The target's own path segments were evaluated once, above,
-                    // and are shared by the read and the write — `a[next()] += 1`
-                    // calls `next` once, like the `a[i] = a[i] + 1` it stands for
-                    // and unlike the text of it.
-                    Some(op) => self.emit(Instr::Update { root, segs, op }, *pos),
-                };
+            Stmt::Assign { targets, op, value, pos } => {
+                if let ([target], _) = (targets.as_slice(), &op) {
+                    let (root, segs) = self.place(target)?;
+                    self.expr(value)?;
+                    match op {
+                        None => self.emit(Instr::Store { root, segs }, *pos),
+                        // The target's own path segments were evaluated once,
+                        // above, and are shared by the read and the write —
+                        // `a[next()] += 1` calls `next` once, like the
+                        // `a[i] = a[i] + 1` it stands for and unlike the text
+                        // of it.
+                        Some(op) => self.emit(Instr::Update { root, segs, op }, *pos),
+                    };
+                } else {
+                    // Several targets for one call that returns several values.
+                    // The values land together, so each target's own path is
+                    // pushed *above* its value and `StoreUnder` reaches past it
+                    // — which also means the paths are evaluated from the back.
+                    self.expr(value)?;
+                    self.emit(Instr::TakeValues(targets.len()), *pos);
+                    for target in targets.iter().rev() {
+                        let (root, segs) = self.place(target)?;
+                        self.emit(Instr::StoreUnder { root, segs }, *pos);
+                    }
+                }
             }
             Stmt::Expr { expr, .. } => {
                 self.expr(expr)?;
                 self.emit(Instr::Pop, pos);
             }
-            Stmt::Return { value, pos } => {
+            Stmt::Return { values, pos } => {
                 if self.in_trail {
                     // §9.6: `check` rejects this too, with a better message.
                     return self.err("`return` inside a trail is not allowed", *pos);
                 }
-                match value {
-                    Some(v) => {
-                        self.expr(v)?;
-                        self.emit(Instr::Return, *pos);
+                if values.is_empty() {
+                    self.emit(Instr::ReturnNull, *pos);
+                } else {
+                    for value in values {
+                        self.expr(value)?;
                     }
-                    None => {
-                        self.emit(Instr::ReturnNull, *pos);
-                    }
+                    self.emit(Instr::Return(values.len()), *pos);
                 }
             }
             Stmt::If { branches, pos, end_pos } => self.compile_if(branches, *pos, *end_pos)?,
@@ -309,7 +347,11 @@ impl Compiler {
             Stmt::Continue { label, pos } => self.compile_continue(label.as_deref(), *pos)?,
             Stmt::Parallel { kind, trails, label, pos, .. } => {
                 self.emit(
-                    Instr::BeginBlock { kind: *kind, label: label.as_deref().map(Arc::from) },
+                    Instr::BeginBlock {
+                        kind: *kind,
+                        label: label.as_deref().map(Arc::from),
+                        arity: Some(trails.len()),
+                    },
                     *pos,
                 );
                 for trail in trails {
@@ -323,7 +365,11 @@ impl Compiler {
             }
             Stmt::ParallelFor { kind, var, iterable, body, label, pos, .. } => {
                 self.emit(
-                    Instr::BeginBlock { kind: *kind, label: label.as_deref().map(Arc::from) },
+                    Instr::BeginBlock {
+                        kind: *kind,
+                        label: label.as_deref().map(Arc::from),
+                        arity: None,
+                    },
                     *pos,
                 );
                 let chunk = self.trail_chunk(body, 0, label.as_deref())?;
@@ -353,7 +399,11 @@ impl Compiler {
             }
             Stmt::ParallelWhile { kind, cond, body, label, pos, .. } => {
                 self.emit(
-                    Instr::BeginBlock { kind: *kind, label: label.as_deref().map(Arc::from) },
+                    Instr::BeginBlock {
+                        kind: *kind,
+                        label: label.as_deref().map(Arc::from),
+                        arity: None,
+                    },
                     *pos,
                 );
                 let chunk = self.trail_chunk(body, 0, label.as_deref())?;
@@ -719,7 +769,7 @@ impl Compiler {
         match &def.body {
             ClosureBody::Expr(expr) => {
                 sub.expr(expr)?;
-                sub.emit(Instr::Return, def.pos);
+                sub.emit(Instr::Return(1), def.pos);
             }
             ClosureBody::Block(body) => {
                 // A function body is not a trail body: `return` is fine there,
@@ -736,6 +786,8 @@ impl Compiler {
                 name: Arc::from(p.name.as_str()),
                 by_ref: p.by_ref,
                 has_default: p.default.is_some(),
+                variadic: p.variadic,
+                keyword_only: p.keyword_only,
             })
             .collect();
         let display = if name.is_empty() { "fn".to_string() } else { name.to_string() };

@@ -165,15 +165,33 @@ pub enum ClosureBody {
 /// those without, so positional filling stays unambiguous.
 #[derive(Clone, Debug)]
 pub struct Param {
+    /// Empty for the bare `*`, which is a marker rather than a parameter: it
+    /// takes no argument and exists only to close the positional list.
     pub name: String,
     pub by_ref: bool,
+    /// `name*` collects the remaining positional arguments into a list.
+    pub variadic: bool,
+    /// Everything declared after a variadic can only be filled by name.
+    pub keyword_only: bool,
     pub default: Option<Expr>,
     pub pos: Pos,
 }
 
 impl Param {
     pub fn plain(name: impl Into<String>, pos: Pos) -> Param {
-        Param { name: name.into(), by_ref: false, default: None, pos }
+        Param {
+            name: name.into(),
+            by_ref: false,
+            variadic: false,
+            keyword_only: false,
+            default: None,
+            pos,
+        }
+    }
+
+    /// The bare `*` binds nothing; `name*` binds the collected list.
+    pub fn binds(&self) -> bool {
+        !self.name.is_empty()
     }
 }
 
@@ -247,8 +265,12 @@ pub enum Stmt {
         pos: Pos,
     },
     /// `x := expr` declares, shadowing an existing name (§6).
+    ///
+    /// `names` holds more than one where the value is a call that returns
+    /// several — `value, ch := receive()`. Extras the binding does not name are
+    /// dropped; naming more than arrive is a crash (channels §6.2).
     Decl {
-        name: String,
+        names: Vec<String>,
         value: Expr,
         pos: Pos,
     },
@@ -258,9 +280,9 @@ pub enum Stmt {
     /// `lvalue += expr` — and `None` for a plain `=`. A compound assignment
     /// means what `lvalue = lvalue op expr` means, except that it names the
     /// place once: the target is evaluated once, and the read and the write are
-    /// one indivisible step (QUESTIONS.md §20).
+    /// one indivisible step (QUESTIONS.md §20). It takes one target only.
     Assign {
-        target: Expr,
+        targets: Vec<Expr>,
         op: Option<&'static str>,
         value: Expr,
         pos: Pos,
@@ -319,8 +341,11 @@ pub enum Stmt {
         label: Option<String>,
         pos: Pos,
     },
+    /// `return`, `return expr`, or `return a, b` — a function may answer with
+    /// several values, of which the first is the meaningful one and the rest
+    /// are additional information (channels §6.2).
     Return {
-        value: Option<Expr>,
+        values: Vec<Expr>,
         pos: Pos,
     },
     Expr {

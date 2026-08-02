@@ -203,18 +203,32 @@ impl<'a> Parser<'a> {
         }
 
         // Everything else starts with an expression: it is a declaration, an
-        // assignment, or an expression statement.
+        // assignment, or an expression statement. A comma after the first one
+        // means several targets for one call that returns several values
+        // (channels §6.2) — the only place a comma appears outside a call, a
+        // list or a dict.
         let expr = self.parse_expr()?;
+        let mut targets = vec![expr];
+        while self.peek().is_op(",") {
+            self.advance();
+            targets.push(self.parse_expr()?);
+        }
+        let several = targets.len() > 1;
 
         if self.peek().is_op(":=") {
-            let op_pos = self.pos();
             self.advance();
             let value = self.parse_expr()?;
             self.expect_end_of_statement()?;
-            return match expr {
-                Expr::Name { name, .. } => Ok(Stmt::Decl { name, value, pos }),
-                _ => self.err("the left of `:=` must be a name", op_pos),
-            };
+            let mut names = Vec::new();
+            for target in targets {
+                match target {
+                    Expr::Name { name, .. } => names.push(name),
+                    other => {
+                        return self.err("the left of `:=` must be a name", other.pos());
+                    }
+                }
+            }
+            return Ok(Stmt::Decl { names, value, pos });
         }
 
         // `=`, and the compound assignments that carry an operator with them.
@@ -225,22 +239,38 @@ impl<'a> Parser<'a> {
             if let Some(op) = op {
                 let op_pos = self.pos();
                 self.advance();
-                let value = self.parse_expr()?;
-                self.expect_end_of_statement()?;
-                if !expr.is_lvalue() {
+                // A compound assignment reads its target as well as writing it,
+                // so it names exactly one place.
+                if several && op.is_some() {
                     return self.err(
-                        format!(
-                            "the left of `{spelling}` must be a variable, a dict key or a list element"
-                        ),
+                        format!("`{spelling}` takes one target: it reads the place it writes"),
                         op_pos,
                     );
                 }
-                return Ok(Stmt::Assign { target: expr, op, value, pos });
+                let value = self.parse_expr()?;
+                self.expect_end_of_statement()?;
+                for target in &targets {
+                    if !target.is_lvalue() {
+                        return self.err(
+                            format!(
+                                "the left of `{spelling}` must be a variable, a dict key or a list element"
+                            ),
+                            target.pos(),
+                        );
+                    }
+                }
+                return Ok(Stmt::Assign { targets, op, value, pos });
             }
         }
 
+        if several {
+            return self.err(
+                "a comma list of targets needs `:=` or `=` and a call that returns several values",
+                targets[1].pos(),
+            );
+        }
         self.expect_end_of_statement()?;
-        Ok(Stmt::Expr { expr, pos })
+        Ok(Stmt::Expr { expr: targets.pop().expect("one target"), pos })
     }
 
     fn parse_use(&mut self, pos: Pos) -> Result<Stmt> {
@@ -274,12 +304,37 @@ impl<'a> Parser<'a> {
         Ok(Stmt::FnDecl { name, def, pos })
     }
 
-    /// `param = [ "&" ] ident [ ":=" expr ]`.
+    /// `param = [ "&" ] ident [ "*" ] [ "=" expr ] | "*"`.
+    ///
+    /// `name*` collects the remaining positional arguments into a list, and a
+    /// bare `*` collects nothing — it exists only to close the positional list.
+    /// Either way, everything after it can be filled by name only (channels
+    /// §6.1).
     fn parse_params(&mut self) -> Result<Vec<Param>> {
         self.expect_op("(")?;
         let mut params: Vec<Param> = Vec::new();
         if !self.peek().is_op(")") {
             loop {
+                let keyword_only = params.iter().any(|p| p.variadic);
+                let star_pos = self.pos();
+                if self.eat_op("*") {
+                    if keyword_only {
+                        return self.err("a parameter list takes one `*`", star_pos);
+                    }
+                    params.push(Param {
+                        name: String::new(),
+                        by_ref: false,
+                        variadic: true,
+                        keyword_only: false,
+                        default: None,
+                        pos: star_pos,
+                    });
+                    if !self.eat_op(",") {
+                        break;
+                    }
+                    continue;
+                }
+
                 let by_ref = self.eat_op("&");
                 if matches!(self.peek().kind, Tok::Kw(_)) {
                     return self.err(
@@ -294,6 +349,10 @@ impl<'a> Parser<'a> {
                 if params.iter().any(|p| p.name == name) {
                     return self.err(format!("duplicate parameter `{name}`"), pos);
                 }
+                let variadic = self.eat_op("*");
+                if variadic && keyword_only {
+                    return self.err("a parameter list takes one `*`", pos);
+                }
                 let default = if self.eat_op("=") { Some(self.parse_expr()?) } else { None };
 
                 if by_ref && default.is_some() {
@@ -304,15 +363,32 @@ impl<'a> Parser<'a> {
                         pos,
                     );
                 }
+                if variadic && default.is_some() {
+                    return self.err(
+                        format!("`{name}*` cannot have a default: with no arguments it is `[]`"),
+                        pos,
+                    );
+                }
+                if variadic && by_ref {
+                    return self.err(
+                        format!("`{name}*` cannot be taken by reference: it is a fresh list"),
+                        pos,
+                    );
+                }
                 // Positional filling only, so a defaulted parameter cannot be
-                // followed by one that must be supplied.
-                if default.is_none() && params.iter().any(|p| p.default.is_some()) {
+                // followed by one that must be supplied — unless the `*` has
+                // been passed, after which nothing is positional at all.
+                if default.is_none()
+                    && !variadic
+                    && !keyword_only
+                    && params.iter().any(|p| p.default.is_some())
+                {
                     return self.err(
                         format!("`{name}` has no default but follows one that does"),
                         pos,
                     );
                 }
-                params.push(Param { name, by_ref, default, pos });
+                params.push(Param { name, by_ref, variadic, keyword_only, default, pos });
                 if !self.eat_op(",") {
                     break;
                 }
@@ -418,13 +494,17 @@ impl<'a> Parser<'a> {
 
     fn parse_return(&mut self, pos: Pos) -> Result<Stmt> {
         self.advance();
-        let value = if self.peek().is_newline() || self.peek().is_eof() {
-            None
-        } else {
-            Some(self.parse_expr()?)
-        };
+        let mut values = Vec::new();
+        if !(self.peek().is_newline() || self.peek().is_eof()) {
+            values.push(self.parse_expr()?);
+            // `return a, b` — the first value is the meaningful one and the
+            // rest are additional information (channels §6.2).
+            while self.eat_op(",") {
+                values.push(self.parse_expr()?);
+            }
+        }
         self.expect_end_of_statement()?;
-        Ok(Stmt::Return { value, pos })
+        Ok(Stmt::Return { values, pos })
     }
 
     // --- parallel blocks (§4) ----------------------------------------------

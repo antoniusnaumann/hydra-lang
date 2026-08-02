@@ -138,9 +138,51 @@ pub struct BlockCtx {
     pub kind: BlockKind,
     pub owner: TaskId,
     pub children: Vec<TaskId>,
+    /// Each child's cancel flag, in the same order. The block holds them
+    /// because a trail that is *running* has been taken out of the task table,
+    /// and cancelling it must not depend on catching it at rest (§9.4).
+    pub flags: Vec<Arc<CancelFlag>>,
     pub pending: usize,
     /// Set when a `race` has been decided by its first completion.
     pub decided: bool,
+
+    // --- auto-channels (spec/hydra_channels.md) -----------------------------
+    /// How many trails the block will have, where that is known before it runs
+    /// — which is the row form always, and the others never. It is what makes
+    /// an index that cannot exist a crash instead of a wait (channels §6.7).
+    pub arity: Option<usize>,
+    /// Set when the owner reaches its `JoinBlock`: no further trail can appear,
+    /// so an index past the last one is now certainly wrong and a peer that has
+    /// not started never will.
+    pub spawn_done: bool,
+    /// Channel indices whose trail has ended.
+    pub finished: Vec<usize>,
+    /// Values in flight: buffered by `.detach` and `.broadcast`, and offered by
+    /// a `.wait` whose sender is parked behind them. FIFO, so messages between
+    /// one pair arrive in the order they were sent (channels §5).
+    pub mail: VecDeque<Msg>,
+    /// Trails parked in `send` or `receive`.
+    pub waiting: Vec<Waiter>,
+}
+
+/// One value on its way to a sibling.
+pub struct Msg {
+    pub from: usize,
+    /// The destinations it was addressed to, or `None` for "any", which is
+    /// every trail but the sender.
+    pub to: Option<Vec<usize>>,
+    pub value: Value,
+    /// The sender, when it is parked until someone takes this (mode `.wait`).
+    pub waiter: Option<TaskId>,
+}
+
+/// A trail parked on a channel call.
+pub struct Waiter {
+    pub task: TaskId,
+    pub channel: usize,
+    /// A parked `receive`: the sources it will take from, or `None` for any.
+    /// A parked `send` is not here — its value waits in `mail` instead.
+    pub from: Option<Vec<usize>>,
 }
 
 impl BlockCtx {
@@ -150,6 +192,31 @@ impl BlockCtx {
         match self.kind {
             BlockKind::Parallel => self.pending == 0,
             BlockKind::Race => self.decided || self.pending == 0,
+        }
+    }
+
+    pub fn is_finished(&self, channel: usize) -> bool {
+        self.finished.contains(&channel)
+    }
+
+    /// Whether any trail other than `me` could still take part — either one
+    /// that has not ended, or one that has not been spawned yet. `only`
+    /// restricts the question to the indices a call named.
+    pub fn any_peer_left(&self, me: usize, only: Option<&Vec<usize>>) -> bool {
+        match only {
+            Some(indices) => indices.iter().any(|i| !self.is_finished(*i)),
+            None => {
+                !self.spawn_done
+                    || (0..self.children.len()).any(|i| i != me && !self.is_finished(i))
+            }
+        }
+    }
+
+    /// Whether a message addressed this way reaches `me`.
+    pub fn addressed_to(msg: &Msg, me: usize) -> bool {
+        match &msg.to {
+            Some(indices) => indices.contains(&me),
+            None => msg.from != me,
         }
     }
 }
@@ -176,6 +243,16 @@ pub struct Task {
     pub base_depth: usize,
     pub is_trail: bool,
     pub module: usize,
+    /// This trail's own index within its block, which is what `channel()`
+    /// answers and what a sibling addresses (channels §1).
+    pub channel: Option<usize>,
+    /// What a channel call answered while this task was parked, waiting to be
+    /// pushed when it runs again.
+    pub delivery: Option<Vec<Value>>,
+    /// What the last call answered beyond its first value, waiting for the
+    /// binding site that names them. Written by every return, read by the one
+    /// instruction that spreads them (channels §6.2).
+    pub extras: Vec<Value>,
 }
 
 impl Task {

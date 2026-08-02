@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use crate::ast::*;
 use crate::errors::{Diagnostic, Pos, Report, Site};
 use crate::lexer::{is_private, Tok};
-use crate::value::Native;
+use crate::value::{Native, CHANNEL_NATIVES};
 use crate::parser::parse;
 
 #[derive(Clone, Debug, Default)]
@@ -44,6 +44,11 @@ impl CheckOptions {
 struct Signature {
     required: usize,
     total: usize,
+    /// Which parameter is the `*`, if any: it collects the rest of the
+    /// positional arguments, and everything after it is keyword-only.
+    variadic: Option<usize>,
+    /// The most values a call to it can answer with (channels §6.2).
+    returns: usize,
     /// Which parameters the call must mark with `&` (§5.1).
     by_ref: Vec<bool>,
     /// Parameter names, so a named argument can be matched.
@@ -56,11 +61,20 @@ impl Signature {
         let params: Vec<String> = def
             .params
             .iter()
-            .map(|p| format!("{}{}", if p.by_ref { "&" } else { "" }, p.name))
+            .map(|p| {
+                format!(
+                    "{}{}{}",
+                    if p.by_ref { "&" } else { "" },
+                    p.name,
+                    if p.variadic { "*" } else { "" }
+                )
+            })
             .collect();
         Signature {
             required: def.required(),
             total: def.params.len(),
+            variadic: def.params.iter().position(|p| p.variadic),
+            returns: returns_of(def),
             by_ref: def.params.iter().map(|p| p.by_ref).collect(),
             names: def.params.iter().map(|p| p.name.clone()).collect(),
             label: format!("{name}({})", params.join(", ")),
@@ -71,6 +85,9 @@ impl Signature {
         Signature {
             required: native.required(),
             total: native.total(),
+            variadic: native.variadic(),
+            // `receive` answers with the value and the trail that sent it.
+            returns: if native == Native::Receive { 2 } else { 1 },
             by_ref: native.by_ref().to_vec(),
             names: native.param_names().iter().map(|n| n.to_string()).collect(),
             label: native.signature().to_string(),
@@ -84,16 +101,26 @@ impl Signature {
         let mut next = 0;
         for arg in args {
             match &arg.name {
-                None => {
-                    if next >= self.total {
-                        return None;
+                None => match self.variadic {
+                    // Positional filling stops at the `*`, which takes as many
+                    // as are left — a bare `*` takes none (channels §6.1).
+                    Some(at) if next >= at => {
+                        if self.names.get(at).is_some_and(|n| n.is_empty()) {
+                            return None;
+                        }
+                        bound[at] = Some(arg);
                     }
-                    bound[next] = Some(arg);
-                    next += 1;
-                }
+                    _ => {
+                        if next >= self.total {
+                            return None;
+                        }
+                        bound[next] = Some(arg);
+                        next += 1;
+                    }
+                },
                 Some(name) => {
                     let index = self.names.iter().position(|n| n == name)?;
-                    if bound[index].is_some() {
+                    if bound[index].is_some() || self.variadic == Some(index) {
                         return None;
                     }
                     bound[index] = Some(arg);
@@ -101,12 +128,30 @@ impl Signature {
             }
         }
         for (index, slot) in bound.iter().enumerate() {
-            if slot.is_none() && index < self.required {
+            if slot.is_none() && index < self.required && self.variadic != Some(index) {
                 return None;
             }
         }
         Some(bound)
     }
+}
+
+/// The most values a call to this function can answer with. Falling off the
+/// end answers with one — `.null` — so it is never fewer than that, and §11's
+/// rule means only a name that is *guaranteed* to have nothing behind it is
+/// reported (channels §6.2).
+fn returns_of(def: &ClosureDef) -> usize {
+    let body = match &def.body {
+        ClosureBody::Expr(_) => return 1,
+        ClosureBody::Block(body) => body,
+    };
+    let mut most = 1;
+    walk_stmts(body, &mut |stmt| {
+        if let Stmt::Return { values, .. } = stmt {
+            most = most.max(values.len());
+        }
+    });
+    most
 }
 
 #[derive(Clone, Debug, Default)]
@@ -184,6 +229,11 @@ struct Checker<'a> {
     /// know it is running in a trail.
     trail_depth: usize,
     race_depth: usize,
+    /// While checking a trail of the row form: this trail's own index and how
+    /// many the block has. That is the one shape whose trail count is known
+    /// before the program runs, which is what lets a channel index that cannot
+    /// exist be an error rather than a crash (channels §6.7).
+    trail_shape: Option<(usize, usize)>,
     /// Names ever written to or `&`-referenced anywhere in the file. Coarse on
     /// purpose: it only ever *suppresses* diagnostics.
     mutated: HashSet<String>,
@@ -212,6 +262,7 @@ impl<'a> Checker<'a> {
             labels: Vec::new(),
             trail_depth: 0,
             race_depth: 0,
+            trail_shape: None,
             mutated: HashSet::new(),
             overloaded: HashSet::new(),
             read: HashSet::new(),
@@ -390,9 +441,16 @@ impl<'a> Checker<'a> {
                     name,
                     Binding { pos: *pos, arity: Some(Signature::of(def, name)), keys: None },
                 ),
-                Stmt::Decl { name, value, pos } => {
-                    let binding = self.binding_for(name, value, *pos);
-                    self.declare(name, binding);
+                Stmt::Decl { names, value, pos } => {
+                    for (i, name) in names.iter().enumerate() {
+                        // Only the first name takes the value's shape: the rest
+                        // are additional information (channels §6.2).
+                        let binding = match i {
+                            0 => self.binding_for(name, value, *pos),
+                            _ => Binding { pos: *pos, arity: None, keys: None },
+                        };
+                        self.declare(name, binding);
+                    }
                 }
                 _ => {}
             }
@@ -439,21 +497,31 @@ impl<'a> Checker<'a> {
                 );
                 self.closure(def);
             }
-            Stmt::Decl { name, value, pos } => {
+            Stmt::Decl { names, value, pos } => {
                 self.expr(value);
-                let binding = self.binding_for(name, value, *pos);
-                self.declare(name, binding);
-            }
-            Stmt::Assign { target, op, value, pos } => {
-                self.expr(value);
-                // `a += 1` reads `a` as well as writing it, so a private name
-                // that is only ever incremented is used, not unused (§11).
-                if op.is_some() {
-                    if let Some(Expr::Name { name, .. }) = target.lvalue_root() {
-                        self.read.insert(name.clone());
-                    }
+                self.multi_value(names.len(), value, *pos);
+                for (i, name) in names.iter().enumerate() {
+                    let binding = match i {
+                        0 => self.binding_for(name, value, *pos),
+                        _ => Binding { pos: *pos, arity: None, keys: None },
+                    };
+                    self.declare(name, binding);
                 }
-                self.assign_target(target, *pos);
+            }
+            Stmt::Assign { targets, op, value, pos } => {
+                self.expr(value);
+                self.multi_value(targets.len(), value, *pos);
+                for target in targets {
+                    // `a += 1` reads `a` as well as writing it, so a private
+                    // name that is only ever incremented is used, not unused
+                    // (§11).
+                    if op.is_some() {
+                        if let Some(Expr::Name { name, .. }) = target.lvalue_root() {
+                            self.read.insert(name.clone());
+                        }
+                    }
+                    self.assign_target(target, *pos);
+                }
             }
             Stmt::Expr { expr, pos } => {
                 // A required side effect inside a racing trail may never run,
@@ -468,7 +536,7 @@ impl<'a> Checker<'a> {
                 }
                 self.expr(expr);
             }
-            Stmt::Return { value, pos } => {
+            Stmt::Return { values, pos } => {
                 if self.trail_depth > 0 {
                     self.error(
                         "`return` inside a trail is not allowed; \
@@ -477,7 +545,7 @@ impl<'a> Checker<'a> {
                         "return-in-trail",
                     );
                 }
-                if let Some(value) = value {
+                for value in values {
                     self.expr(value);
                 }
             }
@@ -525,7 +593,9 @@ impl<'a> Checker<'a> {
                 self.check_split_header(rows, *pos);
                 let mut declared: Vec<(String, Pos)> = Vec::new();
                 for trail in trails {
+                    self.trail_shape = Some((trail.column, trails.len()));
                     let scope = self.trail_body(*kind, &trail.body, label.clone());
+                    self.trail_shape = None;
                     for (name, binding) in scope.names {
                         declared.push((name, binding.pos));
                     }
@@ -832,11 +902,127 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// `a, b := f()` — only a call answers with several values, and naming more
+    /// than it can answer with is a crash (channels §6.2).
+    fn multi_value(&mut self, named: usize, value: &Expr, pos: Pos) {
+        if named < 2 {
+            return;
+        }
+        let Expr::Call { callee, .. } = value else {
+            self.error(
+                "only a call answers with several values, and a multi-value is not a value",
+                pos,
+                "multi-value-not-a-call",
+            );
+            return;
+        };
+        let Some(signature) = self.callee_signature(callee) else { return };
+        if named > signature.returns {
+            self.error(
+                format!(
+                    "`{}` answers with {} value{}, but {named} were named",
+                    signature.label,
+                    signature.returns,
+                    if signature.returns == 1 { "" } else { "s" }
+                ),
+                pos,
+                "too-many-values-named",
+            );
+        }
+    }
+
+    /// The signature behind a callee, where exactly one candidate is knowable.
+    fn callee_signature(&self, callee: &Expr) -> Option<Signature> {
+        match callee {
+            Expr::Name { name, .. } => {
+                if self.mutated.contains(name) || self.overloaded.contains(name) {
+                    return None;
+                }
+                let local = self.lookup(name);
+                let has_import = self.imports.contains_key(name);
+                let has_native = self.names_are_knowable && Native::lookup(name).is_some();
+                if usize::from(local.is_some()) + usize::from(has_import) + usize::from(has_native)
+                    > 1
+                {
+                    return None;
+                }
+                match (local, has_import) {
+                    (Some(binding), _) => binding.arity.clone(),
+                    (None, true) => self.imports.get(name).and_then(|(_, a)| a.clone()),
+                    (None, false) => Native::lookup(name).map(Signature::native),
+                }
+            }
+            Expr::Namespace { module, name, .. } if module.is_empty() => {
+                Native::lookup(name).map(Signature::native)
+            }
+            Expr::Namespace { module, name, .. } => {
+                self.modules.get(module).and_then(|m| m.exports.get(name).cloned()).flatten()
+            }
+            _ => None,
+        }
+    }
+
+    /// `send`, `receive` and `channel` are lexically scoped to a `parallel` or
+    /// `race` body: they name that block's trails, and there is nothing for
+    /// them to name anywhere else. A function a trail calls is *not* inside it
+    /// — that is the deliberate contrast with `alive()`, which is dynamic at
+    /// any depth (channels §6.4).
+    fn channel_call(&mut self, name: &str, args: &[Arg], pos: Pos) {
+        if !self.names_are_knowable
+            || self.lookup(name).is_some()
+            || self.imports.contains_key(name)
+            || !CHANNEL_NATIVES.iter().any(|n| n.name() == name)
+        {
+            return;
+        }
+        if self.trail_depth == 0 {
+            self.error(
+                format!(
+                    "`{name}` belongs inside a `parallel` or `race` block: it names that \
+                     block's trails, and a function a trail calls is not inside it"
+                ),
+                pos,
+                "channel-outside-trail",
+            );
+            return;
+        }
+        // Only the row form knows how many trails it has before it runs.
+        let Some((me, count)) = self.trail_shape else { return };
+        // `send`'s first argument is the value; the rest are indices, as all of
+        // `receive`'s are.
+        let skip = usize::from(name == Native::Send.name());
+        for arg in args.iter().filter(|a| a.name.is_none()).skip(skip) {
+            let Expr::Num { value, pos, .. } = &arg.value else { continue };
+            let index = *value as usize;
+            if value.fract() != 0.0 || *value < 0.0 {
+                continue;
+            }
+            if index == me {
+                self.error(
+                    format!("trail {me} is this one: a trail names its siblings, not itself"),
+                    *pos,
+                    "channel-is-self",
+                );
+            } else if index >= count {
+                self.error(
+                    format!(
+                        "no trail {index}: this block has {count} trail{}, 0 to {}",
+                        if count == 1 { "" } else { "s" },
+                        count.saturating_sub(1)
+                    ),
+                    *pos,
+                    "no-such-channel",
+                );
+            }
+        }
+    }
+
     fn closure(&mut self, def: &ClosureDef) {
         // A function body is not a trail body: `return` is fine in it, and
         // `break trail` is not (QUESTIONS.md §16).
         let trail_depth = std::mem::take(&mut self.trail_depth);
         let race_depth = std::mem::take(&mut self.race_depth);
+        let trail_shape = std::mem::take(&mut self.trail_shape);
         let labels = std::mem::take(&mut self.labels);
 
         self.push_scope();
@@ -856,6 +1042,7 @@ impl<'a> Checker<'a> {
         self.pop_scope();
 
         self.labels = labels;
+        self.trail_shape = trail_shape;
         self.race_depth = race_depth;
         self.trail_depth = trail_depth;
     }
@@ -925,6 +1112,13 @@ impl<'a> Checker<'a> {
     /// A call nothing accepts, and a missing `&` on the one that does
     /// (§11, §5.1, §3).
     fn check_call(&mut self, callee: &Expr, args: &[Arg], pos: Pos) {
+        match callee {
+            Expr::Name { name, .. } => self.channel_call(name, args, pos),
+            Expr::Namespace { module, name, .. } if module.is_empty() => {
+                self.channel_call(name, args, pos)
+            }
+            _ => {}
+        }
         let (name, signature) = match callee {
             Expr::Name { name, .. } => {
                 let local = self.lookup(name).and_then(|b| b.arity.clone());
@@ -1017,14 +1211,21 @@ impl<'a> Checker<'a> {
 fn collect_names(body: &[Stmt], out: &mut HashSet<String>, overloaded: &mut HashSet<String>) {
     let mut declared: HashSet<String> = HashSet::new();
     walk_stmts(body, &mut |stmt| match stmt {
-        Stmt::Assign { target, .. } => {
-            if let Some(Expr::Name { name, .. }) = target.lvalue_root() {
-                out.insert(name.clone());
+        Stmt::Assign { targets, .. } => {
+            for target in targets {
+                if let Some(Expr::Name { name, .. }) = target.lvalue_root() {
+                    out.insert(name.clone());
+                }
             }
         }
-        Stmt::Decl { name, .. } | Stmt::FnDecl { name, .. }
-            if !declared.insert(name.clone()) =>
-        {
+        Stmt::Decl { names, .. } => {
+            for name in names {
+                if !declared.insert(name.clone()) {
+                    overloaded.insert(name.clone());
+                }
+            }
+        }
+        Stmt::FnDecl { name, .. } if !declared.insert(name.clone()) => {
             overloaded.insert(name.clone());
         }
         _ => {}
@@ -1056,12 +1257,17 @@ fn module_exports(path: &Path) -> Option<HashMap<String, Option<Signature>>> {
             Stmt::FnDecl { name, def, .. } if !is_private(name) => {
                 exports.insert(name.clone(), Some(Signature::of(def, name)));
             }
-            Stmt::Decl { name, value, .. } if !is_private(name) => {
-                let signature = match value {
-                    Expr::Closure(def) => Some(Signature::of(def, name)),
-                    _ => None,
-                };
-                exports.insert(name.clone(), signature);
+            Stmt::Decl { names, value, .. } => {
+                for (i, name) in names.iter().enumerate() {
+                    if is_private(name) {
+                        continue;
+                    }
+                    let signature = match (i, value) {
+                        (0, Expr::Closure(def)) => Some(Signature::of(def, name)),
+                        _ => None,
+                    };
+                    exports.insert(name.clone(), signature);
+                }
             }
             _ => {}
         }
@@ -1115,12 +1321,18 @@ fn walk_exprs(body: &[Stmt], f: &mut dyn FnMut(&Expr)) {
 fn walk_stmt_exprs(stmt: &Stmt, f: &mut impl FnMut(&Expr)) {
     match stmt {
         Stmt::Decl { value, .. } => f(value),
-        Stmt::Assign { target, value, .. } => {
-            f(target);
+        Stmt::Assign { targets, value, .. } => {
+            for target in targets {
+                f(target);
+            }
             f(value);
         }
         Stmt::Expr { expr, .. } => f(expr),
-        Stmt::Return { value: Some(value), .. } => f(value),
+        Stmt::Return { values, .. } => {
+            for value in values {
+                f(value);
+            }
+        }
         Stmt::If { branches, .. } => {
             for branch in branches {
                 if let Some(cond) = &branch.cond {

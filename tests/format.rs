@@ -182,3 +182,25 @@ fn the_reference_program_formats_and_stays_formatted() {
     assert!(once.contains("\teu = warm(\"eu\", img) || us = warm(\"us\", img) || ap = warm(\"ap\", img)\n"));
     assert!(once.contains("\tsmoke(eu)            || smoke(us)            || smoke(ap)\n"));
 }
+
+#[test]
+fn a_variadic_closes_up_against_its_name_but_a_bare_star_does_not() {
+    // Channels §6.1: `values*` is one parameter, `*` is a parameter of its own.
+    assert_eq!(
+        fmt_idempotent("fn log(prefix,values* ,sep=\" \")\n\tprint(prefix)\nend\n"),
+        "fn log(prefix, values*, sep = \" \")\n\tprint(prefix)\nend\n"
+    );
+    assert_eq!(
+        fmt_idempotent("fn retry(host,*,attempts=3)\n\tprint(host)\nend\n"),
+        "fn retry(host, *, attempts = 3)\n\tprint(host)\nend\n"
+    );
+}
+
+#[test]
+fn a_multi_value_binding_is_spaced_like_any_other_comma_list() {
+    assert_eq!(fmt_idempotent("value ,ch:=receive()\n"), "value, ch := receive()\n");
+    assert_eq!(fmt_idempotent("a,b = f()\n"), "a, b = f()\n");
+    assert_eq!(fmt_idempotent("d.x , d.y = f()\n"), "d.x, d.y = f()\n");
+    // A binary `*` still gets its spaces.
+    assert_eq!(fmt_idempotent("y := f(a , b*2)\n"), "y := f(a, b * 2)\n");
+}

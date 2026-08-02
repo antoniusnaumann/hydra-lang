@@ -26,7 +26,8 @@ use crate::lexer::is_private;
 use crate::parser::parse;
 use crate::scope::{Scope, ScopeRef};
 use crate::sched::{
-    BlockCtx, BlockId, CancelFlag, Frame, IterState, OnReturn, ScopeSlot, Task, TaskId, TaskState,
+    BlockCtx, BlockId, CancelFlag, Frame, IterState, Msg, OnReturn, ScopeSlot, Task, TaskId,
+    TaskState, Waiter,
 };
 use crate::value::{
     binary_op, boolean, copy_value, deref, get_member, member_opt, new_dict, new_list, path_segment,
@@ -114,6 +115,9 @@ struct Sched {
     /// one consumes its token instead of parking it, which is what closes the
     /// race between "I am about to block" and "your last child just finished".
     wakes: HashSet<TaskId>,
+    /// What a parked channel call was answered with, waiting for the task to be
+    /// stepped again (channels §6.5).
+    deliveries: HashMap<TaskId, Vec<Value>>,
 }
 
 pub struct Vm {
@@ -225,6 +229,9 @@ impl Vm {
             base_depth: 1,
             is_trail: false,
             module,
+            extras: Vec::new(),
+            channel: None,
+            delivery: None,
         };
         sched.tasks.insert(id, task);
         sched.ready.push_back(id);
@@ -270,7 +277,10 @@ impl Vm {
                 loop {
                     match sched.ready.pop_front() {
                         Some(id) => match sched.tasks.remove(&id) {
-                            Some(task) => {
+                            Some(mut task) => {
+                                if let Some(values) = sched.deliveries.remove(&id) {
+                                    task.delivery = Some(values);
+                                }
                                 sched.running += 1;
                                 self.peak_parallelism.fetch_max(sched.running, Ordering::Relaxed);
                                 break task;
@@ -327,6 +337,14 @@ impl Vm {
     }
 
     fn run_slice(&self, task: &mut Task) -> Result<Flow, Crash> {
+        // A parked channel call left its answer here; the instruction that
+        // asked for it is already behind us (channels §6.5).
+        if let Some(values) = task.delivery.take() {
+            let mut answered = values.into_iter();
+            let value = answered.next().unwrap_or_else(Value::null);
+            task.extras = answered.collect();
+            task.push(value);
+        }
         let mut budget = self.options.step_budget;
         // The running chunk is held for the whole slice and refreshed only when
         // a call or a return changes frames. Cloning it per instruction would
@@ -476,6 +494,33 @@ impl Vm {
                 let cell = self.cell_for(task, root)?;
                 write_place(&cell, &path, value)?;
             }
+            Instr::StoreUnder { root, segs } => {
+                // The values arrived together, so this target's path sits on
+                // top of the value rather than under it (channels §6.2).
+                let path = self.take_path(task, *segs)?;
+                let value = task.pop();
+                // Evaluate → check the cancel flag → only then store (§9.5).
+                if task.should_stop() {
+                    return Ok(Flow::Stop);
+                }
+                let cell = self.cell_for(task, root)?;
+                write_place(&cell, &path, value)?;
+            }
+            Instr::TakeValues(count) => {
+                let value = task.pop();
+                let extras = std::mem::take(&mut task.extras);
+                let answered = 1 + extras.len();
+                if *count > answered {
+                    return Err(Crash::new(format!(
+                        "this call answers with {answered} value{}, but {count} were named",
+                        if answered == 1 { "" } else { "s" }
+                    )));
+                }
+                task.push(value);
+                for extra in extras.into_iter().take(count - 1) {
+                    task.push(extra);
+                }
+            }
             Instr::Update { root, segs, op } => {
                 let operand = task.pop();
                 let path = self.take_path(task, *segs)?;
@@ -562,20 +607,29 @@ impl Vm {
                 if candidates.is_empty() {
                     return Err(Crash::new(format!("`{name}` is not declared")));
                 }
-                let chosen = candidates
-                    .iter()
-                    .find_map(|c| bind_args(c, &args).map(|bound| (c.clone(), bound)));
+                // A concrete arity is tried before any variadic, whichever is
+                // nearer: a `*` accepts everything positional, and would
+                // otherwise swallow every narrower candidate behind it
+                // (channels §6.1).
+                let take = |variadic: bool| {
+                    candidates
+                        .iter()
+                        .filter(|c| is_variadic(c) == variadic)
+                        .find_map(|c| bind_args(c, &args).map(|bound| (c.clone(), bound)))
+                };
+                let chosen = take(false).or_else(|| take(true));
                 let Some((callee, bound)) = chosen else {
                     return Err(rejected(Some(name), &candidates, &args));
                 };
                 return self.enter(task, callee, bound);
             }
-            Instr::Return => {
-                let value = task.pop();
-                return Ok(self.pop_frame(task, value));
+            Instr::Return(count) => {
+                let at = task.stack.len() - count;
+                let values: Vec<Value> = task.stack.split_off(at);
+                return Ok(self.pop_frame(task, values));
             }
             Instr::ReturnNull => {
-                return Ok(self.pop_frame(task, Value::null()));
+                return Ok(self.pop_frame(task, vec![Value::null()]));
             }
 
             Instr::PushScope => {
@@ -647,7 +701,7 @@ impl Vm {
                 *budget -= 1;
             }
 
-            Instr::BeginBlock { kind, .. } => {
+            Instr::BeginBlock { kind, arity, .. } => {
                 let mut sched = self.sched.lock().unwrap_or_else(|e| e.into_inner());
                 let id = sched.next_block;
                 sched.next_block += 1;
@@ -657,8 +711,14 @@ impl Vm {
                         kind: *kind,
                         owner: task.id,
                         children: Vec::new(),
+                        flags: Vec::new(),
                         pending: 0,
                         decided: false,
+                        arity: *arity,
+                        spawn_done: false,
+                        finished: Vec::new(),
+                        mail: VecDeque::new(),
+                        waiting: Vec::new(),
                     },
                 );
                 task.blocks.push(id);
@@ -683,6 +743,16 @@ impl Vm {
                 let satisfied = match task.blocks.last() {
                     Some(id) => {
                         let mut sched = self.sched.lock().unwrap_or_else(|e| e.into_inner());
+                        // No further trail can appear from here, which is what
+                        // makes "nobody is left to receive" a final answer
+                        // rather than a guess (channels §1).
+                        if let Some(block) = sched.blocks.get_mut(id) {
+                            if !block.spawn_done {
+                                block.spawn_done = true;
+                                let woken = closed_waiters(block);
+                                deliver_all(&mut sched, woken);
+                            }
+                        }
                         match sched.blocks.get(id) {
                             // Satisfied: drop the block, so a loser finishing
                             // later finds nothing to report to (§9.4).
@@ -771,7 +841,11 @@ impl Vm {
                 let mut provided = vec![false; closure.params.len()];
                 for (i, (param, value)) in closure.params.iter().zip(bound).enumerate() {
                     if let Some(value) = value {
-                        scope.declare(&param.name, value);
+                        // The bare `*` has no name and binds nothing: it only
+                        // closes the positional list (channels §6.1).
+                        if !param.name.is_empty() {
+                            scope.declare(&param.name, value);
+                        }
                         provided[i] = true;
                     }
                 }
@@ -796,9 +870,26 @@ impl Vm {
                 Ok(Flow::Next)
             }
             Value::Native(native) => {
-                let value = self.native(task, native, bound)?;
-                task.push(value);
-                Ok(Flow::Next)
+                let out = match native {
+                    Native::Send => self.send(task, &bound)?,
+                    Native::Receive => self.receive(task, &bound)?,
+                    Native::Channel => {
+                        let (_, me) = self.in_trail(task, "channel")?;
+                        NativeOut::Values(vec![index_of(me)])
+                    }
+                    other => NativeOut::Values(self.native(task, other, bound)?),
+                };
+                match out {
+                    NativeOut::Values(values) => {
+                        let mut answered = values.into_iter();
+                        let value = answered.next().unwrap_or_else(Value::null);
+                        task.extras = answered.collect();
+                        task.push(value);
+                        Ok(Flow::Next)
+                    }
+                    // The trail is parked; what it answers arrives later.
+                    NativeOut::Blocked => Ok(Flow::Blocked),
+                }
             }
             other => Err(Crash::new(format!("cannot call a {}", other.kind()))),
         }
@@ -810,12 +901,12 @@ impl Vm {
         task: &Task,
         native: Native,
         args: Vec<Option<Value>>,
-    ) -> Result<Value, Crash> {
+    ) -> Result<Vec<Value>, Crash> {
         let arg = |i: usize| args.get(i).cloned().flatten().unwrap_or_else(Value::null);
         match native {
             // Dynamic, no token threading, `.true` outside any trail — and
             // false during crash shutdown too (§9.5).
-            Native::Alive => Ok(boolean(!task.cancel.is_cancelled())),
+            Native::Alive => Ok(vec![boolean(!task.cancel.is_cancelled())]),
             Native::Print => {
                 let end = match args.get(1).cloned().flatten() {
                     Some(end) => to_text(&deref(&end)?),
@@ -826,10 +917,10 @@ impl Vm {
                 // and never mid-line.
                 let _ = write!(out, "{}{end}", to_text(&deref(&arg(0))?));
                 let _ = out.flush();
-                Ok(Value::null())
+                Ok(vec![Value::null()])
             }
-            Native::Has => Ok(boolean(member_opt(&arg(0), &arg(1))?.is_some())),
-            Native::Get => Ok(member_opt(&arg(0), &arg(1))?.unwrap_or_else(|| arg(2))),
+            Native::Has => Ok(vec![boolean(member_opt(&arg(0), &arg(1))?.is_some())]),
+            Native::Get => Ok(vec![member_opt(&arg(0), &arg(1))?.unwrap_or_else(|| arg(2))]),
             Native::Len => {
                 let value = deref(&arg(0))?;
                 let len = match &value {
@@ -844,19 +935,150 @@ impl Vm {
                         )))
                     }
                 };
-                Ok(Value::Num(len as f64))
+                Ok(vec![Value::Num(len as f64)])
+            }
+            Native::Send | Native::Receive | Native::Channel => {
+                unreachable!("the channel calls are dispatched before this")
             }
             Native::Push => {
                 let Value::Ref(target) = arg(0) else {
                     unreachable!("checked by the by-reference rule above")
                 };
                 let len = push_place(&target.root, &target.path, arg(1))?;
-                Ok(Value::Num(len as f64))
+                Ok(vec![Value::Num(len as f64)])
             }
         }
     }
 
-    fn pop_frame(&self, task: &mut Task, value: Value) -> Flow {
+    /// Return from a frame with everything it answered: the first value is the
+    /// meaningful one and the rest are additional information, held until the
+    /// binding site names them or the next call replaces them (channels §6.2).
+    // --- auto-channels (spec/hydra_channels.md) ------------------------------
+
+    /// `send(value, to*, mode = .wait)`.
+    ///
+    /// Returns `.true` when the value reached someone or was buffered for
+    /// someone, and `.false` when every trail it could have reached has already
+    /// ended. `.wait` parks until one of those two is true.
+    fn send(&self, task: &mut Task, args: &[Option<Value>]) -> Result<NativeOut, Crash> {
+        let (block_id, me) = self.in_trail(task, "send")?;
+        let value = args.first().cloned().flatten().unwrap_or_else(Value::null);
+        let to = channel_list(args.get(1).cloned().flatten())?;
+        let mode = match args.get(2).cloned().flatten() {
+            Some(mode) => send_mode(&mode)?,
+            None => SendMode::Wait,
+        };
+
+        let mut sched = self.sched.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(block) = sched.blocks.get_mut(&block_id) else {
+            // The block is gone: a `race` released control and this trail is an
+            // orphan, so there is nobody left to reach.
+            return Ok(NativeOut::Values(vec![boolean(false)]));
+        };
+        check_indices(block, me, to.as_ref())?;
+
+        let targets: Vec<usize> = match &to {
+            Some(indices) => indices.clone(),
+            None => (0..block.children.len()).filter(|i| *i != me).collect(),
+        };
+
+        let mut woken: Vec<(TaskId, Vec<Value>)> = Vec::new();
+        let mut delivered = false;
+
+        match mode {
+            SendMode::Broadcast => {
+                // One copy for every eligible trail: those parked take it now,
+                // the rest find it waiting (channels §5).
+                for target in targets {
+                    if block.is_finished(target) {
+                        continue;
+                    }
+                    delivered = true;
+                    match take_waiter(block, target, me) {
+                        Some(waiter) => woken.push((waiter, vec![copy_value(&value), index_of(me)])),
+                        None => block.mail.push_back(Msg {
+                            from: me,
+                            to: Some(vec![target]),
+                            value: copy_value(&value),
+                            waiter: None,
+                        }),
+                    }
+                }
+            }
+            SendMode::Detach | SendMode::Wait => {
+                match take_any_waiter(block, &targets, me) {
+                    Some(waiter) => {
+                        woken.push((waiter, vec![value, index_of(me)]));
+                        delivered = true;
+                    }
+                    None if !block.any_peer_left(me, to.as_ref()) => {}
+                    None => {
+                        delivered = true;
+                        let waiter = match mode {
+                            SendMode::Wait => Some(task.id),
+                            _ => None,
+                        };
+                        block.mail.push_back(Msg { from: me, to: to.clone(), value, waiter });
+                        if mode == SendMode::Wait {
+                            let parked = park_check(block);
+                            deliver_all(&mut sched, woken);
+                            parked?;
+                            return Ok(NativeOut::Blocked);
+                        }
+                    }
+                }
+            }
+        }
+        deliver_all(&mut sched, woken);
+        Ok(NativeOut::Values(vec![boolean(delivered)]))
+    }
+
+    /// `receive(from*)` — the value, and the trail that sent it. Both come back
+    /// `.null` when no eligible sender is left, which is the one answer a
+    /// sender cannot fake (channels §1).
+    fn receive(&self, task: &mut Task, args: &[Option<Value>]) -> Result<NativeOut, Crash> {
+        let (block_id, me) = self.in_trail(task, "receive")?;
+        let from = channel_list(args.first().cloned().flatten())?;
+
+        let mut sched = self.sched.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(block) = sched.blocks.get_mut(&block_id) else {
+            return Ok(NativeOut::Values(closed()));
+        };
+        check_indices(block, me, from.as_ref())?;
+
+        if let Some(at) = block.mail.iter().position(|msg| {
+            BlockCtx::addressed_to(msg, me)
+                && from.as_ref().is_none_or(|only| only.contains(&msg.from))
+        }) {
+            let msg = block.mail.remove(at).expect("the message just found");
+            // A `.wait` sender was parked behind its value.
+            if let Some(sender) = msg.waiter {
+                deliver_all(&mut sched, vec![(sender, vec![boolean(true)])]);
+            }
+            return Ok(NativeOut::Values(vec![msg.value, index_of(msg.from)]));
+        }
+
+        if !block.any_peer_left(me, from.as_ref()) {
+            return Ok(NativeOut::Values(closed()));
+        }
+
+        block.waiting.push(Waiter { task: task.id, channel: me, from });
+        park_check(block)?;
+        Ok(NativeOut::Blocked)
+    }
+
+    /// The block a channel call belongs to, and this trail's own index in it.
+    fn in_trail(&self, task: &Task, what: &str) -> Result<(BlockId, usize), Crash> {
+        match (task.block, task.channel) {
+            (Some(block), Some(channel)) => Ok((block, channel)),
+            _ => Err(Crash::new(format!(
+                "`{what}` names a trail's siblings, and there is no trail here: \
+                 it belongs inside a `parallel` or `race` block"
+            ))),
+        }
+    }
+
+    fn pop_frame(&self, task: &mut Task, values: Vec<Value>) -> Flow {
         let frame = task.frames.pop().expect("a frame to return from");
         task.stack.truncate(frame.stack_base);
         if frame.is_module_body {
@@ -870,6 +1092,9 @@ impl Vm {
                 if task.frames.is_empty() {
                     return Flow::Done;
                 }
+                let mut answered = values.into_iter();
+                let value = answered.next().unwrap_or_else(Value::null);
+                task.extras = answered.collect();
                 task.push(value);
             }
             OnReturn::BindModule { alias, module } => {
@@ -979,6 +1204,15 @@ impl Vm {
         let id = sched.next_id;
         sched.next_id += 1;
         let block = task.blocks.last().copied();
+        // Trail 0 is the first spawned and the number climbs, which is the
+        // index a sibling addresses and `channel()` answers. For the row form
+        // that is the column; for the spawning forms it is spawn order, which
+        // is all there is (channels §7.1).
+        let channel = block
+            .and_then(|b| sched.blocks.get(&b))
+            .map(|block| block.children.len())
+            .unwrap_or(0);
+        let cancel = CancelFlag::child(&task.cancel);
         let child = Task {
             id,
             frames: vec![Frame {
@@ -994,16 +1228,20 @@ impl Vm {
                 provided: Vec::new(),
             }],
             stack: Vec::new(),
-            cancel: CancelFlag::child(&task.cancel),
+            cancel: cancel.clone(),
             block,
             blocks: Vec::new(),
             state: TaskState::Ready,
             base_depth: 1,
             is_trail: true,
             module: task.module,
+            extras: Vec::new(),
+            channel: Some(channel),
+            delivery: None,
         };
         if let Some(block) = block.and_then(|b| sched.blocks.get_mut(&b)) {
             block.children.push(id);
+            block.flags.push(cancel);
             block.pending += 1;
         }
         sched.tasks.insert(id, child);
@@ -1041,21 +1279,37 @@ impl Vm {
         let Some(block) = sched.blocks.get_mut(&block_id) else { return };
 
         block.pending -= 1;
+        if let Some(channel) = task.channel {
+            block.finished.push(channel);
+        }
         let mut to_cancel: Vec<TaskId> = Vec::new();
         if block.kind == BlockKind::Race && !block.decided {
             block.decided = true;
-            to_cancel.extend(block.children.iter().filter(|c| **c != task.id));
+            // Losers are cancelled (§9.4); they are never interrupted, so they
+            // stop at their own next statement boundary. The flag comes from
+            // the block, because a sibling that is running at this moment is
+            // not in the task table and would otherwise escape.
+            for (index, id) in block.children.iter().enumerate() {
+                if *id != task.id {
+                    to_cancel.push(*id);
+                    block.flags[index].cancel();
+                }
+            }
         }
         let owner = block.owner;
         let satisfied = block.satisfied();
 
-        // Losers are cancelled (§9.4); they are never interrupted, so they stop
-        // at their own next statement boundary.
-        for id in to_cancel {
-            if let Some(sibling) = sched.tasks.get(&id) {
-                sibling.cancel.cancel();
-            }
+        // Whoever was parked on this trail has to hear that it will not answer.
+        let mut woken = closed_waiters(block);
+        // A cancelled trail parked on a channel is woken too: it gets the same
+        // answer as a closed channel and then runs no further statement. The
+        // flag is already set above, so it sees itself dead the moment it wakes
+        // — this is the one place §9.5's "never interrupted" bends, and it
+        // bends where nothing can observe it (channels §6.5).
+        for id in &to_cancel {
+            woken.extend(cancel_waiter(block, *id));
         }
+        deliver_all(sched, woken);
 
         if !satisfied {
             return;
@@ -1202,9 +1456,13 @@ fn take_args(task: &mut Task, positional: usize, names: &[Arc<str>]) -> CallArgs
 
 /// What one parameter expects, for a closure or a builtin alike.
 struct ParamSpec {
+    /// Empty for the bare `*`, which binds nothing (channels §6.1).
     name: Arc<str>,
     has_default: bool,
     by_ref: bool,
+    /// A `*`: it collects what is left of the positional arguments, which is
+    /// also what makes everything after it fillable by name only.
+    variadic: bool,
 }
 
 fn param_specs(callee: &Value) -> Option<Vec<ParamSpec>> {
@@ -1217,6 +1475,7 @@ fn param_specs(callee: &Value) -> Option<Vec<ParamSpec>> {
                     name: p.name.clone(),
                     has_default: p.has_default,
                     by_ref: p.by_ref,
+                    variadic: p.variadic,
                 })
                 .collect(),
         ),
@@ -1229,6 +1488,7 @@ fn param_specs(callee: &Value) -> Option<Vec<ParamSpec>> {
                     name: Arc::from(*name),
                     has_default: i >= native.required(),
                     by_ref: native.by_ref().get(i) == Some(&true),
+                    variadic: native.variadic() == Some(i),
                 })
                 .collect(),
         ),
@@ -1251,26 +1511,59 @@ fn signature_of(callee: &Value) -> String {
 /// That is what makes the next candidate worth trying (§3).
 fn bind_args(callee: &Value, args: &CallArgs) -> Option<Vec<Option<Value>>> {
     let specs = param_specs(callee)?;
-    if args.positional.len() > specs.len() {
-        return None;
-    }
     let mut bound: Vec<Option<Value>> = vec![None; specs.len()];
-    for (i, value) in args.positional.iter().enumerate() {
-        bound[i] = Some(value.clone());
+
+    match specs.iter().position(|s| s.variadic) {
+        // Positional filling stops at the `*`; what is left of the arguments
+        // collects into it, and a bare `*` collects nothing, so anything left
+        // over is a rejection (channels §6.1).
+        Some(at) => {
+            for (i, value) in args.positional.iter().take(at).enumerate() {
+                bound[i] = Some(value.clone());
+            }
+            let rest: Vec<Value> = args.positional.iter().skip(at).cloned().collect();
+            if specs[at].name.is_empty() {
+                if !rest.is_empty() {
+                    return None;
+                }
+            } else {
+                bound[at] = Some(new_list(rest));
+            }
+        }
+        None => {
+            if args.positional.len() > specs.len() {
+                return None;
+            }
+            for (i, value) in args.positional.iter().enumerate() {
+                bound[i] = Some(value.clone());
+            }
+        }
     }
+
     for (name, value) in &args.named {
-        let index = specs.iter().position(|s| s.name.as_ref() == name.as_ref())?;
-        if bound[index].is_some() {
+        let index = specs
+            .iter()
+            .position(|s| !s.name.is_empty() && s.name.as_ref() == name.as_ref())?;
+        // A variadic collects positionally or not at all: naming it would put
+        // one value where a list belongs.
+        if specs[index].variadic || bound[index].is_some() {
             return None;
         }
         bound[index] = Some(value.clone());
     }
+
     for (spec, value) in specs.iter().zip(bound.iter()) {
-        if value.is_none() && !spec.has_default {
+        if value.is_none() && !spec.has_default && !spec.variadic {
             return None;
         }
     }
     Some(bound)
+}
+
+/// True where a candidate has a `*`, and so never rejects a call for having too
+/// many arguments. Those are tried after every concrete arity (channels §6.1).
+fn is_variadic(callee: &Value) -> bool {
+    param_specs(callee).is_some_and(|specs| specs.iter().any(|s| s.variadic))
 }
 
 /// The crash for a call nothing accepted, listing what was tried (§8).
@@ -1290,6 +1583,189 @@ fn rejected(name: Option<&str>, candidates: &[Value], args: &CallArgs) -> Crash 
         args.describe(),
         callable.join(", ")
     ))
+}
+
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SendMode {
+    Wait,
+    Detach,
+    Broadcast,
+}
+
+/// What a native answered: values to push, or a trail parked until a sibling
+/// answers it (channels §6.5).
+enum NativeOut {
+    Values(Vec<Value>),
+    Blocked,
+}
+
+/// `.null, .null` — no eligible sender is left (channels §1).
+fn closed() -> Vec<Value> {
+    vec![Value::null(), Value::null()]
+}
+
+fn index_of(channel: usize) -> Value {
+    Value::Num(channel as f64)
+}
+
+fn send_mode(value: &Value) -> Result<SendMode, Crash> {
+    match value {
+        Value::Sym(s) if sym("wait") == *s => Ok(SendMode::Wait),
+        Value::Sym(s) if sym("detach") == *s => Ok(SendMode::Detach),
+        Value::Sym(s) if sym("broadcast") == *s => Ok(SendMode::Broadcast),
+        other => Err(Crash::new(format!(
+            "`send`'s mode is .wait, .detach or .broadcast, got {}",
+            to_text(other)
+        ))),
+    }
+}
+
+/// The `to*` / `from*` list, which the variadic collected. Empty means "any".
+fn channel_list(value: Option<Value>) -> Result<Option<Vec<usize>>, Crash> {
+    let Some(value) = value else { return Ok(None) };
+    let Value::List(list) = deref(&value)? else {
+        return Ok(None);
+    };
+    let items = list.read().unwrap_or_else(|e| e.into_inner()).items.clone();
+    if items.is_empty() {
+        return Ok(None);
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        match deref(&item)? {
+            Value::Num(n) if n >= 0.0 && n.fract() == 0.0 => out.push(n as usize),
+            other => {
+                return Err(Crash::new(format!(
+                    "a channel is a trail's index: a whole number from 0, got {}",
+                    to_text(&other)
+                )))
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
+/// An index that cannot exist is a crash, and so is naming yourself: a trail's
+/// siblings are the only ones it can reach (channels §3, §6.7).
+fn check_indices(block: &BlockCtx, me: usize, only: Option<&Vec<usize>>) -> Result<(), Crash> {
+    let Some(indices) = only else { return Ok(()) };
+    // While the block is still spawning, an index past the last trail may yet
+    // be one — unless the block's trail count was known before it ran.
+    let known = block.arity.or(if block.spawn_done { Some(block.children.len()) } else { None });
+    for index in indices {
+        if *index == me {
+            return Err(Crash::new(format!(
+                "trail {me} is this one: a trail sends to its siblings, not to itself"
+            )));
+        }
+        if let Some(count) = known {
+            if *index >= count {
+                return Err(Crash::new(format!(
+                    "no trail {index}: this block has {count} trail{}, 0 to {}",
+                    if count == 1 { "" } else { "s" },
+                    count.saturating_sub(1)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Take the trail parked in `receive` at `target`, if it will have `from`.
+fn take_waiter(block: &mut BlockCtx, target: usize, from: usize) -> Option<TaskId> {
+    let at = block.waiting.iter().position(|w| {
+        w.channel == target && w.from.as_ref().is_none_or(|only| only.contains(&from))
+    })?;
+    Some(block.waiting.remove(at).task)
+}
+
+/// The first parked receiver among `targets` — "first to receive wins" is
+/// decided here, in park order (channels §4).
+fn take_any_waiter(block: &mut BlockCtx, targets: &[usize], from: usize) -> Option<TaskId> {
+    let at = block.waiting.iter().position(|w| {
+        targets.contains(&w.channel)
+            && w.from.as_ref().is_none_or(|only| only.contains(&from))
+    })?;
+    Some(block.waiting.remove(at).task)
+}
+
+/// A block whose every live trail is parked, with nothing buffered that anyone
+/// will take, can never make progress. That is a crash, not a hang
+/// (channels §6.6).
+fn park_check(block: &BlockCtx) -> Result<(), Crash> {
+    let parked = block.waiting.len() + block.mail.iter().filter(|m| m.waiter.is_some()).count();
+    if block.spawn_done && block.pending > 0 && parked >= block.pending {
+        return Err(Crash::new(format!(
+            "every trail in this block is waiting: {parked} of them, and nothing left to send"
+        )));
+    }
+    Ok(())
+}
+
+/// The waiters a change has just made unanswerable: no eligible peer is left,
+/// so a parked `receive` gets `.null, .null` and a parked `send` gets `.false`
+/// (channels §1, §5).
+fn closed_waiters(block: &mut BlockCtx) -> Vec<(TaskId, Vec<Value>)> {
+    let mut woken = Vec::new();
+    let mut kept = Vec::with_capacity(block.waiting.len());
+    for waiter in std::mem::take(&mut block.waiting) {
+        if block.any_peer_left(waiter.channel, waiter.from.as_ref()) {
+            kept.push(waiter);
+        } else {
+            woken.push((waiter.task, closed()));
+        }
+    }
+    block.waiting = kept;
+
+    let mut left = VecDeque::with_capacity(block.mail.len());
+    for msg in std::mem::take(&mut block.mail) {
+        let reachable = match &msg.to {
+            Some(indices) => indices.iter().any(|i| !block.is_finished(*i)),
+            None => (0..block.children.len()).any(|i| i != msg.from && !block.is_finished(i)),
+        };
+        match (reachable, msg.waiter) {
+            (false, Some(sender)) => woken.push((sender, vec![boolean(false)])),
+            (false, None) => {}
+            (true, _) => left.push_back(msg),
+        }
+    }
+    block.mail = left;
+    woken
+}
+
+/// Take a cancelled trail out of whatever it was parked on, with the answer a
+/// closed channel gives.
+fn cancel_waiter(block: &mut BlockCtx, id: TaskId) -> Vec<(TaskId, Vec<Value>)> {
+    let mut woken = Vec::new();
+    if let Some(at) = block.waiting.iter().position(|w| w.task == id) {
+        block.waiting.remove(at);
+        woken.push((id, closed()));
+    }
+    if let Some(at) = block.mail.iter().position(|m| m.waiter == Some(id)) {
+        // Its offer goes with it: nobody may take a dead trail's value.
+        block.mail.remove(at);
+        woken.push((id, vec![boolean(false)]));
+    }
+    woken
+}
+
+/// Hand a parked trail its answer and make it ready. The task may be running on
+/// another worker and so out of the table, which the wake token covers — the
+/// same race the block join has.
+fn deliver_all(sched: &mut Sched, deliveries: Vec<(TaskId, Vec<Value>)>) {
+    for (id, values) in deliveries {
+        sched.deliveries.insert(id, values);
+        match sched.tasks.get_mut(&id) {
+            Some(task) if task.state == TaskState::Blocked => {
+                task.state = TaskState::Ready;
+                sched.ready.push_back(id);
+            }
+            _ => {
+                sched.wakes.insert(id);
+            }
+        }
+    }
 }
 
 fn stem(path: &Path) -> String {

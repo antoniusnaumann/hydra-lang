@@ -382,3 +382,42 @@ fn a_module_export_that_shadows_a_builtin_is_worth_a_second_look() {
 fn a_qualified_builtin_that_does_not_exist() {
     assert_eq!(codes("x := ::nope()\n"), vec!["unknown-builtin"]);
 }
+
+// --- auto-channels (spec/hydra_channels.md) ---------------------------------
+
+#[test]
+fn the_channel_calls_belong_inside_a_block() {
+    // Lexically scoped, deliberately unlike `alive()`: a function a trail calls
+    // is not inside it (channels §6.4).
+    assert_eq!(codes("v := receive()\n"), vec!["channel-outside-trail"]);
+    assert_eq!(
+        codes("fn helper()\n\treturn send(1)\nend\nparallel\n\thelper() || x := 1\nend\n"),
+        vec!["channel-outside-trail"]
+    );
+    assert_eq!(codes("parallel\n\tsend(1) || v := receive()\nend\n"), Vec::<&str>::new());
+}
+
+#[test]
+fn an_index_the_row_form_cannot_have_is_an_error() {
+    // The row form is the one shape whose trail count is known before it runs
+    // (channels §6.7).
+    assert_eq!(
+        codes("parallel\n\tsend(1, 5) || v := receive()\nend\n"),
+        vec!["no-such-channel"]
+    );
+    assert_eq!(
+        codes("parallel\n\tsend(1, 0) || v := receive()\nend\n"),
+        vec!["channel-is-self"]
+    );
+}
+
+#[test]
+fn naming_more_values_than_a_call_answers_with() {
+    assert_eq!(
+        codes("fn two()\n\treturn 1, 2\nend\na, b, c := two()\n"),
+        vec!["too-many-values-named"]
+    );
+    assert_eq!(codes("fn two()\n\treturn 1, 2\nend\na, b := two()\n"), Vec::<&str>::new());
+    // Only a call answers with several values: a multi-value is not a value.
+    assert_eq!(codes("a, b := 1 + 2\n"), vec!["multi-value-not-a-call"]);
+}

@@ -164,12 +164,18 @@ impl Formatter {
                 self.pad_rows(rows);
             }
             Stmt::Decl { value, .. } => self.expr(value, depth),
-            Stmt::Assign { target, value, .. } => {
-                self.expr(target, depth);
+            Stmt::Assign { targets, value, .. } => {
+                for target in targets {
+                    self.expr(target, depth);
+                }
                 self.expr(value, depth);
             }
             Stmt::Expr { expr, .. } => self.expr(expr, depth),
-            Stmt::Return { value: Some(value), .. } => self.expr(value, depth),
+            Stmt::Return { values, .. } => {
+                for value in values {
+                    self.expr(value, depth);
+                }
+            }
             _ => {}
         }
     }
@@ -268,6 +274,24 @@ fn is_operand_end(tok: &Token) -> bool {
     }
 }
 
+/// Which `*` closes a parameter list rather than multiplying: `values*` and the
+/// bare `*` take no space before them (channels §6.1). A binary `*` always has
+/// an operand after it, so a `*` that a `,` or a `)` follows can only be the
+/// other kind.
+fn mark_variadic_stars(tokens: &[Token]) -> Vec<bool> {
+    let mut variadic = vec![false; tokens.len()];
+    for (i, tok) in tokens.iter().enumerate() {
+        if tok.is_op("*") {
+            let closes = matches!(tokens.get(i + 1), Some(next) if next.is_op(",") || next.is_op(")"));
+            // Only `values*` closes up against its name; a bare `*` is a
+            // parameter of its own and is spaced like one.
+            let named = i > 0 && tokens[i - 1].ident().is_some();
+            variadic[i] = closes && named;
+        }
+    }
+    variadic
+}
+
 /// Which `-`, `~` and `&` are prefixes rather than binary operators. A prefix
 /// takes no space after it — `&a`, never `& a` (rule 2).
 fn mark_prefixes(tokens: &[Token]) -> Vec<bool> {
@@ -285,9 +309,10 @@ fn mark_prefixes(tokens: &[Token]) -> Vec<bool> {
 
 fn render(tokens: &[Token]) -> String {
     let prefix = mark_prefixes(tokens);
+    let variadic = mark_variadic_stars(tokens);
     let mut out = String::new();
     for (i, tok) in tokens.iter().enumerate() {
-        if i > 0 && needs_space(&tokens[i - 1], tok, prefix[i - 1]) {
+        if i > 0 && !variadic[i] && needs_space(&tokens[i - 1], tok, prefix[i - 1]) {
             out.push(' ');
         }
         out.push_str(&text_of(tok, i.checked_sub(1).map(|j| &tokens[j])));
