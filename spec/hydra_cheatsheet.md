@@ -60,7 +60,10 @@ symbol := .null
   identical to its source. It is not a reliable aliasing test.
 - Reading a missing key **crashes**; writing one creates it.
 - Lists are 0-based and `a[-1]` is the last element.
-- `."content-type"` is a symbol that isn't a valid identifier; `."\(x)-id"`
+- A symbol's name may contain `-`: `.x-req-id` is one name, because subtracting
+  symbols is nonsense. A *key lookup* is not a symbol literal, so `d.total-1`
+  still subtracts and a hyphenated key is `d[.x-req-id]` or `d."x-req-id"`.
+- `."not a name"` is a symbol that isn't a valid symbol name; `."\(x)-id"`
   builds one from data.
 
 ---

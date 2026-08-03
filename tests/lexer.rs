@@ -118,6 +118,29 @@ fn symbol_versus_key_lookup() {
 }
 
 #[test]
+fn a_symbols_name_may_contain_a_hyphen() {
+    // Subtracting one symbol from another is nonsense, so `.x-req-id` can only
+    // have been meant as one name (§2).
+    assert_eq!(
+        kinds(".x-req-id")[0],
+        Tok::Sym { parts: vec![text_piece("x-req-id")], quoted: false }
+    );
+    assert_eq!(kinds(".a-1")[0], Tok::Sym { parts: vec![text_piece("a-1")], quoted: false });
+    // A space ends the name, and so does a `-` with nothing to join.
+    assert_eq!(kinds(".a - b")[0], Tok::Sym { parts: vec![text_piece("a")], quoted: false });
+    assert_eq!(kinds(".a - b")[1], Tok::Op("-"));
+    assert_eq!(kinds(".a-")[0], Tok::Sym { parts: vec![text_piece("a")], quoted: false });
+    assert_eq!(kinds(".a-")[1], Tok::Op("-"));
+
+    // A *key lookup* is not a symbol literal: there the thing left of the `-`
+    // is a value, and subtracting from it is perfectly sensible.
+    let ks = kinds("d.total-1");
+    assert_eq!(ks[1], Tok::Op("."));
+    assert_eq!(ks[2], Tok::Ident("total".into()));
+    assert_eq!(ks[3], Tok::Op("-"));
+}
+
+#[test]
 fn quoted_symbols() {
     assert_eq!(
         kinds(".\"content-type\"")[0],

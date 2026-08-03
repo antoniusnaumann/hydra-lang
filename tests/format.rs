@@ -65,13 +65,17 @@ fn dict_literals_normalise() {
     // Rule 3a: spaces inside the braces and around the colon.
     assert_eq!(fmt_idempotent("d := {.a:1,.b:2}\n"), "d := { .a : 1, .b : 2 }\n");
     assert_eq!(fmt_idempotent("d := {   }\n"), "d := {}\n");
-    // A quoted symbol whose content is a valid identifier is rewritten bare.
+    // A quoted symbol whose content is a valid symbol name is rewritten bare,
+    // and a name may contain `-` (§2).
     assert_eq!(fmt_idempotent("d := { .\"name\" : 1 }\n"), "d := { .name : 1 }\n");
-    // One that is not stays quoted.
+    assert_eq!(fmt_idempotent("d := { .\"x-req-id\" : 1 }\n"), "d := { .x-req-id : 1 }\n");
+    // One that is not a name at all stays quoted.
     assert_eq!(
-        fmt_idempotent("d := { .\"x-req-id\" : 1 }\n"),
-        "d := { .\"x-req-id\" : 1 }\n"
+        fmt_idempotent("d := { .\"a b\" : 1 }\n"),
+        "d := { .\"a b\" : 1 }\n"
     );
+    // A *key lookup* is not a symbol literal: `d.total-1` subtracts, so a
+    // hyphenated key keeps its quotes.
     assert_eq!(fmt_idempotent("x := headers.\"content-type\"\n"), "x := headers.\"content-type\"\n");
     assert_eq!(fmt_idempotent("x := headers.\"name\"\n"), "x := headers.name\n");
 }

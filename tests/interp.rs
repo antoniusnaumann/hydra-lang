@@ -112,7 +112,8 @@ same := key === .\"x-id\"
 ";
     assert_eq!(eval(src, "seen"), "7");
     assert_eq!(eval(src, "same"), ".true");
-    assert_eq!(eval(src, "key"), ".\"x-id\"");
+    // A name may contain `-`, so the built symbol renders bare (§2).
+    assert_eq!(eval(src, "key"), ".x-id");
 }
 
 #[test]

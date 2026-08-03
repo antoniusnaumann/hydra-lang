@@ -96,9 +96,10 @@ it is never exported by `use` and never reachable through `::`.
 42        3.0                        // numbers
 "text"    "hi \(name), \(a + b)"     // string, with interpolation
 [1, 2, 3]                            // list
-{ .a : 5, ."x-req-id" : 17 }         // dict — keys are symbols
+{ .a : 5, .x-req-id : 17 }           // dict — keys are symbols
 .null  .false  .true  .whatever      // symbols
-."content-type"                      // quoted symbol
+.content-type                        // a symbol's name may contain `-`
+."not a name"                        // quoted symbol
 ```
 
 **[D]** A dot in leading position starts a **symbol**. A dot directly after an
@@ -106,8 +107,18 @@ expression is a **key lookup**. The lexer decides by the preceding token: after
 an identifier, `)`, `]`, `}`, or a literal, `.` is a lookup; otherwise it opens
 a symbol.
 
-**[D] Quoted symbols.** `."content-type"` is a symbol whose name is not a valid
-identifier. It works in every position a bare symbol does, including lookup:
+**[D] A symbol's name may contain `-`**, as long as it is internal:
+`[A-Za-z_][A-Za-z0-9_]*(-[A-Za-z0-9_]+)*`. Nothing is lost by it, because
+subtracting one symbol from another is nonsense, so `.x-req-id` can only ever
+have been meant as one name. Spaces still end it: `.a - b` is a subtraction.
+
+This holds for a symbol **literal** only, and deliberately not for a key lookup.
+In `d.total-1` the thing left of the `-` is a *value*, and subtracting from it
+is perfectly sensible, so the lookup form keeps reading `-` as the operator. A
+hyphenated key is written `d[.x-req-id]` or `d."x-req-id"`.
+
+**[D] Quoted symbols.** `."not a name"` is a symbol whose name is not a valid
+symbol name. It works in every position a bare symbol does, including lookup:
 `headers."content-type"` is `headers[."content-type"]`.
 
 **[D]** A quoted symbol may interpolate — `."\(prefix)-id"` — which gives
@@ -673,8 +684,10 @@ maybe-list would be enormous and would be ignored within a week.
 3a. Dict literals normalise to `{ .a : 1, .b : 2 }` — spaces inside the braces
    and around the colon. Interpolations normalise like ordinary expressions:
    `\(a + b)`, never `\( a+b )`. A quoted symbol whose content is a valid
-   identifier is rewritten bare: `."name"` becomes `.name`. **[D]**, one line
-   each to change.
+   symbol name is rewritten bare: `."name"` becomes `.name` and `."x-req-id"`
+   becomes `.x-req-id`. A *key lookup* is not a symbol literal, so
+   `d."x-req-id"` keeps its quotes — bare, the `-` there would subtract.
+   **[D]**, one line each to change.
 4. Never move a line break, since a newline terminates a statement — the
    formatter must not join or split statement lines.
 5. Inside a `parallel` block:

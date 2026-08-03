@@ -202,7 +202,7 @@ impl Token {
                 // §12 rule 3a: a quoted symbol whose content is a valid
                 // identifier is rewritten bare. An interpolated one never is.
                 match static_text(parts) {
-                    Some(name) if !*quoted || is_identifier(&name) => format!(".{name}"),
+                    Some(name) if !*quoted || is_symbol_name(&name) => format!(".{name}"),
                     _ => format!(".\"{}\"", raw_text(parts)),
                 }
             }
@@ -237,6 +237,23 @@ pub fn is_identifier(text: &str) -> bool {
         Some(c) if is_ident_start(c) => chars.all(is_ident_char),
         _ => false,
     }
+}
+
+/// A **symbol** name may also contain `-`, as long as it is internal:
+/// `[A-Za-z_][A-Za-z0-9_]*(-[A-Za-z0-9_]+)*`. Nothing is lost by it, because
+/// subtracting one symbol from another is nonsense, so `.x-req-id` can only
+/// have been meant as one name.
+///
+/// This holds for a symbol *literal* only, never for a key lookup: in
+/// `d.total-1` the thing left of the `-` is a value, and subtracting from it is
+/// perfectly sensible. A hyphenated key is `d[.x-req-id]` or `d."x-req-id"`.
+pub fn is_symbol_name(text: &str) -> bool {
+    !text.is_empty()
+        && !text.ends_with('-')
+        && text.split('-').enumerate().all(|(i, part)| match i {
+            0 => is_identifier(part),
+            _ => !part.is_empty() && part.chars().all(is_ident_char),
+        })
 }
 
 /// A leading underscore marks an item private (§2).
@@ -513,6 +530,23 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// A symbol's name, where a `-` joins two runs of identifier characters and
+    /// a trailing one is left for the operator it must be.
+    fn take_symbol_name(&mut self) -> String {
+        let mut name = self.take_ident();
+        while self.peek() == Some('-') {
+            let Some(after) = self.peek_at(1) else { break };
+            if !is_ident_char(after) {
+                break;
+            }
+            self.bump();
+            name.push('-');
+            // A run after a `-` may start with a digit: `.a-1` is one name.
+            name.push_str(&self.take_ident());
+        }
+        name
+    }
+
     fn take_ident(&mut self) -> String {
         let mut word = String::new();
         while matches!(self.peek(), Some(c) if is_ident_char(c)) {
@@ -544,7 +578,7 @@ impl<'a> Lexer<'a> {
         if !matches!(self.peek(), Some(c) if is_ident_start(c)) {
             return Err(self.err("expected a name or a quoted string after `.`", pos));
         }
-        let name = self.take_ident();
+        let name = self.take_symbol_name();
         Ok(Token::new(Tok::Sym { parts: vec![text_piece(&name)], quoted: false }, pos))
     }
 

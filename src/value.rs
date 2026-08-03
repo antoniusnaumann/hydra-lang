@@ -1018,7 +1018,7 @@ fn to_text_at(v: &Value, depth: u32) -> String {
         Value::Num(n) => num_to_text(*n),
         Value::Str(s) => s.to_string(),
         Value::Sym(s) => {
-            if crate::lexer::is_identifier(s.name()) {
+            if crate::lexer::is_symbol_name(s.name()) {
                 format!(".{}", s.name())
             } else {
                 format!(".\"{}\"", crate::lexer::escape_string(s.name()))

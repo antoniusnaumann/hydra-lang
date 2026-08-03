@@ -68,7 +68,7 @@ Interpolation is therefore where the text form of a value is defined:
 |---|---|
 | number | shortest round-tripping form; `3.0` prints as `3`, `NaN`/`Infinity`/`-Infinity` spelled out |
 | string | itself, uninterpreted |
-| symbol | `.name`, quoted (`."x-req-id"`) when not an identifier |
+| symbol | `.name`, and `-` is part of a name (`.x-req-id`); quoted (`."not a name"`) when it is not one |
 | list | `[1, 2]` |
 | dict | `{ .a : 1 }` |
 | closure | `fn(a, b)` |

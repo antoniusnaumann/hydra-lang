@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use crate::ast::*;
 use crate::errors::Result;
-use crate::lexer::{is_identifier, static_text, tokenize, StrPiece, Tok, Token};
+use crate::lexer::{is_identifier, is_symbol_name, static_text, tokenize, StrPiece, Tok, Token};
 use crate::parser::parse;
 
 /// Format a source file. The output is canonical and formatting it again
@@ -328,6 +328,9 @@ fn text_of(tok: &Token, prev: Option<&Token>) -> String {
     match &tok.kind {
         Tok::Str { parts } => {
             if let (Some(prev), Some(literal)) = (prev, static_text(parts)) {
+                // A *key lookup* keeps its quotes unless the key is a plain
+                // identifier: `d.total-1` subtracts, so a hyphenated key can
+                // only be written `d."x-req-id"` or `d[.x-req-id]`.
                 if prev.is_op(".") && is_identifier(&literal) {
                     return literal;
                 }
@@ -337,7 +340,7 @@ fn text_of(tok: &Token, prev: Option<&Token>) -> String {
         Tok::Sym { parts, quoted } => match static_text(parts) {
             // Rule 3a: a quoted symbol whose content is a valid identifier is
             // rewritten bare. One that interpolates never can be.
-            Some(name) if !*quoted || is_identifier(&name) => format!(".{name}"),
+            Some(name) if !*quoted || is_symbol_name(&name) => format!(".{name}"),
             _ => format!(".\"{}\"", render_parts(parts)),
         },
         _ => tok.text(),

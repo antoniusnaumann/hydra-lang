@@ -137,7 +137,11 @@ pub fn tmlanguage_json() -> String {
     patterns.push(rule("keyword.other", &format!("\\b({})\\b", OTHER.join("|"))));
 
     patterns.push(rule("punctuation.trail", r"\|\|"));
-    patterns.push(rule("entity.symbol", r#"\.(\"[^\"]*\"|[A-Za-z_][A-Za-z0-9_]*)"#));
+    patterns.push(rule(
+        "entity.symbol",
+        // A symbol's name may contain `-`, as long as it is internal (§2).
+        r#"\.(\"[^\"]*\"|[A-Za-z_][A-Za-z0-9_]*(-[A-Za-z0-9_]+)*)"#,
+    ));
     patterns.push(rule("entity.namespace", "[A-Za-z_][A-Za-z0-9_]*(?=::)"));
     patterns.push(rule("entity.function", r"[A-Za-z_][A-Za-z0-9_]*(?=\()"));
     patterns.push(rule("constant.numeric", r"\b[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?\b"));
