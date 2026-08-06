@@ -135,7 +135,10 @@ pub enum Instr {
 
     /// `break trail` (§9.6).
     EndTrail,
-    Use(Arc<str>),
+    /// `use fs`, `use fs as *`, `use fs as filesystem` (§7). `alias` is the
+    /// name the module answers to when qualified, and `unqualified` is whether
+    /// its names are bound bare as well.
+    Use { module: Arc<str>, alias: Arc<str>, unqualified: bool },
 }
 
 /// What a call has to supply for one parameter.
@@ -273,8 +276,15 @@ impl Compiler {
         let pos = stmt.pos();
         self.emit(Instr::Tick, pos);
         match stmt {
-            Stmt::Use { module, pos } => {
-                self.emit(Instr::Use(Arc::from(module.as_str())), *pos);
+            Stmt::Use { module, alias, unqualified, pos } => {
+                self.emit(
+                    Instr::Use {
+                        module: Arc::from(module.as_str()),
+                        alias: Arc::from(alias.as_deref().unwrap_or(module.as_str())),
+                        unqualified: *unqualified,
+                    },
+                    *pos,
+                );
             }
             Stmt::FnDecl { name, def, pos } => {
                 self.closure(def, name, *pos)?;
@@ -656,6 +666,14 @@ impl Compiler {
                     *pos,
                 );
             }
+            Expr::Method { name, pos, .. } => {
+                return self.err(
+                    format!(
+                        "`.{name}` here is a call through a dot, and it is missing its `(…)`"
+                    ),
+                    *pos,
+                )
+            }
             Expr::Key { obj, key, pos } => {
                 self.expr(obj)?;
                 self.symbol(key)?;
@@ -681,24 +699,33 @@ impl Compiler {
                             *pos,
                         );
                     }
-                    // `x.f(…)`: a field call, or a free function with `x` as its
-                    // first argument (§5.2). Which one is a runtime question —
-                    // it depends on what the receiver holds — so the whole
-                    // decision goes into one instruction. A quoted key is not a
-                    // function name, so it stays an ordinary field call.
-                    Expr::Key { obj, key, .. } if key.is_static() && !key.quoted => {
+                    // `x.f(…)`: a field call, or a free function with `x` as
+                    // its first argument (§5.2). Which one is a runtime
+                    // question — it depends on what the receiver holds — so the
+                    // whole decision goes into one instruction.
+                    Expr::Method { obj, module: None, name, .. } => {
                         self.expr(obj)?;
                         for arg in args {
                             self.expr(&arg.value)?;
                         }
                         self.emit(
-                            Instr::CallMethod {
-                                name: Arc::from(key.name.as_str()),
-                                positional,
-                                names,
-                            },
+                            Instr::CallMethod { name: Arc::from(name.as_str()), positional, names },
                             *pos,
                         );
+                    }
+                    // `x.mod::f(…)` is exactly `mod::f(x, …)`: a field cannot be
+                    // namespaced, so there is nothing to decide (§7).
+                    Expr::Method { obj, module: Some(module), name, pos: name_pos } => {
+                        self.expr(&Expr::Namespace {
+                            module: module.clone(),
+                            name: name.clone(),
+                            pos: *name_pos,
+                        })?;
+                        self.expr(obj)?;
+                        for arg in args {
+                            self.expr(&arg.value)?;
+                        }
+                        self.emit(Instr::Call { positional: positional + 1, names }, *pos);
                     }
                     _ => {
                         self.expr(callee)?;

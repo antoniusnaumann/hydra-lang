@@ -461,6 +461,9 @@ a call that used to reach a function, unless the field holds a function too.
 `d."x-y"(…)` and `d[k](…)` are ordinary field calls and crash when the field is
 missing, as they always did.
 
+**[D]** `x.mod::f(…)` is exactly `mod::f(x, …)` and skips step 1 entirely: a
+field cannot be namespaced, so there is nothing to decide (§7).
+
 **[D]** A **bare `x.f` is still an ordinary key read**, and still crashes when
 the key is missing. Nothing is bound or partially applied by writing the dot
 without a call.
@@ -524,14 +527,49 @@ is the **values** flowing between bindings that copy (§5.1).
 
 1. **Execute** the file's toplevel code — **skipped** if that file is already in
    scope, so side effects happen exactly once per program.
-2. **Bind** its non-private names into the global lookup — this **always** runs,
-   even on a repeat `use`.
+2. **Bind** the module into the importing file — this **always** runs, even on a
+   repeat `use`.
 
 Keeping (2) unconditional is what makes "most recent `use` wins" match source
 order even when a module was already pulled in transitively.
 
+**[D] Three forms, and each gives exactly one way in:**
+
+| Written | Reaches it as | Unqualified names |
+|---|---|---|
+| `use fs` | `fs::read` | — |
+| `use fs as *` | `fs::read` | `read` |
+| `use fs as filesystem` | `filesystem::read` | — |
+
+A plain `use` brings a module in **for qualified calling only**. Nothing of it
+is reachable bare, so importing a module can never quietly capture a name the
+file already uses, and a module is free to call its functions `read`, `list` and
+`size` without asking what else is in the program.
+
+`as *` is how a file says it wants the names themselves, and it is where every
+shadowing diagnostic lives — that warning now marks a deliberate act rather than
+an accident. The module's own name stays a qualifier alongside, because two star
+imports that collide need a way to say which one is meant.
+
+`as name` puts the qualified form under that name **instead**: after
+`use fs as filesystem`, `fs::read` is not in scope. One import, one way in.
+
 **[D]** `mod::name` selects explicitly and is the way to disambiguate.
 Private (`_`-prefixed) names are not reachable through it.
+
+**[D] A qualifier works through the dot too**, which is what makes a lean
+module name and a lean function name compose:
+
+```hydra
+use fs
+text := path.fs::read(fallback = "")   // fs::read(path, fallback = "")
+n := &rows.fs::push(1)                 // fs::push(&rows, 1)
+```
+
+`x.mod::f(…)` is exactly `mod::f(x, …)`. There is nothing for the receiver to
+decide (§5.2): a field cannot be namespaced, so the qualified form is always the
+free call, and the `&` reaches the receiver the same way it does without a
+module.
 
 **[D] Qualified syntax wins.** `::name` — the same selector with the module
 omitted — names the **language's own namespace**: the builtin, whatever else has
@@ -790,8 +828,8 @@ VS Code Dark+ mapping used in the mock-ups.
 // deploy.hy — warm three regions at once, then verify
 
 use fmt
-use http
-use json                 // http exports decode too, so json:: disambiguates
+use http as *            // `push` below is http's, so this file asks for the
+use json                 // bare names; `decode` is only ever qualified
 
 REGIONS := ["eu", "us", "ap"]
 

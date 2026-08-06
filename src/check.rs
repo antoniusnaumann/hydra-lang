@@ -333,9 +333,9 @@ impl<'a> Checker<'a> {
     // --- modules ------------------------------------------------------------
 
     fn load_modules(&mut self, body: &[Stmt]) {
-        let mut uses: Vec<(String, Pos)> = Vec::new();
+        let mut uses: Vec<(String, String, bool, Pos)> = Vec::new();
         collect_uses(body, &mut uses);
-        for (name, pos) in uses {
+        for (name, qualifier, unqualified, pos) in uses {
             let Some(path) = self.resolve_module(&name) else {
                 self.names_are_knowable = false;
                 self.warn(
@@ -359,6 +359,13 @@ impl<'a> Checker<'a> {
                     continue;
                 }
             };
+            // Only `as *` binds names unqualified, so only `as *` can shadow
+            // anything silently — which is most of the reason `use` no longer
+            // does it on its own (§7).
+            if !unqualified {
+                self.modules.insert(qualifier.clone(), ModuleInfo { exports });
+                continue;
+            }
             // Silent shadowing is the failure mode that reaches production,
             // because the wrong `decode` usually still returns something (§11).
             let clashes: Vec<String> = exports
@@ -398,6 +405,9 @@ impl<'a> Checker<'a> {
             for (export, arity) in &exports {
                 self.imports.insert(export.clone(), (name.clone(), arity.clone()));
             }
+            // A star import keeps the module's own name as a qualifier, so a
+            // collision still has a way to say which one is meant.
+            self.modules.insert(qualifier.clone(), ModuleInfo { exports: exports.clone() });
             self.modules.insert(name.clone(), ModuleInfo { exports });
         }
     }
@@ -852,6 +862,9 @@ impl<'a> Checker<'a> {
                     self.check_known_key(obj, &key.name, *pos);
                 }
             }
+            // The callee of a call through a dot: only the receiver is a read,
+            // and what the name means is `check_call`'s question (§5.2).
+            Expr::Method { obj, .. } => self.expr(obj),
             Expr::Index { obj, index, pos } => {
                 self.expr(obj);
                 self.expr(index);
@@ -862,13 +875,7 @@ impl<'a> Checker<'a> {
                 }
             }
             Expr::Call { callee, args, pos } => {
-                // `x.f(…)` is a field call *or* a free function with `x` as its
-                // first argument (§5.2), so a missing field is not a missing
-                // key here — only the receiver is an ordinary read.
-                match callee.as_ref() {
-                    Expr::Key { obj, key, .. } if key.is_static() && !key.quoted => self.expr(obj),
-                    other => self.expr(other),
-                }
+                self.expr(callee);
                 for arg in args {
                     self.expr(&arg.value);
                 }
@@ -1153,17 +1160,27 @@ impl<'a> Checker<'a> {
     /// A call nothing accepts, and a missing `&` on the one that does
     /// (§11, §5.1, §3).
     fn check_call(&mut self, callee: &Expr, args: &[Arg], pos: Pos) {
-        // A receiver that provably has no field of that name settles which call
-        // `x.f(…)` is: the free function, with the receiver as its first
-        // argument. Then the ordinary rules apply to it, including the missing
-        // `&` on a parameter that needs one (§5.2, §11).
-        if let Expr::Key { obj, key, .. } = callee {
-            if key.is_static() && !key.quoted && self.provably_fieldless(obj, &key.name) {
+        // A call through a dot is the free function with the receiver as its
+        // first argument — always, when it is qualified (a field cannot be
+        // namespaced), and when the receiver *provably* has no such field
+        // otherwise. Then the ordinary rules apply to it, including the missing
+        // `&` on a parameter that needs one (§5.2, §7, §11).
+        if let Expr::Method { obj, module, name, .. } = callee {
+            let settled = match module {
+                Some(_) => true,
+                None => self.provably_fieldless(obj, name),
+            };
+            if settled {
                 let mut with_receiver = vec![Arg::positional((**obj).clone())];
                 with_receiver.extend(args.iter().cloned());
-                let name = Expr::Name { name: key.name.clone(), pos };
+                let callee = match module {
+                    Some(module) => {
+                        Expr::Namespace { module: module.clone(), name: name.clone(), pos }
+                    }
+                    None => Expr::Name { name: name.clone(), pos },
+                };
                 let outer = std::mem::replace(&mut self.receiver_call, true);
-                self.check_call(&name, &with_receiver, pos);
+                self.check_call(&callee, &with_receiver, pos);
                 self.receiver_call = outer;
             }
             return;
@@ -1304,10 +1321,13 @@ fn collect_names(body: &[Stmt], out: &mut HashSet<String>, overloaded: &mut Hash
     });
 }
 
-fn collect_uses(body: &[Stmt], out: &mut Vec<(String, Pos)>) {
+/// Every `use`, with the qualifier it registers and whether it binds the
+/// module's names unqualified as well (§7).
+fn collect_uses(body: &[Stmt], out: &mut Vec<(String, String, bool, Pos)>) {
     walk_stmts(body, &mut |stmt| {
-        if let Stmt::Use { module, pos } = stmt {
-            out.push((module.clone(), *pos));
+        if let Stmt::Use { module, alias, unqualified, pos } = stmt {
+            let qualifier = alias.clone().unwrap_or_else(|| module.clone());
+            out.push((module.clone(), qualifier, *unqualified, *pos));
         }
     });
 }

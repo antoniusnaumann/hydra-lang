@@ -23,7 +23,9 @@ const BLOCK_ENDERS: &[&str] = &["end", "else", "else if"];
 fn spine_has_call(expr: &Expr) -> bool {
     match expr {
         Expr::Call { .. } => true,
-        Expr::Key { obj, .. } | Expr::Index { obj, .. } => spine_has_call(obj),
+        Expr::Key { obj, .. } | Expr::Index { obj, .. } | Expr::Method { obj, .. } => {
+            spine_has_call(obj)
+        }
         _ => false,
     }
 }
@@ -283,11 +285,28 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Expr { expr: targets.pop().expect("one target"), pos })
     }
 
+    /// `use fs`, `use fs as *`, `use fs as filesystem` (§7).
     fn parse_use(&mut self, pos: Pos) -> Result<Stmt> {
         self.advance();
         let (module, _) = self.expect_ident("a module name")?;
+        let mut alias = None;
+        let mut unqualified = false;
+        if self.eat_kw("as") {
+            if self.eat_op("*") {
+                unqualified = true;
+            } else {
+                let (name, name_pos) = self.expect_ident("an alias, or `*`")?;
+                if name == module {
+                    return self.err(
+                        format!("`as {name}` is the name it already has"),
+                        name_pos,
+                    );
+                }
+                alias = Some(name);
+            }
+        }
         self.expect_end_of_statement()?;
-        Ok(Stmt::Use { module, pos })
+        Ok(Stmt::Use { module, alias, unqualified, pos })
     }
 
     fn parse_fn_decl(&mut self, pos: Pos) -> Result<Stmt> {
@@ -885,10 +904,10 @@ impl<'a> Parser<'a> {
                 match *callee {
                     // The dot is what passes the receiver, so the dot is what
                     // the `&` reaches (§5.2).
-                    Expr::Key { obj, key, pos: key_pos } => {
+                    Expr::Method { obj, module, name, pos: key_pos } => {
                         let obj = Box::new(self.reference(*obj, pos)?);
                         Ok(Expr::Call {
-                            callee: Box::new(Expr::Key { obj, key, pos: key_pos }),
+                            callee: Box::new(Expr::Method { obj, module, name, pos: key_pos }),
                             args,
                             pos: call_pos,
                         })
@@ -903,6 +922,10 @@ impl<'a> Parser<'a> {
             Expr::Key { obj, key, pos: key_pos } => {
                 let obj = Box::new(self.mark_receiver(*obj, pos)?);
                 Ok(Expr::Key { obj, key, pos: key_pos })
+            }
+            Expr::Method { obj, module, name, pos: key_pos } => {
+                let obj = Box::new(self.mark_receiver(*obj, pos)?);
+                Ok(Expr::Method { obj, module, name, pos: key_pos })
             }
             Expr::Index { obj, index, pos: index_pos } => {
                 let obj = Box::new(self.mark_receiver(*obj, pos)?);
@@ -932,6 +955,36 @@ impl<'a> Parser<'a> {
             }
             if self.peek().is_op(".") {
                 self.advance();
+                // A name with a call after it is a *method* callee: the
+                // receiver decides which call it is (§5.2). A name with `::`
+                // after it names the module the call comes from, and then
+                // nothing is left to decide (§7).
+                if let Some(name) = self.peek().ident().map(str::to_string) {
+                    if self.peek_at(1).is_op("::") {
+                        self.advance();
+                        self.advance();
+                        let (call, _) = self.expect_ident("a name after `::`")?;
+                        if !self.peek().is_op("(") {
+                            return self.err(
+                                "a qualified name is a function, so it needs a call: \
+                                 write `x.mod::f(…)`",
+                                self.pos(),
+                            );
+                        }
+                        expr = Expr::Method {
+                            obj: Box::new(expr),
+                            module: Some(name),
+                            name: call,
+                            pos,
+                        };
+                        continue;
+                    }
+                    if self.peek_at(1).is_op("(") {
+                        self.advance();
+                        expr = Expr::Method { obj: Box::new(expr), module: None, name, pos };
+                        continue;
+                    }
+                }
                 let key = match &self.peek().kind {
                     Tok::Ident(name) => SymLit::plain(name.clone(), false, pos),
                     // `headers."content-type"` is `headers[."content-type"]`,

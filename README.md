@@ -153,6 +153,19 @@ A missing `&` is *not* a rejection: it is reported against the candidate that
 accepted the call, because it is a mistake to fix rather than a reason to
 quietly run something else.
 
+**Importing.** `use fs` brings a module in for **qualified calling only** —
+`fs::read` — so an import can never quietly capture a name the file already
+uses. `use fs as *` binds its names unqualified as well and is where every
+shadowing warning lives; `use fs as filesystem` puts the qualified form under
+that name instead. A qualifier works through the dot too, which is what lets
+both the module and its functions keep lean names:
+
+```hydra
+use fs
+text := path.fs::read(fallback = "")  // fs::read(path, fallback = "")
+n := &rows.fs::push(1)                // fs::push(&rows, 1)
+```
+
 **Calling through a dot.** `x.f(…)` is two calls in one syntax, and the
 receiver decides which: a field named `f` **holding something callable** is the
 call, and otherwise it is `f(x, …)` with the receiver as the first argument.

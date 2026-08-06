@@ -72,8 +72,9 @@ pub struct IterState {
 pub enum OnReturn {
     /// Ordinary call: the value lands on the caller's operand stack.
     PushValue,
-    /// A module body ran; bind its public names into the importer (§7).
-    BindModule { alias: Arc<str>, module: usize },
+    /// A module body ran; bind it into the importer under the rules of its
+    /// `use` (§7).
+    BindModule { name: Arc<str>, alias: Arc<str>, unqualified: bool, module: usize },
 }
 
 /// One level of a frame's scope stack.

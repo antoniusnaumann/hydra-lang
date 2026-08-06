@@ -72,6 +72,14 @@ pub enum Expr {
     Namespace { module: String, name: String, pos: Pos },
     /// `a.b` — sugar for `a[.b]` (§5).
     Key { obj: Box<Expr>, key: SymLit, pos: Pos },
+    /// The callee of `x.f(…)` and `x.mod::f(…)` — a dot with a *name* and a
+    /// call after it, which the parser only ever builds in that position.
+    ///
+    /// Unqualified, the receiver decides which call it is: a field holding
+    /// something callable, or `f(x, …)` (§5.2). Qualified, there is nothing to
+    /// decide — a field cannot be namespaced — so `x.mod::f(a)` is exactly
+    /// `mod::f(x, a)`.
+    Method { obj: Box<Expr>, module: Option<String>, name: String, pos: Pos },
     Index { obj: Box<Expr>, index: Box<Expr>, pos: Pos },
     Call { callee: Box<Expr>, args: Vec<Arg>, pos: Pos },
     /// `-x`, `~x`, `not x`.
@@ -92,6 +100,7 @@ impl Expr {
             | Expr::Name { pos, .. }
             | Expr::Namespace { pos, .. }
             | Expr::Key { pos, .. }
+            | Expr::Method { pos, .. }
             | Expr::Index { pos, .. }
             | Expr::Call { pos, .. }
             | Expr::Unary { pos, .. }
@@ -255,8 +264,17 @@ pub enum BreakTarget {
 
 #[derive(Clone, Debug)]
 pub enum Stmt {
+    /// `use fs` brings the module in **for qualified calling only** — `fs::read`
+    /// — and nothing of it is reachable unqualified. `use fs as *` binds its
+    /// names unqualified as well, and `use fs as filesystem` puts the qualified
+    /// form under that name instead (§7).
     Use {
         module: String,
+        /// The name the module answers to when qualified. `None` is the
+        /// module's own name.
+        alias: Option<String>,
+        /// `as *`: the module's names are bound unqualified too.
+        unqualified: bool,
         pos: Pos,
     },
     FnDecl {

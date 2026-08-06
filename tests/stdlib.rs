@@ -167,8 +167,8 @@ fn resolution_reaches_past_an_import_to_an_earlier_one() {
     // `use` keeps every candidate: the most recent wins a read, and a call it
     // rejects falls through to the earlier module.
     let src = "
-use http
-use shadows
+use http as *
+use shadows as *
 theirs := push(\"host\", \"img\")
 fetched := fetch(\"url\")
 ";
@@ -369,7 +369,7 @@ fn a_module_export_shadows_a_builtin_and_the_qualified_form_gets_past_it() {
     // `shadows.hy` exports its own `push`, which is §14's "push an image to a
     // host" rather than the list append.
     let src = "
-use shadows
+use shadows as *
 theirs := push(\"host\", \"img\")
 rows := []
 mine := ::push(&rows, 1)

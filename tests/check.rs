@@ -186,7 +186,9 @@ fn a_call_no_candidate_accepts() {
     assert_eq!(codes("fn f(a, b)\nend\nf(1, 2)\n"), Vec::<&str>::new());
     assert_eq!(codes("g := fn(a) a\ng()\n"), vec!["no-matching-call"]);
     assert_eq!(codes("use json\njson::decode()\n"), vec!["no-matching-call"]);
-    assert_eq!(codes("use json\ndecode()\n"), vec!["no-matching-call"]);
+    // Unqualified only after `as *`; a plain `use` leaves the name alone (§7).
+    assert_eq!(codes("use json as *\ndecode()\n"), vec!["no-matching-call"]);
+    assert_eq!(codes("use json\ndecode()\n"), vec!["undeclared-name"]);
     // A name that is reassigned might hold anything by then.
     assert_eq!(codes("fn f(a)\nend\nf := fn(a, b) a\nf(1, 2)\n"), Vec::<&str>::new());
 }
@@ -207,7 +209,7 @@ fn a_name_with_several_candidates_says_nothing() {
     // A call one candidate rejects goes to the next (§3), so no single
     // signature is guaranteed — which is exactly §11's principle.
     assert_eq!(codes("len := fn(a, b) a\nx := len(1)\n"), Vec::<&str>::new());
-    assert_eq!(codes("use shadows\nx := push(1, 2, 3)\n"), Vec::<&str>::new());
+    assert_eq!(codes("use shadows as *\nx := push(1, 2, 3)\n"), Vec::<&str>::new());
 }
 
 #[test]
@@ -267,8 +269,10 @@ fn forward_references_between_functions_are_fine() {
 #[test]
 fn a_name_two_used_modules_both_export() {
     // Silent shadowing is the failure mode that reaches production (§11).
-    assert_eq!(warnings("use http\nuse json\n"), vec!["ambiguous-import"]);
-    assert!(warnings("use json\n").is_empty());
+    assert_eq!(warnings("use http as *\nuse json as *\n"), vec!["ambiguous-import"]);
+    assert!(warnings("use json as *\n").is_empty());
+    // Only `as *` binds names unqualified, so only `as *` can collide (§7).
+    assert!(warnings("use http\nuse json\n").is_empty());
 }
 
 #[test]
@@ -369,7 +373,7 @@ fn an_unresolvable_module_also_silences_the_builtin_signatures() {
 fn a_module_export_that_shadows_a_builtin_is_worth_a_second_look() {
     // The same failure mode as two modules exporting one name (§11): it still
     // returns *something*, so it reaches production.
-    let src = "use shadows\nx := push(\"host\", \"img\")\n";
+    let src = "use shadows as *\nx := push(\"host\", \"img\")\n";
     assert!(warnings(src).contains(&"shadowed-builtin"), "{:?}", warnings(src));
     assert!(check(src).errors().next().is_none());
     // Qualifying says which one is meant, and the builtin's signature is known

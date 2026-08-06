@@ -43,6 +43,10 @@ fn sexpr(e: &Expr) -> String {
         Expr::Name { name, .. } => name.clone(),
         Expr::Namespace { module, name, .. } => format!("{module}::{name}"),
         Expr::Key { obj, key, .. } => format!("(key {} .{})", sexpr(obj), key.name),
+        Expr::Method { obj, module: None, name, .. } => format!("(dot {} {name})", sexpr(obj)),
+        Expr::Method { obj, module: Some(module), name, .. } => {
+            format!("(dot {} {module}::{name})", sexpr(obj))
+        }
         Expr::Index { obj, index, .. } => format!("(index {} {})", sexpr(obj), sexpr(index)),
         Expr::Call { callee, args, .. } => {
             let args: Vec<String> = args

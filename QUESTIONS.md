@@ -36,7 +36,9 @@ Three language features came out of their signatures, all now in the handoff:
 - ~~The name `push` is contested.~~ **Resolved:** qualified syntax wins.
   Whichever module supplies §14's `push(h, img)` shadows the builtin for
   unqualified calls, `check` warns at the `use`, and `::push` reaches the
-  builtin (§7).
+  builtin (§7). Since a plain `use` no longer binds bare names, that file now
+  says `use http as *` — and the warning marks a deliberate act rather than an
+  accident.
 
 ---
 

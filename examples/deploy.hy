@@ -6,11 +6,12 @@
 //
 // `push(h, img)` below pushes an image to a host: whichever module supplies it
 // shadows the builtin `push(&list, value)` for unqualified calls, and `::push`
-// reaches the builtin.
+// reaches the builtin. That takes `use http as *` — a plain `use` brings a
+// module in for qualified calling only, so it can never capture a name (§7).
 
 use fmt
-use http
-use json // http exports decode too, so json:: disambiguates
+use http as * // `push` below is http's, so this file asks for the bare names
+use json // and `decode`, which both export, is only ever written qualified
 
 REGIONS := ["eu", "us", "ap"]
 

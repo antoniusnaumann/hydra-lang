@@ -61,7 +61,8 @@ symbol := .null
 - Reading a missing key **crashes**; writing one creates it.
 - `x.f(…)` is the field when `.f` holds something callable, and otherwise
   `f(x, …)` — the receiver becomes the first argument. A bare `x.f` is still a
-  plain key read.
+  plain key read. `x.mod::f(…)` is exactly `mod::f(x, …)`: a field cannot be
+  namespaced, so there is nothing to decide.
 - `&` reaches through the dots to the receiver of the **first** call:
   `&a.b` is the field, `&a.foo()` is `foo(&a)`, `&a.b.foo()` is `foo(&(a.b))`.
   Nothing is auto-referenced — `rows.push(x)` is an error, `&rows.push(x)` is
@@ -145,16 +146,20 @@ isolated to that trail (reported on stderr, fatal under strict mode).
 ## Modules
 
 ```hydra
-use fmt
-use http
-use json          // both export `decode`
+use json                // qualified only: `json::decode`
+use json as *           // and unqualified: `decode`
+use json as codec       // qualified, under `codec::` only
 
-decode(body)        // json's — most recent `use` wins
-http::decode(body)  // explicit
+json::decode(body)
+body.json::decode()     // the same call, through the dot
 ```
 
-`use` **executes** a file's toplevel once, but **rebinds** its names every time —
-so unqualified lookup always matches source order, even for transitive imports.
+Each form gives exactly one way in, so importing a module can never quietly
+capture a name — only `as *` binds bare names, and every shadowing warning lives
+there.
+
+`use` **executes** a file's toplevel once, but **rebinds** it every time — so
+unqualified lookup always matches source order, even for transitive imports.
 
 Unqualified lookup is scope chain, then imports, then builtins. `::push` names
 the builtin whatever else has taken it.

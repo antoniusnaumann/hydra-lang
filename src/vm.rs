@@ -828,7 +828,9 @@ impl Vm {
             }
 
             Instr::EndTrail => return Ok(Flow::Stop),
-            Instr::Use(name) => return self.use_module(task, name),
+            Instr::Use { module, alias, unqualified } => {
+                return self.use_module(task, module, alias, *unqualified)
+            }
         }
         Ok(Flow::Next)
     }
@@ -1150,8 +1152,8 @@ impl Vm {
                 task.extras = answered.collect();
                 task.push(value);
             }
-            OnReturn::BindModule { alias, module } => {
-                self.bind_module(task, module, &alias);
+            OnReturn::BindModule { name, alias, unqualified, module } => {
+                self.bind_module(task, module, &name, &alias, unqualified);
             }
         }
         if task.frames.is_empty() {
@@ -1392,7 +1394,13 @@ impl Vm {
 
     // --- modules (§7) -------------------------------------------------------
 
-    fn use_module(&self, task: &mut Task, name: &str) -> Result<Flow, Crash> {
+    fn use_module(
+        &self,
+        task: &mut Task,
+        name: &str,
+        alias: &str,
+        unqualified: bool,
+    ) -> Result<Flow, Crash> {
         let importer = task.frame().module;
         let from = self.module(importer).path.clone();
         let Some(path) = self.resolve_module(name, &from) else {
@@ -1407,7 +1415,7 @@ impl Vm {
             // Executing is skipped if the file is already in scope, but binding
             // always runs — including for a circular import, which resolves to
             // whatever is bound so far (§7).
-            self.bind_module(task, id, name);
+            self.bind_module(task, id, name, alias, unqualified);
             return Ok(Flow::Next);
         }
 
@@ -1426,7 +1434,12 @@ impl Vm {
             iters: Vec::new(),
             stack_base,
             module: id,
-            on_return: OnReturn::BindModule { alias: Arc::from(name), module: id },
+            on_return: OnReturn::BindModule {
+                name: Arc::from(name),
+                alias: Arc::from(alias),
+                unqualified,
+                module: id,
+            },
             call_site: Pos::NONE,
             is_module_body: true,
             provided: Vec::new(),
@@ -1451,16 +1464,30 @@ impl Vm {
 
     /// Bind a module's non-private names into the importer, and register the
     /// alias `::` selects through (§7).
-    fn bind_module(&self, task: &Task, module: usize, alias: &str) {
+    /// Bind a module into the importer (§7).
+    ///
+    /// `use fs` registers the qualifier and nothing else, so `fs::read` reaches
+    /// it and a bare `read` does not. `as *` binds the names unqualified as
+    /// well — the qualifier stays, because otherwise two star-imports that
+    /// collide would have no way to say which one is meant. `as filesystem`
+    /// registers that qualifier *instead* of the module's own name.
+    fn bind_module(
+        &self,
+        task: &Task,
+        module: usize,
+        name: &str,
+        alias: &str,
+        unqualified: bool,
+    ) {
         let importer = task.frame().module;
-        let exported_scope = self.module_scope(module);
-        let exported: Vec<(String, Cell)> = exported_scope
-            .names()
-            .into_iter()
-            .filter(|n| !is_private(n))
-            .filter_map(|n| exported_scope.get_local(&n).map(|c| (n.to_string(), c)))
-            .collect();
-        {
+        if unqualified {
+            let exported_scope = self.module_scope(module);
+            let exported: Vec<(String, Cell)> = exported_scope
+                .names()
+                .into_iter()
+                .filter(|n| !is_private(n))
+                .filter_map(|n| exported_scope.get_local(&n).map(|c| (n.to_string(), c)))
+                .collect();
             let importer_module = self.module(importer);
             let mut imports = importer_module.imports.write().unwrap_or_else(|e| e.into_inner());
             for (name, cell) in exported {
@@ -1472,11 +1499,12 @@ impl Vm {
                 slot.insert(0, cell);
             }
         }
-        self.module(importer)
-            .aliases
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(alias.to_string(), module);
+        let importer_module = self.module(importer);
+        let mut aliases = importer_module.aliases.write().unwrap_or_else(|e| e.into_inner());
+        aliases.insert(alias.to_string(), module);
+        if unqualified {
+            aliases.insert(name.to_string(), module);
+        }
     }
 }
 
