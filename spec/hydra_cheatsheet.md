@@ -158,6 +158,11 @@ Each form gives exactly one way in, so importing a module can never quietly
 capture a name — only `as *` binds bare names, and every shadowing warning lives
 there.
 
+`use` looks for a file — same directory, then `HYDRA_PATH` — and then for a
+**built-in module** such as `fs`. A file of that name shadows the builtin, which
+is discouraged. A qualified name resolves by shape among *that module's* own
+candidates: `fs::read(p)` and `fs::read(p, "")` are two functions.
+
 `use` **executes** a file's toplevel once, but **rebinds** it every time — so
 unqualified lookup always matches source order, even for transitive imports.
 

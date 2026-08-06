@@ -234,8 +234,11 @@ f(1, 2)      // "two"
 candidate that accepted the call, because a missing `&` is a mistake to fix,
 not a reason to quietly run something else.
 
-**[D]** A **qualified** call — `mod::f(…)` or `::f(…)` — names one function, so
-there is nothing to fall through to.
+**[D]** A **qualified** call — `mod::f(…)` or `::f(…)` — does not fall through
+to anything *outside* what it names: no other module, and not the builtins. It
+still resolves by shape **within** it, because one module may export several
+functions of a name — `fs::read(path)` and `fs::read(path, fallback)` are two
+candidates and the call picks the one that accepts it.
 
 ### Operator precedence **[D]**
 
@@ -582,8 +585,15 @@ because a silently shadowed name still returns *something*.
 never assigned to or referenced with `&`.
 
 **[D]** Resolution order for `use fmt`: same directory, then a path list from an
-environment variable. Circular imports resolve to whatever is bound so far
-rather than looping forever.
+environment variable, then the **built-in modules**. Circular imports resolve to
+whatever is bound so far rather than looping forever.
+
+**[D] Built-in modules** are namespaces of native functions that the interpreter
+and `check` know without a file — `fs` is the first of them
+(`spec/hydra_fs.md`). They come last in the resolution order, so a file named
+`fs.hy` beside the program shadows the built-in one. That is legal and
+**discouraged**, and `check` warns at the `use` that does it: a shadowed module
+is the same failure mode as a shadowed name, and it still returns *something*.
 
 ---
 
