@@ -1243,8 +1243,10 @@ impl<'a> Checker<'a> {
                 let param = signature.names.get(index).cloned().unwrap_or_default();
                 // A receiver is marked where it is written, which is in front
                 // of the dot (§5.2).
+                // A `&` in front of a call reaches the receiver (§5.2), so the
+                // marker goes in front of the whole thing.
                 let how = if self.receiver_call && index == 0 {
-                    format!("write `(&…).{name}(…)` or `{name}(&…, …)`")
+                    format!("mark the receiver: `&x.{name}(…)`")
                 } else {
                     "write `&` before it".to_string()
                 };

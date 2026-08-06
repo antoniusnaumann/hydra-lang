@@ -91,6 +91,60 @@ n := (&rows).push(7)
 }
 
 #[test]
+fn an_ampersand_reaches_through_the_dots_to_the_first_call() {
+    // §5.2: `&a.b` references the field, `&a.foo()` is `foo(&a)`, and
+    // `&a.b.foo()` is `foo(&(a.b))`.
+    let src = "
+fn bump(&box, by)
+\treturn box.n + by
+end
+d := { .n : 0 }
+field := &d.n
+nested := { .inner : { .n : 5 } }
+answered := &nested.inner.bump(2)
+
+rows := []
+pushed := &rows.push(7)
+";
+    assert_eq!(eval(src, "field"), "0");
+    assert_eq!(eval(src, "answered"), "7");
+    assert_eq!(eval(src, "rows"), "[7]");
+    assert_eq!(eval(src, "pushed"), "1");
+}
+
+#[test]
+fn only_the_first_call_takes_the_reference() {
+    let src = "
+fn wrap(x)
+\treturn [x]
+end
+rows := []
+answered := &rows.push(1).wrap()
+";
+    // `wrap(push(&rows, 1))`, so `wrap` is handed the length and not a
+    // reference to anything.
+    assert_eq!(eval(src, "answered"), "[1]");
+    assert_eq!(eval(src, "rows"), "[1]");
+}
+
+#[test]
+fn a_reference_through_a_call_that_has_no_receiver_is_an_error() {
+    let error = run_source("x := &f(1)\n", "t.hy", opts()).expect_err("rejected").to_string();
+    assert!(error.contains("no receiver to mark"), "{error}");
+    // And a plain non-lvalue is still the old error.
+    let error = run_source("x := &(a + b)\n", "t.hy", opts()).expect_err("rejected").to_string();
+    assert!(error.contains("`&` takes a variable"), "{error}");
+}
+
+#[test]
+fn a_field_call_is_handed_no_receiver_so_there_is_nothing_to_mark() {
+    // Fields still win (§5.2), so this is the marker being wrong rather than
+    // the call.
+    let crash = crash_of("obj := { .greet : fn(who) \"hi\" }\nx := &obj.greet(\"eu\")\n");
+    assert!(crash.contains("nothing for the `&` to mark"), "{crash}");
+}
+
+#[test]
 fn a_bare_dot_is_still_a_key_read() {
     // Nothing is bound or partially applied by writing the dot without a call.
     let crash = crash_of("d := { .a : 1 }\nx := d.len\n");

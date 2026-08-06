@@ -640,6 +640,15 @@ impl Vm {
                     _ => None,
                 };
                 if let Some(callee) = field {
+                    // A field call takes no receiver, so a `&` in front of one
+                    // marks something nothing will be handed. Fields win (§5.2),
+                    // so this is the marker being wrong rather than the call.
+                    if matches!(receiver, Value::Ref(_)) {
+                        return Err(Crash::new(format!(
+                            "`.{name}` is a field holding a function, and a field call is \
+                             handed no receiver: there is nothing for the `&` to mark"
+                        )));
+                    }
                     let Some(bound) = bind_args(&callee, &args) else {
                         return Err(rejected(Some(name), &[callee], &args));
                     };

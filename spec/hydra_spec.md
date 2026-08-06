@@ -466,12 +466,28 @@ the key is missing. Nothing is bound or partially applied by writing the dot
 without a call.
 
 **[D]** The receiver is passed **exactly as written**, which is what keeps §5.1
-intact: `&` still marks shared mutable state at the site that writes it. A
-parameter that requires a reference therefore requires one here too —
-`rows.push(x)` is the same error as `push(rows, x)`, and the ways to write it
-are `(&rows).push(x)` and `push(&rows, x)`. Nothing is auto-referenced, because
-"the caller marks it, never the callee" is the rule the visibility of shared
-state rests on.
+intact: `&` still marks shared mutable state at the site that writes it, and
+nothing is ever auto-referenced.
+
+**[D] A `&` reaches through a postfix chain to the receiver of the first call.**
+The dot is what passes the receiver, so the dot is what the marker reaches:
+
+```hydra
+&a.b            // &(a.b)      — a reference to the field, as before
+&a.foo()        // foo(&a)
+&a.b.foo()      // foo(&(a.b))
+&a.foo().bar()  // bar(foo(&a)) — the first call takes it, and only it
+&f(x)           // an error: no receiver to mark. Write `f(&x)`.
+```
+
+This is the one place the marker is not written immediately in front of the
+thing it marks, and it reads that way because that is where the receiver is.
+`rows.push(x)` is still the same error as `push(rows, x)`; `&rows.push(x)` is
+how it is written, and `push(&rows, x)` still says the same thing.
+
+**[D]** A **field** call is handed no receiver, so a `&` in front of one has
+nothing to mark and **crashes**. Fields still win (§5.2 step 1) — the marker is
+what is wrong, not the call — and the diagnostic says so.
 
 **[D]** `check` reports what is guaranteed: when the receiver **provably** has
 no such field — a literal that is not a dict, or a dict whose keys are known —

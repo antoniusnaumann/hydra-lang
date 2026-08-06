@@ -61,8 +61,11 @@ symbol := .null
 - Reading a missing key **crashes**; writing one creates it.
 - `x.f(…)` is the field when `.f` holds something callable, and otherwise
   `f(x, …)` — the receiver becomes the first argument. A bare `x.f` is still a
-  plain key read. Nothing is auto-referenced: `rows.push(x)` needs
-  `(&rows).push(x)` or `push(&rows, x)`.
+  plain key read.
+- `&` reaches through the dots to the receiver of the **first** call:
+  `&a.b` is the field, `&a.foo()` is `foo(&a)`, `&a.b.foo()` is `foo(&(a.b))`.
+  Nothing is auto-referenced — `rows.push(x)` is an error, `&rows.push(x)` is
+  not.
 - Lists are 0-based and `a[-1]` is the last element.
 - A symbol's name may contain `-`: `.x-req-id` is one name, because subtracting
   symbols is nonsense. A *key lookup* is not a symbol literal, so `d.total-1`

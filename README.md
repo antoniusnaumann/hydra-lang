@@ -165,9 +165,20 @@ obj.greet("eu")        // the field, when `.greet` holds a closure
 
 Callable is the whole test, so adding a data field can never quietly capture a
 call that used to reach a function. A bare `x.f` is still an ordinary key read.
-And the receiver is passed exactly as written, which is what keeps `&` meaning
-what it means: `rows.push(x)` is the same error as `push(rows, x)`, spelled
-`(&rows).push(x)` or `push(&rows, x)`. Nothing is auto-referenced.
+
+Nothing is auto-referenced — `&` still marks shared mutable state where it is
+written — but it **reaches through the dots to the receiver of the first call**,
+because the dot is what passes it:
+
+```hydra
+&a.b            // &(a.b)      — a reference to the field
+&a.foo()        // foo(&a)
+&a.b.foo()      // foo(&(a.b))
+&a.foo().bar()  // bar(foo(&a)) — the first call takes it, and only it
+```
+
+So `rows.push(x)` is the same error as `push(rows, x)`, and `&rows.push(x)` is
+how it is written.
 
 **A concrete arity beats a variadic.** A `*` parameter accepts everything
 positional, so a variadic candidate is tried only after every candidate that

@@ -18,6 +18,16 @@ use crate::lexer::{
 /// Keywords that end a block body without being part of it.
 const BLOCK_ENDERS: &[&str] = &["end", "else", "else if"];
 
+/// Whether a postfix chain contains a call, which is what decides where a `&`
+/// in front of it lands (§5.2).
+fn spine_has_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call { .. } => true,
+        Expr::Key { obj, .. } | Expr::Index { obj, .. } => spine_has_call(obj),
+        _ => false,
+    }
+}
+
 pub fn parse(src: &str, file: &str) -> Result<Program> {
     let lexed = tokenize(src, file)?;
     let mut parser = Parser::new(lexed.tokens, file, false);
@@ -358,7 +368,8 @@ impl<'a> Parser<'a> {
                 if by_ref && default.is_some() {
                     return self.err(
                         format!(
-                            "`&{name}` cannot have a default: a default is a value,                              and a reference has to come from a call site"
+                            "`&{name}` cannot have a default: a default is a value, \
+                             and a reference has to come from a call site"
                         ),
                         pos,
                     );
@@ -832,17 +843,73 @@ impl<'a> Parser<'a> {
         if self.peek().is_op("&") {
             self.advance();
             let target = self.parse_unary()?;
-            // §5.1: only an lvalue may be referenced. `check` reports this too,
-            // but the message is more useful with the token in hand.
-            if !target.is_lvalue() {
-                return self.err(
-                    "`&` takes a variable, a dict key or a list element",
-                    target.pos(),
-                );
-            }
-            return Ok(Expr::Ref { target: Box::new(target), pos });
+            return self.reference(target, pos);
         }
         self.parse_postfix()
+    }
+
+    /// `&expr` (§5.1), which reaches **through a postfix chain as far as the
+    /// first call and marks that call's receiver** (§5.2):
+    ///
+    /// ```text
+    /// &a.b            &(a.b)          — a reference to the field
+    /// &a.foo()        foo(&a)         — the receiver, by reference
+    /// &a.b.foo()      foo(&(a.b))
+    /// &a.foo().bar()  bar(foo(&a))    — the first call takes it, and only it
+    /// ```
+    ///
+    /// A `&` in front of a call is the one place the marker is not written
+    /// immediately in front of the thing it marks, and it is written that way
+    /// because that is where the receiver is: the dot is what passes it.
+    fn reference(&mut self, target: Expr, pos: Pos) -> Result<Expr> {
+        if spine_has_call(&target) {
+            return self.mark_receiver(target, pos);
+        }
+        // §5.1: only an lvalue may be referenced. `check` reports this too, but
+        // the message is more useful with the token in hand.
+        if !target.is_lvalue() {
+            return self.err("`&` takes a variable, a dict key or a list element", target.pos());
+        }
+        Ok(Expr::Ref { target: Box::new(target), pos })
+    }
+
+    /// Push the `&` down the postfix chain to the receiver of the innermost
+    /// call, which is the one that will be handed it.
+    fn mark_receiver(&mut self, target: Expr, pos: Pos) -> Result<Expr> {
+        match target {
+            Expr::Call { callee, args, pos: call_pos } => {
+                if spine_has_call(&callee) {
+                    let callee = Box::new(self.mark_receiver(*callee, pos)?);
+                    return Ok(Expr::Call { callee, args, pos: call_pos });
+                }
+                match *callee {
+                    // The dot is what passes the receiver, so the dot is what
+                    // the `&` reaches (§5.2).
+                    Expr::Key { obj, key, pos: key_pos } => {
+                        let obj = Box::new(self.reference(*obj, pos)?);
+                        Ok(Expr::Call {
+                            callee: Box::new(Expr::Key { obj, key, pos: key_pos }),
+                            args,
+                            pos: call_pos,
+                        })
+                    }
+                    other => self.err(
+                        "`&` marks a value a call is handed, and this call has no receiver \
+                         to mark: write it as an argument, `f(&x)`",
+                        other.pos(),
+                    ),
+                }
+            }
+            Expr::Key { obj, key, pos: key_pos } => {
+                let obj = Box::new(self.mark_receiver(*obj, pos)?);
+                Ok(Expr::Key { obj, key, pos: key_pos })
+            }
+            Expr::Index { obj, index, pos: index_pos } => {
+                let obj = Box::new(self.mark_receiver(*obj, pos)?);
+                Ok(Expr::Index { obj, index, pos: index_pos })
+            }
+            other => self.err("`&` takes a variable, a dict key or a list element", other.pos()),
+        }
     }
 
     fn parse_postfix(&mut self) -> Result<Expr> {
