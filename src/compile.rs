@@ -93,6 +93,10 @@ pub enum Instr {
     /// Call by name: every function bound to that name is a candidate, and the
     /// first that accepts the argument count and names is the one (§3).
     CallName { name: Arc<str>, positional: usize, names: Arc<Vec<Arc<str>>> },
+    /// `receiver.name(…)`. The field wins where the receiver has one of that
+    /// name holding something callable; otherwise the call is `name(receiver, …)`
+    /// — the receiver becomes the first argument (§5.2).
+    CallMethod { name: Arc<str>, positional: usize, names: Arc<Vec<Arc<str>>> },
     /// Return `n` values, the first of which is the meaningful one and the rest
     /// additional information (channels §6.2).
     Return(usize),
@@ -674,6 +678,25 @@ impl Compiler {
                         }
                         self.emit(
                             Instr::CallName { name: Arc::from(name.as_str()), positional, names },
+                            *pos,
+                        );
+                    }
+                    // `x.f(…)`: a field call, or a free function with `x` as its
+                    // first argument (§5.2). Which one is a runtime question —
+                    // it depends on what the receiver holds — so the whole
+                    // decision goes into one instruction. A quoted key is not a
+                    // function name, so it stays an ordinary field call.
+                    Expr::Key { obj, key, .. } if key.is_static() && !key.quoted => {
+                        self.expr(obj)?;
+                        for arg in args {
+                            self.expr(&arg.value)?;
+                        }
+                        self.emit(
+                            Instr::CallMethod {
+                                name: Arc::from(key.name.as_str()),
+                                positional,
+                                names,
+                            },
                             *pos,
                         );
                     }

@@ -623,6 +623,50 @@ impl Vm {
                 };
                 return self.enter(task, callee, bound);
             }
+            Instr::CallMethod { name, positional, names } => {
+                let mut args = take_args(task, *positional, names);
+                let receiver = task.pop();
+                // A field of that name wins, but only if it holds something
+                // callable: a number named `count` is not what `x.count()`
+                // meant (§5.2).
+                // Only a dict has fields, and asking a number for one is not
+                // an error here — it is the question that decides which call
+                // this is.
+                let field = match deref(&receiver)? {
+                    Value::Dict(_) => match member_opt(&receiver, &Value::Sym(sym(name)))? {
+                        Some(value) if param_specs(&value).is_some() => Some(value),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(callee) = field {
+                    let Some(bound) = bind_args(&callee, &args) else {
+                        return Err(rejected(Some(name), &[callee], &args));
+                    };
+                    return self.enter(task, callee, bound);
+                }
+
+                // Otherwise the receiver is the first argument, and the rest of
+                // the call resolves exactly as a written-out one does (§3).
+                args.positional.insert(0, receiver);
+                let candidates = self.candidates(task, name)?;
+                if candidates.is_empty() {
+                    return Err(Crash::new(format!(
+                        "no field `.{name}` and no function `{name}`: \
+                         `x.{name}(…)` is either"
+                    )));
+                }
+                let take = |variadic: bool| {
+                    candidates
+                        .iter()
+                        .filter(|c| is_variadic(c) == variadic)
+                        .find_map(|c| bind_args(c, &args).map(|bound| (c.clone(), bound)))
+                };
+                let Some((callee, bound)) = take(false).or_else(|| take(true)) else {
+                    return Err(rejected(Some(name), &candidates, &args));
+                };
+                return self.enter(task, callee, bound);
+            }
             Instr::Return(count) => {
                 let at = task.stack.len() - count;
                 let values: Vec<Value> = task.stack.split_off(at);

@@ -421,3 +421,22 @@ fn naming_more_values_than_a_call_answers_with() {
     // Only a call answers with several values: a multi-value is not a value.
     assert_eq!(codes("a, b := 1 + 2\n"), vec!["multi-value-not-a-call"]);
 }
+
+// --- calling through a dot (spec §5.2) --------------------------------------
+
+#[test]
+fn a_missing_field_is_not_a_missing_key_when_it_is_a_call() {
+    // `x.f(…)` is a field call *or* a free function with `x` as its first
+    // argument, so only a bare read demands the key exists.
+    assert_eq!(codes("d := { .a : 1 }\nx := d.len()\n"), Vec::<&str>::new());
+    assert_eq!(codes("d := { .a : 1 }\nx := d.len\n"), vec!["missing-key"]);
+}
+
+#[test]
+fn a_receiver_that_provably_has_no_field_settles_the_call() {
+    // Then the ordinary rules apply to the free function it must be.
+    assert_eq!(codes("n := \"abc\".len(1, 2)\n"), vec!["no-matching-call"]);
+    // A receiver is marked where it is written, in front of the dot.
+    assert_eq!(codes("rows := []\nrows.push(7)\n"), vec!["missing-reference"]);
+    assert_eq!(codes("rows := []\nn := (&rows).push(7)\n"), Vec::<&str>::new());
+}

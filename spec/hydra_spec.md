@@ -435,6 +435,49 @@ the evaluator, not two.
 caught, the stdlib must provide `has(d, .k)` and probably `get(d, .k, default)`.
 Any program touching decoded JSON needs them on the first line.
 
+### 5.2 Calling through a dot
+
+**[D]** `x.f(…)` is **two calls in one syntax**, and the receiver decides which:
+
+1. If `x` has a field `f` **holding something callable**, that is the call, and
+   the receiver is not passed — a closure in a dict is called with exactly the
+   arguments written.
+2. Otherwise the call is `f(x, …)`: the receiver becomes the **first
+   argument**, and `f` resolves like any other name — scope chain, then
+   imports, then builtins, first candidate that accepts it (§3).
+
+```hydra
+"hello".len()          // len("hello")   -> 5
+config.get(.port, 80)  // get(config, .port, 80)
+obj.greet("eu")        // the field, when `.greet` holds a closure
+```
+
+**[D]** *Callable* is the whole test for step 1. A field named `count` holding a
+number is not what `x.count()` meant, so it falls through to the function. This
+is deliberate: it means adding a data field to a dict can never quietly capture
+a call that used to reach a function, unless the field holds a function too.
+
+**[D]** Only an **unquoted, non-interpolated** key is a function name.
+`d."x-y"(…)` and `d[k](…)` are ordinary field calls and crash when the field is
+missing, as they always did.
+
+**[D]** A **bare `x.f` is still an ordinary key read**, and still crashes when
+the key is missing. Nothing is bound or partially applied by writing the dot
+without a call.
+
+**[D]** The receiver is passed **exactly as written**, which is what keeps §5.1
+intact: `&` still marks shared mutable state at the site that writes it. A
+parameter that requires a reference therefore requires one here too —
+`rows.push(x)` is the same error as `push(rows, x)`, and the ways to write it
+are `(&rows).push(x)` and `push(&rows, x)`. Nothing is auto-referenced, because
+"the caller marks it, never the callee" is the rule the visibility of shared
+state rests on.
+
+**[D]** `check` reports what is guaranteed: when the receiver **provably** has
+no such field — a literal that is not a dict, or a dict whose keys are known —
+the call is certainly the free one, so its shape and its missing `&` are checked
+against the function.
+
 ---
 
 ## 6. Scope and binding

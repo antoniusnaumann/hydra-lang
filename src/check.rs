@@ -162,6 +162,10 @@ struct Binding {
     /// Set when the name is bound to a dict literal and never written to, so
     /// its key set is exactly known.
     keys: Option<Vec<String>>,
+    /// Set when the name is bound to something that is not a dict at all and
+    /// never written to, so it certainly has no fields — which is what settles
+    /// `x.f(…)` as a free call (§5.2).
+    fieldless: bool,
 }
 
 /// A lexical scope while checking.
@@ -234,6 +238,9 @@ struct Checker<'a> {
     /// before the program runs, which is what lets a channel index that cannot
     /// exist be an error rather than a crash (channels §6.7).
     trail_shape: Option<(usize, usize)>,
+    /// True while checking the free call that `x.f(…)` turned out to be, so a
+    /// diagnostic about its first argument can say it is the receiver (§5.2).
+    receiver_call: bool,
     /// Names ever written to or `&`-referenced anywhere in the file. Coarse on
     /// purpose: it only ever *suppresses* diagnostics.
     mutated: HashSet<String>,
@@ -263,6 +270,7 @@ impl<'a> Checker<'a> {
             trail_depth: 0,
             race_depth: 0,
             trail_shape: None,
+            receiver_call: false,
             mutated: HashSet::new(),
             overloaded: HashSet::new(),
             read: HashSet::new(),
@@ -439,7 +447,7 @@ impl<'a> Checker<'a> {
             match stmt {
                 Stmt::FnDecl { name, def, pos } => self.declare(
                     name,
-                    Binding { pos: *pos, arity: Some(Signature::of(def, name)), keys: None },
+                    Binding { pos: *pos, arity: Some(Signature::of(def, name)), ..Binding::default() },
                 ),
                 Stmt::Decl { names, value, pos } => {
                     for (i, name) in names.iter().enumerate() {
@@ -447,7 +455,7 @@ impl<'a> Checker<'a> {
                         // are additional information (channels §6.2).
                         let binding = match i {
                             0 => self.binding_for(name, value, *pos),
-                            _ => Binding { pos: *pos, arity: None, keys: None },
+                            _ => Binding { pos: *pos, ..Binding::default() },
                         };
                         self.declare(name, binding);
                     }
@@ -458,7 +466,7 @@ impl<'a> Checker<'a> {
     }
 
     fn binding_for(&self, name: &str, value: &Expr, pos: Pos) -> Binding {
-        let mut binding = Binding { pos, arity: None, keys: None };
+        let mut binding = Binding { pos, ..Binding::default() };
         if self.mutated.contains(name) {
             return binding;
         }
@@ -466,6 +474,9 @@ impl<'a> Checker<'a> {
             Expr::Closure(def) => binding.arity = Some(Signature::of(def, name)),
             Expr::Dict { entries, .. } if entries.iter().all(|(k, _)| k.is_static()) => {
                 binding.keys = Some(entries.iter().map(|(k, _)| k.name.clone()).collect())
+            }
+            Expr::List { .. } | Expr::Str { .. } | Expr::Num { .. } | Expr::Sym(_) => {
+                binding.fieldless = true
             }
             _ => {}
         }
@@ -493,7 +504,7 @@ impl<'a> Checker<'a> {
             Stmt::FnDecl { name, def, pos } => {
                 self.declare(
                     name,
-                    Binding { pos: *pos, arity: Some(Signature::of(def, name)), keys: None },
+                    Binding { pos: *pos, arity: Some(Signature::of(def, name)), ..Binding::default() },
                 );
                 self.closure(def);
             }
@@ -503,7 +514,7 @@ impl<'a> Checker<'a> {
                 for (i, name) in names.iter().enumerate() {
                     let binding = match i {
                         0 => self.binding_for(name, value, *pos),
-                        _ => Binding { pos: *pos, arity: None, keys: None },
+                        _ => Binding { pos: *pos, ..Binding::default() },
                     };
                     self.declare(name, binding);
                 }
@@ -581,7 +592,7 @@ impl<'a> Checker<'a> {
                 self.expr(iterable);
                 self.labels.push(Label { name: label.clone(), kind: LabelKind::Loop });
                 self.push_scope();
-                self.declare(var, Binding { pos: *pos, arity: None, keys: None });
+                self.declare(var, Binding { pos: *pos, ..Binding::default() });
                 self.hoist(body);
                 self.stmts(body);
                 self.pop_scope();
@@ -605,7 +616,7 @@ impl<'a> Checker<'a> {
             Stmt::ParallelFor { kind, var, iterable, body, label, pos, .. } => {
                 self.expr(iterable);
                 self.push_scope();
-                self.declare(var, Binding { pos: *pos, arity: None, keys: None });
+                self.declare(var, Binding { pos: *pos, ..Binding::default() });
                 self.labels.push(Label { name: label.clone(), kind: LabelKind::Trail });
                 self.trail_depth += 1;
                 if *kind == BlockKind::Race {
@@ -851,7 +862,13 @@ impl<'a> Checker<'a> {
                 }
             }
             Expr::Call { callee, args, pos } => {
-                self.expr(callee);
+                // `x.f(…)` is a field call *or* a free function with `x` as its
+                // first argument (§5.2), so a missing field is not a missing
+                // key here — only the receiver is an ordinary read.
+                match callee.as_ref() {
+                    Expr::Key { obj, key, .. } if key.is_static() && !key.quoted => self.expr(obj),
+                    other => self.expr(other),
+                }
                 for arg in args {
                     self.expr(&arg.value);
                 }
@@ -1030,7 +1047,7 @@ impl<'a> Checker<'a> {
             if let Some(default) = &param.default {
                 self.expr(default);
             }
-            self.declare(&param.name, Binding { pos: param.pos, arity: None, keys: None });
+            self.declare(&param.name, Binding { pos: param.pos, ..Binding::default() });
         }
         match &def.body {
             ClosureBody::Expr(expr) => self.expr(expr),
@@ -1084,6 +1101,30 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Whether the receiver of `x.f(…)` certainly has no field `f`, which is
+    /// what makes the call certainly a free one (§5.2).
+    fn provably_fieldless(&self, obj: &Expr, key: &str) -> bool {
+        let keys = match obj {
+            // Only a dict has fields at all.
+            Expr::Str { .. } | Expr::Num { .. } | Expr::List { .. } | Expr::Sym(_) => return true,
+            Expr::Dict { entries, .. } if entries.iter().all(|(k, _)| k.is_static()) => {
+                entries.iter().map(|(k, _)| k.name.clone()).collect()
+            }
+            Expr::Name { name, .. } => {
+                let Some(binding) = self.lookup(name) else { return false };
+                if binding.fieldless {
+                    return true;
+                }
+                match binding.keys.clone() {
+                    Some(keys) => keys,
+                    None => return false,
+                }
+            }
+            _ => return false,
+        };
+        !keys.iter().any(|k| k == key)
+    }
+
     /// A key read on a dict literal that provably lacks the key (§11).
     fn check_known_key(&mut self, obj: &Expr, key: &str, pos: Pos) {
         let keys: Option<Vec<String>> = match obj {
@@ -1112,6 +1153,21 @@ impl<'a> Checker<'a> {
     /// A call nothing accepts, and a missing `&` on the one that does
     /// (§11, §5.1, §3).
     fn check_call(&mut self, callee: &Expr, args: &[Arg], pos: Pos) {
+        // A receiver that provably has no field of that name settles which call
+        // `x.f(…)` is: the free function, with the receiver as its first
+        // argument. Then the ordinary rules apply to it, including the missing
+        // `&` on a parameter that needs one (§5.2, §11).
+        if let Expr::Key { obj, key, .. } = callee {
+            if key.is_static() && !key.quoted && self.provably_fieldless(obj, &key.name) {
+                let mut with_receiver = vec![Arg::positional((**obj).clone())];
+                with_receiver.extend(args.iter().cloned());
+                let name = Expr::Name { name: key.name.clone(), pos };
+                let outer = std::mem::replace(&mut self.receiver_call, true);
+                self.check_call(&name, &with_receiver, pos);
+                self.receiver_call = outer;
+            }
+            return;
+        }
         match callee {
             Expr::Name { name, .. } => self.channel_call(name, args, pos),
             Expr::Namespace { module, name, .. } if module.is_empty() => {
@@ -1184,12 +1240,19 @@ impl<'a> Checker<'a> {
             if signature.by_ref.get(index) == Some(&true)
                 && !matches!(arg.value, Expr::Ref { .. })
             {
+                let param = signature.names.get(index).cloned().unwrap_or_default();
+                // A receiver is marked where it is written, which is in front
+                // of the dot (§5.2).
+                let how = if self.receiver_call && index == 0 {
+                    format!("write `(&…).{name}(…)` or `{name}(&…, …)`")
+                } else {
+                    "write `&` before it".to_string()
+                };
                 self.error(
                     format!(
-                        "`{}` takes `{}` by reference; write `&` before it, \
+                        "`{}` takes `{param}` by reference; {how}, \
                          or it is handed a copy",
-                        signature.label,
-                        signature.names.get(index).cloned().unwrap_or_default()
+                        signature.label
                     ),
                     arg.pos,
                     "missing-reference",

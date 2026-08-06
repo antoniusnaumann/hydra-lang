@@ -153,6 +153,22 @@ A missing `&` is *not* a rejection: it is reported against the candidate that
 accepted the call, because it is a mistake to fix rather than a reason to
 quietly run something else.
 
+**Calling through a dot.** `x.f(…)` is two calls in one syntax, and the
+receiver decides which: a field named `f` **holding something callable** is the
+call, and otherwise it is `f(x, …)` with the receiver as the first argument.
+
+```hydra
+"hello".len()          // len("hello")
+config.get(.port, 80)  // get(config, .port, 80)
+obj.greet("eu")        // the field, when `.greet` holds a closure
+```
+
+Callable is the whole test, so adding a data field can never quietly capture a
+call that used to reach a function. A bare `x.f` is still an ordinary key read.
+And the receiver is passed exactly as written, which is what keeps `&` meaning
+what it means: `rows.push(x)` is the same error as `push(rows, x)`, spelled
+`(&rows).push(x)` or `push(&rows, x)`. Nothing is auto-referenced.
+
 **A concrete arity beats a variadic.** A `*` parameter accepts everything
 positional, so a variadic candidate is tried only after every candidate that
 takes the call exactly — otherwise a variadic shadow would swallow the narrower
