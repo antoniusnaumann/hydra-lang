@@ -169,6 +169,13 @@ unqualified lookup always matches source order, even for transitive imports.
 Unqualified lookup is scope chain, then imports, then builtins. `::push` names
 the builtin whatever else has taken it.
 
+A qualified call resolves among *that module's* candidates and falls through to
+nothing else, so a module can offer `read(path)` and `read(path, fallback)`
+under one name.
+
+`fs` is a **built-in module** (`spec/hydra_fs.md`): no file to find, and a file
+named `fs.hy` shadows it, which `check` warns about.
+
 ---
 
 ## Concurrency

@@ -97,6 +97,11 @@ pub enum Instr {
     /// name holding something callable; otherwise the call is `name(receiver, …)`
     /// — the receiver becomes the first argument (§5.2).
     CallMethod { name: Arc<str>, positional: usize, names: Arc<Vec<Arc<str>>> },
+    /// `mod::name(…)`, and `x.mod::name(…)` with the receiver already first
+    /// among the arguments. A qualified call falls through to nothing, but the
+    /// module may have several candidates under the name, and resolution by
+    /// shape picks between them (§7).
+    CallNs { module: Arc<str>, name: Arc<str>, positional: usize, names: Arc<Vec<Arc<str>>> },
     /// Return `n` values, the first of which is the meaningful one and the rest
     /// additional information (channels §6.2).
     Return(usize),
@@ -715,17 +720,34 @@ impl Compiler {
                     }
                     // `x.mod::f(…)` is exactly `mod::f(x, …)`: a field cannot be
                     // namespaced, so there is nothing to decide (§7).
-                    Expr::Method { obj, module: Some(module), name, pos: name_pos } => {
-                        self.expr(&Expr::Namespace {
-                            module: module.clone(),
-                            name: name.clone(),
-                            pos: *name_pos,
-                        })?;
+                    Expr::Method { obj, module: Some(module), name, .. } => {
                         self.expr(obj)?;
                         for arg in args {
                             self.expr(&arg.value)?;
                         }
-                        self.emit(Instr::Call { positional: positional + 1, names }, *pos);
+                        self.emit(
+                            Instr::CallNs {
+                                module: Arc::from(module.as_str()),
+                                name: Arc::from(name.as_str()),
+                                positional: positional + 1,
+                                names,
+                            },
+                            *pos,
+                        );
+                    }
+                    Expr::Namespace { module, name, .. } => {
+                        for arg in args {
+                            self.expr(&arg.value)?;
+                        }
+                        self.emit(
+                            Instr::CallNs {
+                                module: Arc::from(module.as_str()),
+                                name: Arc::from(name.as_str()),
+                                positional,
+                                names,
+                            },
+                            *pos,
+                        );
                     }
                     _ => {
                         self.expr(callee)?;

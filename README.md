@@ -198,6 +198,35 @@ positional, so a variadic candidate is tried only after every candidate that
 takes the call exactly — otherwise a variadic shadow would swallow the narrower
 functions behind it.
 
+## The `fs` module
+
+The filesystem, specified in [`spec/hydra_fs.md`](spec/hydra_fs.md) and
+demonstrated by [`examples/files.hy`](examples/files.hy). It is **built in**:
+there is no file to find, `use fs` brings it in for qualified calling, and a
+file named `fs.hy` beside the program shadows it — which `check` warns about.
+
+```hydra
+use fs
+
+note, bytes := fs::write(fs::join(fs::temp(), "notes", "first.txt"), "one\n")
+text := fs::read(note)
+missing, why := fs::read("gone.txt", "(nothing)")   // .not_found
+
+for entry in fs::list("src", match = "*.hy", recursive = .true)
+	print("\(entry.fs::name()) is \(entry.fs::size()) bytes")
+end
+```
+
+Three rules and nothing else to remember: **defaults absorb the ordinary
+failures** (writing makes the parents it needs, making a directory that exists
+is fine, removing what is not there answers `.false`), **anything left crashes**,
+and **a reader opts out with a `fallback`** and then says why it had to.
+
+That last one is two overloads rather than a sentinel — `read(path)` crashes and
+`read(path, fallback)` does not — so no value is spent marking "no fallback
+given" and every value is still a legal fallback. Every flag is keyword-only,
+which is what keeps the two apart.
+
 ## Auto-channels
 
 Trails hand values to their siblings with no channel declared anywhere: the

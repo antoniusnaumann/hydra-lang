@@ -26,10 +26,17 @@ Three language features came out of their signatures, all now in the handoff:
 
 **Still open:**
 
-- Everything else §14 leans on: `read_file`, `lease`, `wait_ready`, `healthy`,
-  `drain`, `smoke`, `live`, `rollback`, `json::decode`. `--extern` still exists
-  for those.
-- String helpers, any I/O, and whether there is an `eprint`.
+- ~~Any I/O.~~ **Resolved:** `fs` is a **built-in module**
+  (`spec/hydra_fs.md`), so `read_file` is `fs::read` and the interpreter and
+  `check` know it without a file. Two language rules came out of it: a
+  qualified call resolves among the module's own candidates, which is what lets
+  a reader be `read(path)` *and* `read(path, fallback)` rather than one with a
+  sentinel; and `use` falls back to the built-in modules, so a file named
+  `fs.hy` shadows one — legal, discouraged, and warned about (§7).
+- Everything else §14 leans on: `lease`, `wait_ready`, `healthy`, `drain`,
+  `smoke`, `live`, `rollback`, `json::decode`. `--extern` still exists for
+  those.
+- String helpers, and whether there is an `eprint`.
 - `print`'s second parameter is `terminator`, not `end`: `end` closes every
   block, so it can never be a name. Swift's `print(_:terminator:)` is the
   precedent, and the parser now says exactly why if you try `end`.

@@ -565,8 +565,8 @@ module name and a lean function name compose:
 
 ```hydra
 use fs
-text := path.fs::read(fallback = "")   // fs::read(path, fallback = "")
-n := &rows.fs::push(1)                 // fs::push(&rows, 1)
+text := path.fs::read("")     // fs::read(path, "")
+n := &box.counter::bump(1)    // counter::bump(&box, 1)
 ```
 
 `x.mod::f(…)` is exactly `mod::f(x, …)`. There is nothing for the receiver to
@@ -582,7 +582,22 @@ is how the builtin is still reached. `check` warns at the `use` that does it,
 because a silently shadowed name still returns *something*.
 
 **[D]** `::name` is not a variable: it can be called and passed around, but
-never assigned to or referenced with `&`.
+never assigned to or referenced with `&`. Neither is a builtin module's name:
+`fs::read` can be called, but there is no cell behind it to pass around.
+
+**[D] A qualified call resolves among the module's own candidates.** It falls
+through to nothing — never to another module's function, nor to a builtin — but
+a module may have more than one function under a name, and resolution by shape
+(§3) picks between them:
+
+```hydra
+use fs
+fs::read("a.txt")      // read(path)
+fs::read("a.txt", "")  // read(path, fallback)
+```
+
+That is what lets a module offer a crashing reader and a falling-back one under
+one name (`spec/hydra_fs.md` §1) rather than spending a value on a sentinel.
 
 **[D]** Resolution order for `use fmt`: same directory, then a path list from an
 environment variable, then the **built-in modules**. Circular imports resolve to

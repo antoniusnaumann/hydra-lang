@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use crate::ast::*;
 use crate::errors::{Diagnostic, Pos, Report, Site};
 use crate::lexer::{is_private, Tok};
-use crate::value::{Native, CHANNEL_NATIVES};
+use crate::value::{Native, BUILTIN_MODULES, CHANNEL_NATIVES};
 use crate::parser::parse;
 
 #[derive(Clone, Debug, Default)]
@@ -86,8 +86,7 @@ impl Signature {
             required: native.required(),
             total: native.total(),
             variadic: native.variadic(),
-            // `receive` answers with the value and the trail that sent it.
-            returns: if native == Native::Receive { 2 } else { 1 },
+            returns: native.returns(),
             by_ref: native.by_ref().to_vec(),
             names: native.param_names().iter().map(|n| n.to_string()).collect(),
             label: native.signature().to_string(),
@@ -194,7 +193,10 @@ struct Label {
 }
 
 struct ModuleInfo {
-    exports: HashMap<String, Option<Signature>>,
+    /// A name's candidates. Empty where the module exports the name but not as
+    /// a knowable function; more than one where it offers overloads, as `fs`
+    /// does for every reader (fs §1).
+    exports: HashMap<String, Vec<Signature>>,
 }
 
 pub fn check_program(program: &Program, options: &CheckOptions) -> Report {
@@ -336,7 +338,47 @@ impl<'a> Checker<'a> {
         let mut uses: Vec<(String, String, bool, Pos)> = Vec::new();
         collect_uses(body, &mut uses);
         for (name, qualifier, unqualified, pos) in uses {
-            let Some(path) = self.resolve_module(&name) else {
+            // A file of that name shadows a builtin module, which is why naming
+            // one after `fs` is discouraged (§7).
+            let known_builtin = BUILTIN_MODULES.contains(&name.as_str());
+            let path = self.resolve_module(&name);
+            if path.is_some() && known_builtin {
+                self.warn(
+                    format!(
+                        "`{name}.hy` shadows the builtin module `{name}`, which is \
+                         reachable nowhere else once it does"
+                    ),
+                    pos,
+                    "shadowed-builtin-module",
+                );
+            }
+            if path.is_none() && known_builtin {
+                let mut exports: HashMap<String, Vec<Signature>> = HashMap::new();
+                for export in Native::module_names(&name) {
+                    exports.insert(
+                        export.to_string(),
+                        Native::in_module(&name, export)
+                            .into_iter()
+                            .map(Signature::native)
+                            .collect(),
+                    );
+                }
+                if unqualified {
+                    for (export, candidates) in &exports {
+                        // With more than one candidate nothing about the call
+                        // is guaranteed, which is §11's rule (§3).
+                        let only = match candidates.as_slice() {
+                            [one] => Some(one.clone()),
+                            _ => None,
+                        };
+                        self.imports.insert(export.clone(), (name.clone(), only));
+                    }
+                    self.modules.insert(name.clone(), ModuleInfo { exports: exports.clone() });
+                }
+                self.modules.insert(qualifier.clone(), ModuleInfo { exports });
+                continue;
+            }
+            let Some(path) = path else {
                 self.names_are_knowable = false;
                 self.warn(
                     format!(
@@ -402,8 +444,12 @@ impl<'a> Checker<'a> {
                     "shadowed-builtin",
                 );
             }
-            for (export, arity) in &exports {
-                self.imports.insert(export.clone(), (name.clone(), arity.clone()));
+            for (export, candidates) in &exports {
+                let only = match candidates.as_slice() {
+                    [one] => Some(one.clone()),
+                    _ => None,
+                };
+                self.imports.insert(export.clone(), (name.clone(), only));
             }
             // A star import keeps the module's own name as a qualifier, so a
             // collision still has a way to say which one is meant.
@@ -932,7 +978,7 @@ impl<'a> Checker<'a> {
         if named < 2 {
             return;
         }
-        let Expr::Call { callee, .. } = value else {
+        let Expr::Call { callee, args, .. } = value else {
             self.error(
                 "only a call answers with several values, and a multi-value is not a value",
                 pos,
@@ -940,7 +986,7 @@ impl<'a> Checker<'a> {
             );
             return;
         };
-        let Some(signature) = self.callee_signature(callee) else { return };
+        let Some(signature) = self.callee_signature(callee, args) else { return };
         if named > signature.returns {
             self.error(
                 format!(
@@ -956,7 +1002,9 @@ impl<'a> Checker<'a> {
     }
 
     /// The signature behind a callee, where exactly one candidate is knowable.
-    fn callee_signature(&self, callee: &Expr) -> Option<Signature> {
+    /// A module with several under one name still settles on the one this call
+    /// binds, because a qualified call falls through to nothing else (§7).
+    fn callee_signature(&self, callee: &Expr, args: &[Arg]) -> Option<Signature> {
         match callee {
             Expr::Name { name, .. } => {
                 if self.mutated.contains(name) || self.overloaded.contains(name) {
@@ -980,7 +1028,13 @@ impl<'a> Checker<'a> {
                 Native::lookup(name).map(Signature::native)
             }
             Expr::Namespace { module, name, .. } => {
-                self.modules.get(module).and_then(|m| m.exports.get(name).cloned()).flatten()
+                let candidates = self.modules.get(module)?.exports.get(name)?;
+                match candidates.as_slice() {
+                    [one] => Some(one.clone()),
+                    // A qualified call falls through to nothing else, so the
+                    // one this call binds is the one it means (§7).
+                    many => many.iter().find(|c| c.bind(args).is_some()).cloned(),
+                }
             }
             _ => None,
         }
@@ -1222,12 +1276,37 @@ impl<'a> Checker<'a> {
                 (format!("::{name}"), Native::lookup(name).map(Signature::native))
             }
             Expr::Namespace { module, name, .. } => {
-                let signature = self
-                    .modules
-                    .get(module)
-                    .and_then(|m| m.exports.get(name).cloned())
-                    .flatten();
-                (format!("{module}::{name}"), signature)
+                let written = format!("{module}::{name}");
+                let candidates =
+                    self.modules.get(module).and_then(|m| m.exports.get(name)).cloned();
+                match candidates.as_deref() {
+                    // A qualified call falls through to nothing, so a module
+                    // with several candidates under one name is still exactly
+                    // knowable: the call is wrong only if *none* accepts (§7).
+                    Some([]) | None => (written, None),
+                    Some([one]) => (written, Some(one.clone())),
+                    Some(many) => {
+                        if !many.iter().any(|candidate| candidate.bind(args).is_some()) {
+                            let labels: Vec<String> =
+                                many.iter().map(|c| format!("`{}`", c.label)).collect();
+                            self.error(
+                                format!(
+                                    "`{written}` does not accept this call: it is {}",
+                                    labels.join(" or ")
+                                ),
+                                pos,
+                                "no-matching-call",
+                            );
+                            return;
+                        }
+                        // The one that accepts is the one whose `&` matters.
+                        let chosen = many
+                            .iter()
+                            .find(|candidate| candidate.bind(args).is_some())
+                            .expect("one accepted just above");
+                        (written, Some(chosen.clone()))
+                    }
+                }
             }
             _ => return,
         };
@@ -1333,25 +1412,26 @@ fn collect_uses(body: &[Stmt], out: &mut Vec<(String, String, bool, Pos)>) {
 }
 
 /// A module's public toplevel names, with arities where they are functions.
-fn module_exports(path: &Path) -> Option<HashMap<String, Option<Signature>>> {
+fn module_exports(path: &Path) -> Option<HashMap<String, Vec<Signature>>> {
     let src = std::fs::read_to_string(path).ok()?;
     let program = parse(&src, &path.display().to_string()).ok()?;
-    let mut exports: HashMap<String, Option<Signature>> = HashMap::new();
+    let mut exports: HashMap<String, Vec<Signature>> = HashMap::new();
     for stmt in &program.body {
         match stmt {
             Stmt::FnDecl { name, def, .. } if !is_private(name) => {
-                exports.insert(name.clone(), Some(Signature::of(def, name)));
+                exports.entry(name.clone()).or_default().push(Signature::of(def, name));
             }
             Stmt::Decl { names, value, .. } => {
                 for (i, name) in names.iter().enumerate() {
                     if is_private(name) {
                         continue;
                     }
-                    let signature = match (i, value) {
-                        (0, Expr::Closure(def)) => Some(Signature::of(def, name)),
-                        _ => None,
-                    };
-                    exports.insert(name.clone(), signature);
+                    let slot = exports.entry(name.clone()).or_default();
+                    match (i, value) {
+                        (0, Expr::Closure(def)) => slot.push(Signature::of(def, name)),
+                        // Exported, but nothing is known about calling it.
+                        _ => slot.clear(),
+                    }
                 }
             }
             _ => {}

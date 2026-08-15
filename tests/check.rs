@@ -446,3 +446,36 @@ fn a_receiver_that_provably_has_no_field_settles_the_call() {
     assert_eq!(codes("rows := []\nn := &rows.push(7)\n"), Vec::<&str>::new());
     assert_eq!(codes("rows := []\nn := (&rows).push(7)\n"), Vec::<&str>::new());
 }
+
+// --- the fs module (spec/hydra_fs.md) ---------------------------------------
+
+#[test]
+fn a_builtin_module_is_known_without_a_file() {
+    assert_eq!(codes("use fs\nx := fs::name(\"a/b.txt\")\n"), Vec::<&str>::new());
+    // Qualified only, like any other module (§7).
+    assert_eq!(codes("use fs\nx := name(\"a/b.txt\")\n"), vec!["undeclared-name"]);
+    assert_eq!(codes("use fs as *\nx := name(\"a/b.txt\")\n"), Vec::<&str>::new());
+    assert_eq!(codes("use fs\nx := fs::nope(1)\n"), vec!["unknown-export"]);
+}
+
+#[test]
+fn a_qualified_call_is_checked_against_every_candidate() {
+    // A reader is two functions under one name, so the call is wrong only when
+    // neither accepts it (§7, fs §1).
+    assert_eq!(codes("use fs\nx := fs::read(\"a\")\n"), Vec::<&str>::new());
+    assert_eq!(codes("use fs\nx := fs::read(\"a\", \"\")\n"), Vec::<&str>::new());
+    assert_eq!(codes("use fs\nx := fs::read()\n"), vec!["no-matching-call"]);
+    assert_eq!(codes("use fs\nx := fs::read(1, 2, 3)\n"), vec!["no-matching-call"]);
+    // And through the dot, where the receiver is the first argument (§5.2).
+    assert_eq!(codes("use fs\nx := \"a\".fs::stem(1)\n"), vec!["no-matching-call"]);
+    assert_eq!(codes("use fs\nx := \"a\".fs::stem()\n"), Vec::<&str>::new());
+}
+
+#[test]
+fn a_reader_that_did_not_fall_back_answers_with_one_value() {
+    assert_eq!(codes("use fs\ntext, why := fs::read(\"a\", \"\")\n"), Vec::<&str>::new());
+    assert_eq!(
+        codes("use fs\ntext, why := fs::read(\"a\")\n"),
+        vec!["too-many-values-named"]
+    );
+}

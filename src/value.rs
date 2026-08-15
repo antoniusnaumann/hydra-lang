@@ -242,14 +242,43 @@ impl fmt::Debug for Closure {
     }
 }
 
+/// What one parameter of a builtin expects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PKind {
+    /// Must be supplied.
+    Plain,
+    /// Must be supplied, and the call must mark it with `&` (§5.1).
+    Ref,
+    /// Has a default, so it may be left out.
+    Default,
+    /// `name*`: collects the rest of the positional arguments.
+    Variadic,
+    /// The bare `*`: takes nothing, and closes the positional list.
+    Star,
+}
+
+/// One builtin, in one place. Everything the caller machinery needs — the
+/// module it belongs to, its parameters, and how it reads in a diagnostic.
+pub struct NativeInfo {
+    /// `None` for the flat builtins, which are looked up after the scope chain;
+    /// `Some("fs")` for one that only a `use fs` brings into reach (§7).
+    pub module: Option<&'static str>,
+    pub name: &'static str,
+    pub params: &'static [(&'static str, PKind)],
+    pub signature: &'static str,
+}
+
 /// The builtins: `alive()`, which is the language primitive of §9.5, the three
-/// channel calls of `spec/hydra_channels.md`, and the standard library of
-/// `spec/hydra_stdlib.md`.
+/// channel calls of `spec/hydra_channels.md`, the standard library of
+/// `spec/hydra_stdlib.md`, and the `fs` module of `spec/hydra_fs.md`.
 ///
-/// They are global names looked up *after* the scope chain, so a program can
-/// shadow one — they are not reserved words. The channel three are the
-/// exception in one respect only: `check` rejects them outside a `parallel` or
-/// `race` body, because they are lexically scoped to the block (channels §6.4).
+/// The flat ones are global names looked up *after* the scope chain, so a
+/// program can shadow one — they are not reserved words. A module's are
+/// reachable only through it: `fs::read`, or bare after `use fs as *`.
+///
+/// Two natives may share a name within a module, which is how a reader offers
+/// both `read(path)` and `read(path, fallback)`: resolution by shape picks
+/// between them exactly as it does for two functions a program declares (§3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Native {
     Alive,
@@ -261,7 +290,38 @@ pub enum Native {
     Send,
     Receive,
     Channel,
+
+    // --- fs (spec/hydra_fs.md) ---------------------------------------------
+    FsJoin,
+    FsParent,
+    FsName,
+    FsStem,
+    FsExtension,
+    FsAbsolute,
+    FsExists,
+    FsIsFile,
+    FsIsDir,
+    FsSize,
+    FsSizeOr,
+    FsModified,
+    FsModifiedOr,
+    FsRead,
+    FsReadOr,
+    FsLines,
+    FsLinesOr,
+    FsList,
+    FsListOr,
+    FsWrite,
+    FsCopy,
+    FsMove,
+    FsRemove,
+    FsMakeDir,
+    FsCwd,
+    FsHome,
+    FsTemp,
 }
+
+use PKind::{Default as Def, Plain, Ref, Star, Variadic};
 
 pub const NATIVES: &[Native] = &[
     Native::Alive,
@@ -273,99 +333,312 @@ pub const NATIVES: &[Native] = &[
     Native::Send,
     Native::Receive,
     Native::Channel,
+    Native::FsJoin,
+    Native::FsParent,
+    Native::FsName,
+    Native::FsStem,
+    Native::FsExtension,
+    Native::FsAbsolute,
+    Native::FsExists,
+    Native::FsIsFile,
+    Native::FsIsDir,
+    Native::FsSize,
+    Native::FsSizeOr,
+    Native::FsModified,
+    Native::FsModifiedOr,
+    Native::FsRead,
+    Native::FsReadOr,
+    Native::FsLines,
+    Native::FsLinesOr,
+    Native::FsList,
+    Native::FsListOr,
+    Native::FsWrite,
+    Native::FsCopy,
+    Native::FsMove,
+    Native::FsRemove,
+    Native::FsMakeDir,
+    Native::FsCwd,
+    Native::FsHome,
+    Native::FsTemp,
 ];
 
 /// The calls that only mean something inside a trail (channels §6.4).
 pub const CHANNEL_NATIVES: &[Native] = &[Native::Send, Native::Receive, Native::Channel];
 
+/// Modules the interpreter and `check` know without a file. A file of the same
+/// name shadows one, which is why that is discouraged (§7).
+pub const BUILTIN_MODULES: &[&str] = &["fs"];
+
 impl Native {
+    pub fn info(self) -> &'static NativeInfo {
+        macro_rules! info {
+            ($module:expr, $name:expr, $signature:expr, $params:expr) => {
+                &NativeInfo {
+                    module: $module,
+                    name: $name,
+                    params: $params,
+                    signature: $signature,
+                }
+            };
+        }
+        const FS: Option<&str> = Some("fs");
+        match self {
+            Native::Alive => info!(None, "alive", "alive()", &[]),
+            // Not `end`: that keyword closes every block, so it can never be a
+            // name. `terminator` follows Swift's print (hydra_stdlib.md §2).
+            Native::Print => info!(
+                None,
+                "print",
+                "print(value, terminator = \"\\n\")",
+                &[("value", Plain), ("terminator", Def)]
+            ),
+            Native::Has => {
+                info!(None, "has", "has(container, key)", &[("container", Plain), ("key", Plain)])
+            }
+            Native::Get => info!(
+                None,
+                "get",
+                "get(container, key, fallback)",
+                &[("container", Plain), ("key", Plain), ("fallback", Plain)]
+            ),
+            Native::Len => info!(None, "len", "len(value)", &[("value", Plain)]),
+            Native::Push => {
+                info!(None, "push", "push(&list, value)", &[("list", Ref), ("value", Plain)])
+            }
+            // `to` and `from` are the `*`, so `mode` can only be named.
+            Native::Send => info!(
+                None,
+                "send",
+                "send(value, to*, mode = .wait)",
+                &[("value", Plain), ("to", Variadic), ("mode", Def)]
+            ),
+            Native::Receive => info!(None, "receive", "receive(from*)", &[("from", Variadic)]),
+            Native::Channel => info!(None, "channel", "channel()", &[]),
+
+            // --- fs: paths ------------------------------------------------
+            Native::FsJoin => info!(
+                FS,
+                "join",
+                "join(base, parts*)",
+                &[("base", Plain), ("parts", Variadic)]
+            ),
+            Native::FsParent => info!(FS, "parent", "parent(path)", &[("path", Plain)]),
+            Native::FsName => info!(FS, "name", "name(path)", &[("path", Plain)]),
+            Native::FsStem => info!(FS, "stem", "stem(path)", &[("path", Plain)]),
+            Native::FsExtension => {
+                info!(FS, "extension", "extension(path)", &[("path", Plain)])
+            }
+            Native::FsAbsolute => info!(FS, "absolute", "absolute(path)", &[("path", Plain)]),
+
+            // --- fs: asking -----------------------------------------------
+            Native::FsExists => info!(FS, "exists", "exists(path)", &[("path", Plain)]),
+            Native::FsIsFile => info!(FS, "is_file", "is_file(path)", &[("path", Plain)]),
+            Native::FsIsDir => info!(FS, "is_dir", "is_dir(path)", &[("path", Plain)]),
+            Native::FsSize => info!(FS, "size", "size(path)", &[("path", Plain)]),
+            Native::FsSizeOr => info!(
+                FS,
+                "size",
+                "size(path, fallback)",
+                &[("path", Plain), ("fallback", Plain)]
+            ),
+            Native::FsModified => info!(FS, "modified", "modified(path)", &[("path", Plain)]),
+            Native::FsModifiedOr => info!(
+                FS,
+                "modified",
+                "modified(path, fallback)",
+                &[("path", Plain), ("fallback", Plain)]
+            ),
+
+            // --- fs: reading ----------------------------------------------
+            Native::FsRead => info!(FS, "read", "read(path)", &[("path", Plain)]),
+            Native::FsReadOr => info!(
+                FS,
+                "read",
+                "read(path, fallback)",
+                &[("path", Plain), ("fallback", Plain)]
+            ),
+            Native::FsLines => info!(FS, "lines", "lines(path)", &[("path", Plain)]),
+            Native::FsLinesOr => info!(
+                FS,
+                "lines",
+                "lines(path, fallback)",
+                &[("path", Plain), ("fallback", Plain)]
+            ),
+            // Every flag is keyword-only, which is also what keeps the two
+            // `list`s apart: a second positional can only be the fallback.
+            Native::FsList => info!(
+                FS,
+                "list",
+                "list(dir, *, match = \"*\", recursive = .false)",
+                &[("dir", Plain), ("", Star), ("match", Def), ("recursive", Def)]
+            ),
+            Native::FsListOr => info!(
+                FS,
+                "list",
+                "list(dir, fallback, *, match = \"*\", recursive = .false)",
+                &[
+                    ("dir", Plain),
+                    ("fallback", Plain),
+                    ("", Star),
+                    ("match", Def),
+                    ("recursive", Def)
+                ]
+            ),
+
+            // --- fs: writing ----------------------------------------------
+            Native::FsWrite => info!(
+                FS,
+                "write",
+                "write(path, text, *, mode = .replace, parents = .true)",
+                &[
+                    ("path", Plain),
+                    ("text", Plain),
+                    ("", Star),
+                    ("mode", Def),
+                    ("parents", Def)
+                ]
+            ),
+            Native::FsCopy => info!(
+                FS,
+                "copy",
+                "copy(source, target, *, overwrite = .true, parents = .true)",
+                &[
+                    ("source", Plain),
+                    ("target", Plain),
+                    ("", Star),
+                    ("overwrite", Def),
+                    ("parents", Def)
+                ]
+            ),
+            Native::FsMove => info!(
+                FS,
+                "move",
+                "move(source, target, *, overwrite = .false, parents = .true)",
+                &[
+                    ("source", Plain),
+                    ("target", Plain),
+                    ("", Star),
+                    ("overwrite", Def),
+                    ("parents", Def)
+                ]
+            ),
+            Native::FsRemove => info!(
+                FS,
+                "remove",
+                "remove(path, *, recursive = .false)",
+                &[("path", Plain), ("", Star), ("recursive", Def)]
+            ),
+            Native::FsMakeDir => info!(
+                FS,
+                "make_dir",
+                "make_dir(path, *, parents = .true)",
+                &[("path", Plain), ("", Star), ("parents", Def)]
+            ),
+
+            // --- fs: where the process is ---------------------------------
+            Native::FsCwd => info!(FS, "cwd", "cwd()", &[]),
+            Native::FsHome => info!(FS, "home", "home()", &[]),
+            Native::FsTemp => info!(FS, "temp", "temp()", &[]),
+        }
+    }
+
+    /// The flat builtins, which unqualified lookup falls back to (§7). A
+    /// module's are not among them.
     pub fn lookup(name: &str) -> Option<Native> {
-        NATIVES.iter().copied().find(|n| n.name() == name)
+        NATIVES.iter().copied().find(|n| {
+            let info = n.info();
+            info.module.is_none() && info.name == name
+        })
+    }
+
+    /// Every builtin a module has under that name — more than one where it
+    /// offers overloads, and in the order they are tried.
+    pub fn in_module(module: &str, name: &str) -> Vec<Native> {
+        NATIVES
+            .iter()
+            .copied()
+            .filter(|n| {
+                let info = n.info();
+                info.module == Some(module) && info.name == name
+            })
+            .collect()
+    }
+
+    /// Every name a builtin module exports, for `use fs as *` and for `check`.
+    pub fn module_names(module: &str) -> Vec<&'static str> {
+        let mut names: Vec<&'static str> = NATIVES
+            .iter()
+            .filter(|n| n.info().module == Some(module))
+            .map(|n| n.info().name)
+            .collect();
+        names.dedup();
+        names
     }
 
     pub fn name(self) -> &'static str {
-        match self {
-            Native::Alive => "alive",
-            Native::Print => "print",
-            Native::Has => "has",
-            Native::Get => "get",
-            Native::Len => "len",
-            Native::Push => "push",
-            Native::Send => "send",
-            Native::Receive => "receive",
-            Native::Channel => "channel",
-        }
+        self.info().name
+    }
+
+    pub fn module(self) -> Option<&'static str> {
+        self.info().module
+    }
+
+    /// Arguments that must be supplied.
+    pub fn required(self) -> usize {
+        self.info()
+            .params
+            .iter()
+            .filter(|(_, kind)| matches!(kind, PKind::Plain | PKind::Ref))
+            .count()
+    }
+
+    /// Arguments it accepts at most; the difference from [`Native::required`]
+    /// is the defaults.
+    pub fn total(self) -> usize {
+        self.info().params.len()
     }
 
     /// Which parameter is the `*`, if any: it collects what is left of the
     /// positional arguments, and everything after it is keyword-only
     /// (channels §6.1).
     pub fn variadic(self) -> Option<usize> {
-        match self {
-            Native::Send => Some(1),
-            Native::Receive => Some(0),
-            _ => None,
-        }
-    }
-
-    /// Arguments that must be supplied.
-    pub fn required(self) -> usize {
-        match self {
-            Native::Alive | Native::Channel | Native::Receive => 0,
-            Native::Len | Native::Print | Native::Send => 1,
-            Native::Has | Native::Push => 2,
-            Native::Get => 3,
-        }
-    }
-
-    /// Arguments it accepts at most; the difference from [`Native::required`]
-    /// is the defaults.
-    pub fn total(self) -> usize {
-        match self {
-            Native::Alive | Native::Channel => 0,
-            Native::Len | Native::Receive => 1,
-            Native::Print | Native::Has | Native::Push => 2,
-            Native::Get | Native::Send => 3,
-        }
+        self.info()
+            .params
+            .iter()
+            .position(|(_, kind)| matches!(kind, PKind::Variadic | PKind::Star))
     }
 
     /// Parameter names, so a call can name its arguments (§3).
-    pub fn param_names(self) -> &'static [&'static str] {
-        match self {
-            Native::Alive => &[],
-            // Not `end`: that keyword closes every block, so it can never be a
-            // name. `terminator` follows Swift's print (hydra_stdlib.md §2).
-            Native::Print => &["value", "terminator"],
-            Native::Has => &["container", "key"],
-            Native::Get => &["container", "key", "fallback"],
-            Native::Len => &["value"],
-            Native::Push => &["list", "value"],
-            // `to` and `from` are the `*`, so `mode` can only be named.
-            Native::Send => &["value", "to", "mode"],
-            Native::Receive => &["from"],
-            Native::Channel => &[],
-        }
+    pub fn param_names(self) -> Vec<&'static str> {
+        self.info().params.iter().map(|(name, _)| *name).collect()
     }
 
     /// Which parameters the call must mark with `&` (§5.1).
-    pub fn by_ref(self) -> &'static [bool] {
-        match self {
-            Native::Push => &[true, false],
-            _ => &[false, false, false],
-        }
+    pub fn by_ref(self) -> Vec<bool> {
+        self.info().params.iter().map(|(_, kind)| *kind == PKind::Ref).collect()
+    }
+
+    pub fn has_default(self, index: usize) -> bool {
+        matches!(self.info().params.get(index), Some((_, PKind::Default)))
     }
 
     pub fn signature(self) -> &'static str {
+        self.info().signature
+    }
+
+    /// How many values a call to it answers with. A reader that took a
+    /// fallback says why it fell back (fs §1), and `receive` says which trail
+    /// sent the value (channels §1).
+    pub fn returns(self) -> usize {
         match self {
-            Native::Alive => "alive()",
-            Native::Print => "print(value, terminator = \"\\n\")",
-            Native::Has => "has(container, key)",
-            Native::Get => "get(container, key, fallback)",
-            Native::Len => "len(value)",
-            Native::Push => "push(&list, value)",
-            Native::Send => "send(value, to*, mode = .wait)",
-            Native::Receive => "receive(from*)",
-            Native::Channel => "channel()",
+            Native::Receive
+            | Native::FsSizeOr
+            | Native::FsModifiedOr
+            | Native::FsReadOr
+            | Native::FsLinesOr
+            | Native::FsListOr
+            | Native::FsWrite => 2,
+            _ => 1,
         }
     }
 }

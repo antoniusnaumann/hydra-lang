@@ -32,7 +32,7 @@ use crate::sched::{
 use crate::value::{
     binary_op, boolean, copy_value, deref, get_member, member_opt, new_dict, new_list, path_segment,
     push_place, read_place, sym, to_text, unary_op, update_place, write_place, Cell, Closure,
-    Native, PathSeg, RefValue, Sym, Value,
+    Native, PathSeg, RefValue, Sym, Value, BUILTIN_MODULES,
 };
 
 #[derive(Clone, Debug)]
@@ -86,6 +86,13 @@ pub struct ModuleRt {
     pub imports: RwLock<HashMap<String, Vec<Cell>>>,
     /// `alias -> module`, for `mod::name`.
     pub aliases: RwLock<HashMap<String, usize>>,
+    /// `alias -> builtin module`, for one the interpreter knows without a file
+    /// (§7). A file of that name shadows it, so this is only consulted when no
+    /// file answered.
+    pub builtin_aliases: RwLock<HashMap<String, &'static str>>,
+    /// Builtin modules a `use … as *` asked for by name, so unqualified lookup
+    /// reaches them after the imports and before the flat builtins.
+    pub star_builtins: RwLock<Vec<&'static str>>,
 }
 
 enum Flow {
@@ -180,6 +187,8 @@ impl Vm {
             scope: RwLock::new(Scope::root()),
             imports: RwLock::new(HashMap::new()),
             aliases: RwLock::new(HashMap::new()),
+            builtin_aliases: RwLock::new(HashMap::new()),
+            star_builtins: RwLock::new(Vec::new()),
         }));
         drop(modules);
         if !path.as_os_str().is_empty() {
@@ -623,6 +632,25 @@ impl Vm {
                 };
                 return self.enter(task, callee, bound);
             }
+            Instr::CallNs { module, name, positional, names } => {
+                let args = take_args(task, *positional, names);
+                let candidates = self.ns_candidates(task, module, name)?;
+                let take = |variadic: bool| {
+                    candidates
+                        .iter()
+                        .filter(|c| is_variadic(c) == variadic)
+                        .find_map(|c| bind_args(c, &args).map(|bound| (c.clone(), bound)))
+                };
+                let Some((callee, bound)) = take(false).or_else(|| take(true)) else {
+                    let written = if module.is_empty() {
+                        format!("::{name}")
+                    } else {
+                        format!("{module}::{name}")
+                    };
+                    return Err(rejected(Some(&written), &candidates, &args));
+                };
+                return self.enter(task, callee, bound);
+            }
             Instr::CallMethod { name, positional, names } => {
                 let mut args = take_args(task, *positional, names);
                 let receiver = task.pop();
@@ -855,6 +883,13 @@ impl Vm {
                 other => copy_value(&other),
             });
         }
+        // A `use fs as *` puts the module's builtins here — after the imports
+        // and before the flat ones, which is where §7 says an import goes.
+        for module in
+            self.module(module).star_builtins.read().unwrap_or_else(|e| e.into_inner()).iter()
+        {
+            out.extend(Native::in_module(module, name).into_iter().map(Value::Native));
+        }
         if let Some(native) = Native::lookup(name) {
             out.push(Value::Native(native));
         }
@@ -1002,6 +1037,8 @@ impl Vm {
                 let len = push_place(&target.root, &target.path, arg(1))?;
                 Ok(vec![Value::Num(len as f64)])
             }
+            // A module's builtins live with the module (spec/hydra_fs.md).
+            other => crate::fs::call(other, &args),
         }
     }
 
@@ -1191,6 +1228,79 @@ impl Vm {
         imports.get(name).and_then(|c| c.first().cloned())
     }
 
+    /// What a builtin module has under a name, for the importer's own aliases.
+    fn builtin_candidates(&self, task: &Task, module: &str, name: &str) -> Vec<Native> {
+        let importer = self.module(task.frame().module);
+        let target = importer
+            .builtin_aliases
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(module)
+            .copied();
+        match target {
+            Some(builtin) => Native::in_module(builtin, name),
+            None => Vec::new(),
+        }
+    }
+
+    /// Every function a qualified name could mean.
+    ///
+    /// A qualified call does not fall through to anything else (§7), but the
+    /// module itself may have more than one candidate under the name — which is
+    /// how `fs::read` offers both `read(path)` and `read(path, fallback)`.
+    fn ns_candidates(&self, task: &Task, module: &str, name: &str) -> Result<Vec<Value>, Crash> {
+        if module.is_empty() {
+            return match Native::lookup(name) {
+                Some(native) => Ok(vec![Value::Native(native)]),
+                None => Err(Crash::new(format!("there is no builtin named `{name}`"))),
+            };
+        }
+        if is_private(name) {
+            return Err(Crash::new(format!(
+                "`{name}` is private to module `{module}` and cannot be selected"
+            )));
+        }
+        let importer = task.frame().module;
+        let target = self
+            .module(importer)
+            .aliases
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(module)
+            .copied();
+        if let Some(target) = target {
+            let scope = self.module_scope(target);
+            let cells = scope.all_bindings(name);
+            if cells.is_empty() {
+                return Err(Crash::new(format!("module `{module}` has no name `{name}`")));
+            }
+            let mut out = Vec::new();
+            for cell in cells {
+                let value = cell.read().unwrap_or_else(|e| e.into_inner()).clone();
+                out.push(match value {
+                    Value::Ref(r) => read_place(&r.root, &r.path)?,
+                    other => copy_value(&other),
+                });
+            }
+            return Ok(out);
+        }
+        let builtins = self.builtin_candidates(task, module, name);
+        if builtins.is_empty() {
+            let known = self
+                .module(importer)
+                .builtin_aliases
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(module);
+            return Err(if known {
+                Crash::new(format!("module `{module}` has no name `{name}`"))
+            } else {
+                Crash::new(format!("no module `{module}` is in scope; `use {module}` first"))
+            });
+        }
+        Ok(builtins.into_iter().map(Value::Native).collect())
+    }
+
     fn lookup_ns(&self, task: &Task, module: &str, name: &str) -> Result<Cell, Crash> {
         if module.is_empty() {
             return Err(Crash::new(format!("`::{name}` is a builtin, not a variable")));
@@ -1199,6 +1309,13 @@ impl Vm {
         let target =
             self.module(importer).aliases.read().unwrap_or_else(|e| e.into_inner()).get(module).copied();
         let Some(target) = target else {
+            // A builtin module has no scope to select from, so a name of one is
+            // a value only through the call that names it.
+            if !self.builtin_candidates(task, module, name).is_empty() {
+                return Err(Crash::new(format!(
+                    "`{module}::{name}` is a builtin: it can be called, but not passed around"
+                )));
+            }
             return Err(Crash::new(format!("no module `{module}` is in scope; `use {module}` first")));
         };
         // Private names are not reachable through `::` (§7).
@@ -1404,8 +1521,15 @@ impl Vm {
         let importer = task.frame().module;
         let from = self.module(importer).path.clone();
         let Some(path) = self.resolve_module(name, &from) else {
+            // A file of that name would have shadowed it, which is why naming
+            // one after a builtin module is discouraged (§7).
+            if let Some(builtin) = BUILTIN_MODULES.iter().find(|m| **m == name) {
+                self.bind_builtin(task, builtin, alias, unqualified);
+                return Ok(Flow::Next);
+            }
             return Err(Crash::new(format!(
-                "cannot find module `{name}`: no `{name}.hy` beside {} or on HYDRA_PATH",
+                "cannot find module `{name}`: no `{name}.hy` beside {} or on HYDRA_PATH, \
+                 and no builtin module of that name",
                 from.display()
             )));
         };
@@ -1464,6 +1588,29 @@ impl Vm {
 
     /// Bind a module's non-private names into the importer, and register the
     /// alias `::` selects through (§7).
+    /// Bind a builtin module into the importer, under the same three rules a
+    /// file gets: the qualifier alone, the names as well, or the qualifier
+    /// under another name (§7).
+    fn bind_builtin(&self, task: &Task, builtin: &'static str, alias: &str, unqualified: bool) {
+        let importer = self.module(task.frame().module);
+        importer
+            .builtin_aliases
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(alias.to_string(), builtin);
+        if unqualified {
+            importer
+                .builtin_aliases
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(builtin.to_string(), builtin);
+            let mut star = importer.star_builtins.write().unwrap_or_else(|e| e.into_inner());
+            star.retain(|m| *m != builtin);
+            // Most recent `use` wins, so the newest goes first (§7).
+            star.insert(0, builtin);
+        }
+    }
+
     /// Bind a module into the importer (§7).
     ///
     /// `use fs` registers the qualifier and nothing else, so `fs::read` reaches
