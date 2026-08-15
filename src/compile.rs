@@ -171,6 +171,25 @@ pub struct Chunk {
 }
 
 impl Chunk {
+    /// How the function reads in a diagnostic — the same shape a closure's
+    /// signature has, since it is built from the same parameters.
+    pub fn signature(&self) -> String {
+        let params: Vec<String> = self
+            .params
+            .iter()
+            .map(|p| {
+                format!(
+                    "{}{}{}",
+                    if p.by_ref { "&" } else { "" },
+                    p.name,
+                    if p.variadic { "*" } else { "" }
+                )
+            })
+            .collect();
+        let name = if self.name.is_empty() { "fn" } else { &self.name };
+        format!("{name}({})", params.join(", "))
+    }
+
     pub fn required(&self) -> usize {
         self.params.iter().filter(|p| !p.has_default).count()
     }

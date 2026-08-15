@@ -240,6 +240,9 @@ struct Checker<'a> {
     /// before the program runs, which is what lets a channel index that cannot
     /// exist be an error rather than a crash (channels §6.7).
     trail_shape: Option<(usize, usize)>,
+    /// How deep inside function bodies the walk is. `reject()` hands a *call*
+    /// back, so outside one there is nothing for it to hand (§3).
+    fn_depth: usize,
     /// True while checking the free call that `x.f(…)` turned out to be, so a
     /// diagnostic about its first argument can say it is the receiver (§5.2).
     receiver_call: bool,
@@ -272,6 +275,7 @@ impl<'a> Checker<'a> {
             trail_depth: 0,
             race_depth: 0,
             trail_shape: None,
+            fn_depth: 0,
             receiver_call: false,
             mutated: HashSet::new(),
             overloaded: HashSet::new(),
@@ -303,12 +307,49 @@ impl<'a> Checker<'a> {
 
     fn run(&mut self, program: &Program) {
         collect_names(&program.body, &mut self.mutated, &mut self.overloaded);
+        self.check_shadowed_overloads(&program.body);
         self.load_modules(&program.body);
         self.push_scope();
         self.hoist(&program.body);
         self.stmts(&program.body);
         self.unused_privates();
         self.pop_scope();
+    }
+
+    /// A later function that accepts everything an earlier one of the same name
+    /// accepts, and never rejects, makes the earlier one unreachable (§3).
+    ///
+    /// Overloading by shape is what lets two functions share a name, and
+    /// `reject()` is what lets two of the *same* shape share one — so a shadow
+    /// without a `reject()` anywhere in it is a function nobody can call, and
+    /// that is an error rather than a warning.
+    fn check_shadowed_overloads(&mut self, body: &[Stmt]) {
+        let mut seen: Vec<(String, Signature, Pos)> = Vec::new();
+        for stmt in body {
+            if let Some((name, signature, rejects, pos)) = declared_function(stmt) {
+                if !rejects {
+                    for (earlier, earlier_signature, earlier_pos) in &seen {
+                        if *earlier == name && covers(&signature, earlier_signature) {
+                            self.error(
+                                format!(
+                                    "this `{name}` accepts everything the one on line {} does \
+                                     and never rejects, so that one can never run: \
+                                     give this one a `reject()`, or a shape of its own",
+                                    earlier_pos.line
+                                ),
+                                pos,
+                                "unreachable-overload",
+                            );
+                            break;
+                        }
+                    }
+                }
+                seen.push((name, signature, pos));
+            }
+            for inner in nested_bodies(stmt) {
+                self.check_shadowed_overloads(inner);
+            }
+        }
     }
 
     /// Warn about a private name nothing in the file reads (§11).
@@ -1049,8 +1090,23 @@ impl<'a> Checker<'a> {
         if !self.names_are_knowable
             || self.lookup(name).is_some()
             || self.imports.contains_key(name)
-            || !CHANNEL_NATIVES.iter().any(|n| n.name() == name)
         {
+            return;
+        }
+        // `reject()` hands a call back to resolution, and outside a function
+        // there is no call to hand (§3).
+        if name == Native::Reject.name() {
+            if self.fn_depth == 0 {
+                self.error(
+                    "`reject()` belongs in a function: it hands that function's call \
+                     back to resolution, and there is no call here to hand",
+                    pos,
+                    "reject-outside-function",
+                );
+            }
+            return;
+        }
+        if !CHANNEL_NATIVES.iter().any(|n| n.name() == name) {
             return;
         }
         if self.trail_depth == 0 {
@@ -1098,6 +1154,7 @@ impl<'a> Checker<'a> {
     fn closure(&mut self, def: &ClosureDef) {
         // A function body is not a trail body: `return` is fine in it, and
         // `break trail` is not (QUESTIONS.md §16).
+        self.fn_depth += 1;
         let trail_depth = std::mem::take(&mut self.trail_depth);
         let race_depth = std::mem::take(&mut self.race_depth);
         let trail_shape = std::mem::take(&mut self.trail_shape);
@@ -1123,6 +1180,7 @@ impl<'a> Checker<'a> {
         self.trail_shape = trail_shape;
         self.race_depth = race_depth;
         self.trail_depth = trail_depth;
+        self.fn_depth -= 1;
     }
 
     fn namespace(&mut self, module: &str, name: &str, pos: Pos) {
@@ -1476,6 +1534,82 @@ fn walk_closure_stmts(expr: &Expr, f: &mut impl FnMut(&Stmt)) {
         if let ClosureBody::Block(body) = &def.body {
             walk_stmts(body, f);
         }
+    }
+}
+
+/// A function declared in a statement list: its name, its shape, whether it
+/// ever rejects, and where it was written.
+fn declared_function(stmt: &Stmt) -> Option<(String, Signature, bool, Pos)> {
+    let (name, def, pos) = match stmt {
+        Stmt::FnDecl { name, def, pos } => (name.clone(), def, *pos),
+        Stmt::Decl { names, value: Expr::Closure(def), pos } => match names.as_slice() {
+            [name] => (name.clone(), def, *pos),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some((name.clone(), Signature::of(def, &name), rejects(def), pos))
+}
+
+/// Whether a function can hand its call back (§3). A `reject()` anywhere in it
+/// counts, including one inside a closure it defines: §11 reports what is
+/// guaranteed, and a nested one is not guaranteed *not* to run.
+fn rejects(def: &ClosureDef) -> bool {
+    let mut found = false;
+    let mut look = |expr: &Expr| {
+        let name = match expr {
+            Expr::Call { callee, .. } => match callee.as_ref() {
+                Expr::Name { name, .. } => Some(name.as_str()),
+                Expr::Namespace { module, name, .. } if module.is_empty() => Some(name.as_str()),
+                _ => None,
+            },
+            _ => None,
+        };
+        found |= name == Some(Native::Reject.name());
+    };
+    match &def.body {
+        ClosureBody::Expr(expr) => walk_expr(expr, &mut look),
+        ClosureBody::Block(body) => walk_exprs(body, &mut look),
+    }
+    found
+}
+
+/// Whether `later` accepts every call `earlier` does, so nothing could ever
+/// reach `earlier` past it.
+///
+/// A variadic is tried only after every concrete arity (channels §6.1), so one
+/// never shadows the other however wide it is.
+fn covers(later: &Signature, earlier: &Signature) -> bool {
+    if later.variadic.is_some() != earlier.variadic.is_some() {
+        return false;
+    }
+    if later.required > earlier.required || later.total < earlier.total {
+        return false;
+    }
+    // A named argument has to land in the same place, or the call it fills
+    // reaches only one of them.
+    earlier.names.iter().enumerate().all(|(i, name)| later.names.get(i) == Some(name))
+}
+
+/// The statement lists a statement holds, so a rule about siblings can be
+/// applied to each of them in turn.
+fn nested_bodies(stmt: &Stmt) -> Vec<&[Stmt]> {
+    match stmt {
+        Stmt::FnDecl { def, .. } => match &def.body {
+            ClosureBody::Block(body) => vec![body.as_slice()],
+            ClosureBody::Expr(_) => Vec::new(),
+        },
+        Stmt::Decl { value: Expr::Closure(def), .. } => match &def.body {
+            ClosureBody::Block(body) => vec![body.as_slice()],
+            ClosureBody::Expr(_) => Vec::new(),
+        },
+        Stmt::If { branches, .. } => branches.iter().map(|b| b.body.as_slice()).collect(),
+        Stmt::For { body, .. }
+        | Stmt::While { body, .. }
+        | Stmt::ParallelFor { body, .. }
+        | Stmt::ParallelWhile { body, .. } => vec![body.as_slice()],
+        Stmt::Parallel { trails, .. } => trails.iter().map(|t| t.body.as_slice()).collect(),
+        _ => Vec::new(),
     }
 }
 

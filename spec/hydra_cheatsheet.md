@@ -143,6 +143,14 @@ isolated to that trail (reported on stderr, fatal under strict mode).
 
 ---
 
+`reject("why")` leaves a function and hands its call back to resolution, which
+tries the next candidate — so two functions may share a name *and* a shape. The
+messages are printed by the crash if nobody takes the call. A later function
+that accepts everything an earlier one does and never rejects makes it
+unreachable, which `check` reports.
+
+---
+
 ## Modules
 
 ```hydra

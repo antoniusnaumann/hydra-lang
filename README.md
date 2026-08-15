@@ -193,6 +193,31 @@ because the dot is what passes it:
 So `rows.push(x)` is the same error as `push(rows, x)`, and `&rows.push(x)` is
 how it is written.
 
+**`reject()` hands the call back.** A signature says what a function can be
+given; only the body can say what it can be used for. `reject("why")` leaves the
+function and returns the call to resolution, which carries on down the same list
+— so two functions may share a name *and* a shape:
+
+```hydra
+fn parse(text)
+	return "the careful one"
+end
+fn parse(text)
+	if len(text) > 3
+		reject("this one only does short ones")
+	end
+	return "the quick one"
+end
+
+parse("ab")      // "the quick one"
+parse("abcdef")  // "the careful one" — the quick one handed it back
+```
+
+Every refusal is printed with the crash if nobody takes the call. And a later
+function that accepts everything an earlier one accepts and never rejects makes
+it unreachable, which `check` reports as an error rather than leaving dead code
+in the file.
+
 **A concrete arity beats a variadic.** A `*` parameter accepts everything
 positional, so a variadic candidate is tried only after every candidate that
 takes the call exactly — otherwise a variadic shadow would swallow the narrower

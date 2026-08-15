@@ -26,8 +26,8 @@ use crate::lexer::is_private;
 use crate::parser::parse;
 use crate::scope::{Scope, ScopeRef};
 use crate::sched::{
-    BlockCtx, BlockId, CancelFlag, Frame, IterState, Msg, OnReturn, ScopeSlot, Task, TaskId,
-    TaskState, Waiter,
+    BlockCtx, BlockId, CancelFlag, Frame, IterState, Msg, OnReturn, RejectedBy, Retry, ScopeSlot,
+    Task, TaskId, TaskState, Waiter,
 };
 use crate::value::{
     binary_op, boolean, copy_value, deref, get_member, member_opt, new_dict, new_list, path_segment,
@@ -229,6 +229,8 @@ impl Vm {
                 call_site: Pos::NONE,
                 is_module_body: true,
                 provided: Vec::new(),
+                is_call: false,
+                retry: None,
             }],
             stack: Vec::new(),
             cancel: self.root_cancel.clone(),
@@ -604,9 +606,13 @@ impl Vm {
                 let args = take_args(task, *positional, names);
                 let callee = task.pop();
                 let Some(bound) = bind_args(&callee, &args) else {
-                    return Err(rejected(None, &[callee], &args));
+                    return Err(rejected(None, &[callee], &args, &[]));
                 };
-                return self.enter(task, callee, bound);
+                // One candidate, because the callee was written as something
+                // other than a name — a `reject()` in it has nothing to fall
+                // back to, and says so.
+                let retry = Retry { name: None, rest: Vec::new(), args, rejected: Vec::new() };
+                return self.enter_with(task, callee, bound, Some(retry));
             }
             Instr::CallName { name, positional, names } => {
                 let args = take_args(task, *positional, names);
@@ -616,40 +622,25 @@ impl Vm {
                 if candidates.is_empty() {
                     return Err(Crash::new(format!("`{name}` is not declared")));
                 }
-                // A concrete arity is tried before any variadic, whichever is
-                // nearer: a `*` accepts everything positional, and would
-                // otherwise swallow every narrower candidate behind it
-                // (channels §6.1).
-                let take = |variadic: bool| {
-                    candidates
-                        .iter()
-                        .filter(|c| is_variadic(c) == variadic)
-                        .find_map(|c| bind_args(c, &args).map(|bound| (c.clone(), bound)))
+                let Some((callee, bound, rest)) = Vm::resolve(&candidates, &args) else {
+                    return Err(rejected(Some(name), &candidates, &args, &[]));
                 };
-                let chosen = take(false).or_else(|| take(true));
-                let Some((callee, bound)) = chosen else {
-                    return Err(rejected(Some(name), &candidates, &args));
-                };
-                return self.enter(task, callee, bound);
+                let retry = Retry::at(name, rest, args);
+                return self.enter_with(task, callee, bound, Some(retry));
             }
             Instr::CallNs { module, name, positional, names } => {
                 let args = take_args(task, *positional, names);
                 let candidates = self.ns_candidates(task, module, name)?;
-                let take = |variadic: bool| {
-                    candidates
-                        .iter()
-                        .filter(|c| is_variadic(c) == variadic)
-                        .find_map(|c| bind_args(c, &args).map(|bound| (c.clone(), bound)))
+                let written = if module.is_empty() {
+                    format!("::{name}")
+                } else {
+                    format!("{module}::{name}")
                 };
-                let Some((callee, bound)) = take(false).or_else(|| take(true)) else {
-                    let written = if module.is_empty() {
-                        format!("::{name}")
-                    } else {
-                        format!("{module}::{name}")
-                    };
-                    return Err(rejected(Some(&written), &candidates, &args));
+                let Some((callee, bound, rest)) = Vm::resolve(&candidates, &args) else {
+                    return Err(rejected(Some(&written), &candidates, &args, &[]));
                 };
-                return self.enter(task, callee, bound);
+                let retry = Retry::at(&written, rest, args);
+                return self.enter_with(task, callee, bound, Some(retry));
             }
             Instr::CallMethod { name, positional, names } => {
                 let mut args = take_args(task, *positional, names);
@@ -678,9 +669,10 @@ impl Vm {
                         )));
                     }
                     let Some(bound) = bind_args(&callee, &args) else {
-                        return Err(rejected(Some(name), &[callee], &args));
+                        return Err(rejected(Some(name), &[callee], &args, &[]));
                     };
-                    return self.enter(task, callee, bound);
+                    let retry = Retry::at(name, Vec::new(), args);
+                    return self.enter_with(task, callee, bound, Some(retry));
                 }
 
                 // Otherwise the receiver is the first argument, and the rest of
@@ -693,16 +685,11 @@ impl Vm {
                          `x.{name}(…)` is either"
                     )));
                 }
-                let take = |variadic: bool| {
-                    candidates
-                        .iter()
-                        .filter(|c| is_variadic(c) == variadic)
-                        .find_map(|c| bind_args(c, &args).map(|bound| (c.clone(), bound)))
+                let Some((callee, bound, rest)) = Vm::resolve(&candidates, &args) else {
+                    return Err(rejected(Some(name), &candidates, &args, &[]));
                 };
-                let Some((callee, bound)) = take(false).or_else(|| take(true)) else {
-                    return Err(rejected(Some(name), &candidates, &args));
-                };
-                return self.enter(task, callee, bound);
+                let retry = Retry::at(name, rest, args);
+                return self.enter_with(task, callee, bound, Some(retry));
             }
             Instr::Return(count) => {
                 let at = task.stack.len() - count;
@@ -865,6 +852,28 @@ impl Vm {
 
     // --- calls and frames ---------------------------------------------------
 
+    /// Pick the candidate a call resolves to, and keep the ones behind it.
+    ///
+    /// A concrete arity is tried before any variadic, whichever is nearer: a
+    /// `*` accepts everything positional and would otherwise swallow every
+    /// narrower candidate behind it (channels §6.1). What is left over is what
+    /// a `reject()` falls back to, in the same order (§3).
+    fn resolve(
+        candidates: &[Value],
+        args: &CallArgs,
+    ) -> Option<(Value, Vec<Option<Value>>, Vec<Value>)> {
+        let ordered: Vec<&Value> = candidates
+            .iter()
+            .filter(|c| !is_variadic(c))
+            .chain(candidates.iter().filter(|c| is_variadic(c)))
+            .collect();
+        let at = ordered.iter().position(|c| bind_args(c, args).is_some())?;
+        let callee = ordered[at].clone();
+        let bound = bind_args(&callee, args).expect("it bound a moment ago");
+        let rest: Vec<Value> = ordered[at + 1..].iter().map(|c| (*c).clone()).collect();
+        Some((callee, bound, rest))
+    }
+
     /// Every function the name could mean, innermost binding first, then the
     /// most recent `use` first, then the builtin (§3, §7).
     fn candidates(&self, task: &Task, name: &str) -> Result<Vec<Value>, Crash> {
@@ -896,12 +905,14 @@ impl Vm {
         Ok(out)
     }
 
-    /// Enter a call whose arguments are already matched to its parameters.
-    fn enter(
+    /// Enter a call whose arguments are already matched to its parameters,
+    /// carrying what a `reject()` in the callee would fall back to (§3).
+    fn enter_with(
         &self,
         task: &mut Task,
         callee: Value,
         bound: Vec<Option<Value>>,
+        retry: Option<Retry>,
     ) -> Result<Flow, Crash> {
         let specs = param_specs(&callee).expect("a callee that bound its arguments");
         // `&name` in the signature says the caller must mark it, and the caller
@@ -956,11 +967,16 @@ impl Vm {
                     call_site,
                     is_module_body: false,
                     provided,
+                    is_call: true,
+                    retry: retry.map(Box::new),
                 });
                 Ok(Flow::Next)
             }
             Value::Native(native) => {
                 let out = match native {
+                    // Not a value at all: it leaves the function and hands the
+                    // call to the next candidate (§3).
+                    Native::Reject => return self.reject(task, &bound),
                     Native::Send => self.send(task, &bound)?,
                     Native::Receive => self.receive(task, &bound)?,
                     Native::Channel => {
@@ -1045,6 +1061,65 @@ impl Vm {
     /// Return from a frame with everything it answered: the first value is the
     /// meaningful one and the rest are additional information, held until the
     /// binding site names them or the next call replaces them (channels §6.2).
+    /// `reject(message)` — leave this function and hand the call back to
+    /// resolution, which tries the next candidate that accepts the same
+    /// arguments (§3).
+    ///
+    /// It is the one way a function can say "not this call" after looking at
+    /// the values, which no signature can express. What every candidate said on
+    /// the way out is kept, and printed by the crash if none of them took it.
+    fn reject(&self, task: &mut Task, args: &[Option<Value>]) -> Result<Flow, Crash> {
+        let message = match args.first().cloned().flatten() {
+            Some(value) => match deref(&value)? {
+                Value::Sym(s) if s == sym("null") => None,
+                other => Some(to_text(&other)),
+            },
+            None => None,
+        };
+
+        let Some(frame) = task.frames.last() else {
+            return Err(Crash::new("`reject()` belongs in a function"));
+        };
+        if !frame.is_call {
+            return Err(Crash::new(
+                "`reject()` belongs in a function: there is no call here to hand back",
+            ));
+        }
+        let signature = frame.chunk.signature();
+
+        // Leave the frame, exactly as a return does, and then keep going with
+        // the call rather than with the caller.
+        let frame = task.frames.pop().expect("the frame checked above");
+        task.stack.truncate(frame.stack_base);
+        let mut retry = frame.retry.map(|r| *r).unwrap_or(Retry {
+            name: None,
+            rest: Vec::new(),
+            args: CallArgs::empty(),
+            rejected: Vec::new(),
+        });
+        retry.rejected.push(RejectedBy { signature, message });
+
+        match Vm::resolve(&retry.rest, &retry.args) {
+            Some((callee, bound, rest)) => {
+                let next = Retry {
+                    name: retry.name.clone(),
+                    rest,
+                    args: retry.args.clone(),
+                    rejected: retry.rejected,
+                };
+                self.enter_with(task, callee, bound, Some(next))
+            }
+            // Nothing left to fall back to, so the call itself failed — with
+            // every refusal behind it.
+            None => Err(rejected(
+                retry.name.as_deref(),
+                &retry.rest,
+                &retry.args,
+                &retry.rejected,
+            )),
+        }
+    }
+
     // --- auto-channels (spec/hydra_channels.md) ------------------------------
 
     /// `send(value, to*, mode = .wait)`.
@@ -1398,6 +1473,8 @@ impl Vm {
                 call_site: Pos::NONE,
                 is_module_body: false,
                 provided: Vec::new(),
+                is_call: false,
+                retry: None,
             }],
             stack: Vec::new(),
             cancel: cancel.clone(),
@@ -1567,6 +1644,8 @@ impl Vm {
             call_site: Pos::NONE,
             is_module_body: true,
             provided: Vec::new(),
+            is_call: false,
+            retry: None,
         });
         Ok(Flow::Next)
     }
@@ -1656,12 +1735,19 @@ impl Vm {
 }
 
 /// The arguments of one call, split the way the syntax splits them.
-struct CallArgs {
+/// One call's arguments, kept past the call itself so a `reject()` can hand
+/// them to the next candidate (§3).
+#[derive(Clone)]
+pub struct CallArgs {
     positional: Vec<Value>,
     named: Vec<(Arc<str>, Value)>,
 }
 
 impl CallArgs {
+    fn empty() -> CallArgs {
+        CallArgs { positional: Vec::new(), named: Vec::new() }
+    }
+
     fn describe(&self) -> String {
         let named: Vec<String> = self.named.iter().map(|(n, _)| format!("{n} =")).collect();
         if named.is_empty() {
@@ -1794,11 +1880,17 @@ fn is_variadic(callee: &Value) -> bool {
     param_specs(callee).is_some_and(|specs| specs.iter().any(|s| s.variadic))
 }
 
-/// The crash for a call nothing accepted, listing what was tried (§8).
-fn rejected(name: Option<&str>, candidates: &[Value], args: &CallArgs) -> Crash {
+/// The crash for a call nothing accepted, listing what was tried and what the
+/// ones that ran said on the way out (§3, §8).
+fn rejected(
+    name: Option<&str>,
+    candidates: &[Value],
+    args: &CallArgs,
+    refusals: &[RejectedBy],
+) -> Crash {
     let callable: Vec<String> =
         candidates.iter().filter(|c| param_specs(c).is_some()).map(signature_of).collect();
-    if callable.is_empty() {
+    if callable.is_empty() && refusals.is_empty() {
         let kind = candidates.first().map(|c| c.kind()).unwrap_or("value");
         return Crash::new(format!("cannot call a {kind}"));
     }
@@ -1806,11 +1898,26 @@ fn rejected(name: Option<&str>, candidates: &[Value], args: &CallArgs) -> Crash 
         Some(name) => format!("`{name}`"),
         None => "this function".to_string(),
     };
-    Crash::new(format!(
-        "no {called} accepts {}: tried {}",
-        args.describe(),
-        callable.join(", ")
-    ))
+    let mut message = if refusals.is_empty() {
+        format!("no {called} accepts {}: tried {}", args.describe(), callable.join(", "))
+    } else if callable.is_empty() {
+        format!("no {called} took {}", args.describe())
+    } else {
+        format!(
+            "no {called} took {}: tried {}",
+            args.describe(),
+            callable.join(", ")
+        )
+    };
+    // A candidate that ran and said no is worth more than one that never
+    // matched, so its own words go last, where they are read first.
+    for refusal in refusals {
+        message.push_str(&format!("\n  {} rejected it", refusal.signature));
+        if let Some(said) = &refusal.message {
+            message.push_str(&format!(": {said}"));
+        }
+    }
+    Crash::new(message)
 }
 
 

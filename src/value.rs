@@ -290,6 +290,7 @@ pub enum Native {
     Send,
     Receive,
     Channel,
+    Reject,
 
     // --- fs (spec/hydra_fs.md) ---------------------------------------------
     FsJoin,
@@ -333,6 +334,7 @@ pub const NATIVES: &[Native] = &[
     Native::Send,
     Native::Receive,
     Native::Channel,
+    Native::Reject,
     Native::FsJoin,
     Native::FsParent,
     Native::FsName,
@@ -414,6 +416,11 @@ impl Native {
             ),
             Native::Receive => info!(None, "receive", "receive(from*)", &[("from", Variadic)]),
             Native::Channel => info!(None, "channel", "channel()", &[]),
+            // The message is what a crash prints when nothing accepted the
+            // call, so it is worth writing but never required (§3).
+            Native::Reject => {
+                info!(None, "reject", "reject(message = .null)", &[("message", Def)])
+            }
 
             // --- fs: paths ------------------------------------------------
             Native::FsJoin => info!(

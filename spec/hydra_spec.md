@@ -230,6 +230,46 @@ f(1)         // "one" — the shadowing one rejects a single argument
 f(1, 2)      // "two"
 ```
 
+**[D] `reject()` hands the call back.** A signature says what a function can be
+*given*; only the body can say what it can be *used for*. `reject()` leaves the
+function and returns the call to resolution, which carries on down the same
+list — so two functions may share a name **and** a shape:
+
+```hydra
+fn parse(text)
+	return "the careful one"
+end
+fn parse(text)
+	if len(text) > 3
+		reject("this one only does short ones")
+	end
+	return "the quick one"
+end
+
+parse("ab")      // "the quick one"    — the later one, as always
+parse("abcdef")  // "the careful one"  — the quick one handed it back
+```
+
+**[D]** The message is optional and is what a crash prints. When nothing takes
+the call, every refusal is listed with it, nearest first:
+
+```
+crash: no `parse` took 1 argument(s)
+  parse(text) rejected it: this one only does short ones
+  parse(text) rejected it
+```
+
+**[D]** `reject()` belongs in a **function**. At a file's toplevel or in a trail
+body there is no call to hand back, and it crashes saying so; `check` reports it
+before it runs.
+
+**[D] A shadow that never rejects is an error.** Two functions of one name and
+one shape are only useful because the later can hand a call back — so a later
+one that accepts everything an earlier one accepts and contains no `reject()`
+makes the earlier unreachable, and `check` reports that rather than leaving dead
+code in the file. A **variadic** never shadows a concrete arity, since it is
+tried only after every one of them.
+
 **[D]** A **`&` mismatch is not a rejection.** It is reported against the
 candidate that accepted the call, because a missing `&` is a mistake to fix,
 not a reason to quietly run something else.
