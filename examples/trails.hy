@@ -69,6 +69,13 @@ fn describe(region)
 end
 describe := fn(region, detail) "region \(region) (\(detail))"
 
+bello := { .name : "Bello", .age : 21 }
+
+lol := { .dog : bello }
+lol.dog.name = "Hasso"
+
+print(bello.name)
+
 print(describe("eu"))
 print(describe("eu", "primary"))
 print(describe(detail = "backup", region = "ap"))
