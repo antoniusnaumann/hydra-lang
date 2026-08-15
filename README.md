@@ -213,10 +213,16 @@ parse("ab")      // "the quick one"
 parse("abcdef")  // "the careful one" — the quick one handed it back
 ```
 
-Every refusal is printed with the crash if nobody takes the call. And a later
+Every refusal is printed with the crash if nobody takes the call. A later
 function that accepts everything an earlier one accepts and never rejects makes
 it unreachable, which `check` reports as an error rather than leaving dead code
 in the file.
+
+Rejecting is cheap: holding the arguments for the fall-back is a handle, not a
+copy. The copy happens on a **write** — the retained arguments are marked shared,
+so writing to one splits a node the next candidate still needs — so `check` warns
+where a write that reaches an argument comes before a `reject()`. Look first,
+then write.
 
 **A concrete arity beats a variadic.** A `*` parameter accepts everything
 positional, so a variadic candidate is tried only after every candidate that

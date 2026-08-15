@@ -145,7 +145,9 @@ isolated to that trail (reported on stderr, fatal under strict mode).
 
 `reject("why")` leaves a function and hands its call back to resolution, which
 tries the next candidate — so two functions may share a name *and* a shape. The
-messages are printed by the crash if nobody takes the call. A later function
+messages are printed by the crash if nobody takes the call. Rejecting is cheap —
+holding the arguments is a handle, not a copy — but a *write* before one splits
+a copy that is then thrown away, which `check` warns about. A later function
 that accepts everything an earlier one does and never rejects makes it
 unreachable, which `check` reports.
 

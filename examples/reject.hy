@@ -39,6 +39,16 @@ print("xy".parse())
 // end
 // print(strict(1))
 
+// Rejecting costs nothing: holding the arguments for the fall-back is a handle
+// and not a copy. A *write* is what costs — it splits a node the next candidate
+// still needs, and the call throws it away — so `check` warns about this shape
+// and not about the one above:
+//
+// fn keen(box)
+//	box.tried = .true    // splits a copy…
+//	reject("not mine")   // …that nobody wanted
+// end
+
 // A shape of its own needs no `reject()` at all: resolution has already told
 // the two of them apart (§3).
 fn describe(thing)

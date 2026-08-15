@@ -102,6 +102,53 @@ answered := \"abc\".describe()
     assert_eq!(eval(src, "answered"), "fallback");
 }
 
+#[test]
+fn what_a_rejecting_candidate_wrote_does_not_reach_the_next_one() {
+    // Holding the arguments for the fall-back is free — copy-on-write means a
+    // handle, not a copy — but the next candidate has to be handed what the
+    // caller wrote (§5.1). So the retained arguments are marked shared, and a
+    // write in the candidate that rejects splits a copy of its own.
+    let src = "
+fn take(d)
+	return d.n
+end
+fn take(d)
+	d.n = 99
+	reject()
+end
+answered := take({ .n : 1 })
+";
+    assert_eq!(eval(src, "answered"), "1");
+
+    let src = "
+fn eat(list)
+	return len(list)
+end
+fn eat(list)
+	push(&list, 2)
+	reject()
+end
+answered := eat([1])
+";
+    assert_eq!(eval(src, "answered"), "1");
+
+    // And the caller's own value is untouched either way.
+    let src = "
+fn take(d)
+	return d.n
+end
+fn take(d)
+	d.n = 99
+	reject()
+end
+box := { .n : 1 }
+answered := take(box)
+kept := box.n
+";
+    assert_eq!(eval(src, "answered"), "1");
+    assert_eq!(eval(src, "kept"), "1");
+}
+
 // --- when nobody takes it -----------------------------------------------------
 
 #[test]
@@ -191,6 +238,23 @@ fn a_closure_declaration_shadows_the_same_way() {
         codes("fn f(a)\n\treturn 1\nend\nf := fn(a) 2\n"),
         vec!["unreachable-overload"]
     );
+}
+
+#[test]
+fn writing_before_rejecting_is_worth_a_warning() {
+    // The copy is what the write costs, and the call throws it away (§3).
+    let warned = |src: &str| codes(src).contains(&"write-before-reject");
+    assert!(warned("fn f(d)\n\td.n = 1\n\treject()\nend\n"));
+    // Looking before writing costs nothing at all.
+    assert!(!warned("fn f(d)\n\tif d.n > 3\n\t\treject()\n\tend\n\td.n = 1\nend\n"));
+    // A counter of its own copies nothing, so nothing is said about it.
+    assert!(!warned("fn f(d)\n\tn := 0\n\tn = n + 1\n\tif n > 0\n\t\treject()\n\tend\nend\n"));
+    // A local taken from an argument shares its buffer, so writing it splits
+    // the same node.
+    assert!(warned("fn f(d)\n\tlocal := d\n\tlocal.n = 1\n\treject()\nend\n"));
+    // Through a reference it is not a copy but an effect: the write reached the
+    // caller's own value and stays there.
+    assert!(warned("fn f(&box)\n\tbox.n = 1\n\treject()\nend\n"));
 }
 
 #[test]

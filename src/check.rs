@@ -316,6 +316,106 @@ impl<'a> Checker<'a> {
         self.pop_scope();
     }
 
+    /// A write before a `reject()` is work the call throws away — and a copy it
+    /// pays for (§3).
+    ///
+    /// Holding the arguments for the fall-back is free, because copy-on-write
+    /// hands over a handle. The copy happens on the *write*: the retained
+    /// arguments are marked shared, so writing to one splits a node the next
+    /// candidate still needs. Rejecting first costs nothing.
+    ///
+    /// Only writes that reach an argument count. A counter of its own copies
+    /// nothing, and a warning that fired on those would be ignored within a
+    /// week (§11).
+    fn check_write_before_reject(&mut self, def: &ClosureDef) {
+        let body = match &def.body {
+            ClosureBody::Block(body) => body,
+            ClosureBody::Expr(_) => return,
+        };
+        // Everything the caller handed over, and everything since taken from it.
+        let mut from_caller: HashSet<String> =
+            def.params.iter().filter(|p| p.binds()).map(|p| p.name.clone()).collect();
+        let by_ref: HashSet<String> =
+            def.params.iter().filter(|p| p.by_ref).map(|p| p.name.clone()).collect();
+        let mut wrote: Option<(String, Pos)> = None;
+        self.walk_for_reject(body, &mut from_caller, &by_ref, &mut wrote);
+    }
+
+    fn walk_for_reject(
+        &mut self,
+        body: &[Stmt],
+        from_caller: &mut HashSet<String>,
+        by_ref: &HashSet<String>,
+        wrote: &mut Option<(String, Pos)>,
+    ) {
+        for stmt in body {
+            match stmt {
+                Stmt::Decl { names, value, .. } => {
+                    // A local taken from an argument shares its buffer, so
+                    // writing to it splits the same node.
+                    if mentions_any(value, from_caller) {
+                        from_caller.extend(names.iter().cloned());
+                    }
+                }
+                Stmt::Assign { targets, pos, .. } => {
+                    for target in targets {
+                        if let Some(Expr::Name { name, .. }) = target.lvalue_root() {
+                            if wrote.is_none() && from_caller.contains(name) {
+                                *wrote = Some((name.clone(), *pos));
+                            }
+                        }
+                    }
+                }
+                Stmt::Expr { expr, pos } => {
+                    if let Some((name, at)) = self.rejects_here(expr, *pos) {
+                        let _ = name;
+                        if let Some((written, _)) = wrote.clone() {
+                            let how = if by_ref.contains(&written) {
+                                format!(
+                                    "`{written}` is a reference, so the write reached the \
+                                     caller's own value and stays there"
+                                )
+                            } else {
+                                format!(
+                                    "writing `{written}` split a copy the next candidate \
+                                     does not need"
+                                )
+                            };
+                            self.warn(
+                                format!(
+                                    "this rejects after writing: {how}. Rejecting first costs \
+                                     nothing, because holding the arguments is only a handle"
+                                ),
+                                at,
+                                "write-before-reject",
+                            );
+                            *wrote = None;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            // A `reject()` in a branch is still after the write above it.
+            for inner in nested_bodies(stmt) {
+                self.walk_for_reject(inner, from_caller, by_ref, wrote);
+            }
+        }
+    }
+
+    /// Where a statement is a bare `reject(…)` call, and nothing else.
+    fn rejects_here(&self, expr: &Expr, pos: Pos) -> Option<(String, Pos)> {
+        let Expr::Call { callee, .. } = expr else { return None };
+        let name = match callee.as_ref() {
+            Expr::Name { name, .. } => name.as_str(),
+            Expr::Namespace { module, name, .. } if module.is_empty() => name.as_str(),
+            _ => return None,
+        };
+        if name != Native::Reject.name() || self.lookup(name).is_some() {
+            return None;
+        }
+        Some((name.to_string(), pos))
+    }
+
     /// A later function that accepts everything an earlier one of the same name
     /// accepts, and never rejects, makes the earlier one unreachable (§3).
     ///
@@ -1155,6 +1255,7 @@ impl<'a> Checker<'a> {
         // A function body is not a trail body: `return` is fine in it, and
         // `break trail` is not (QUESTIONS.md §16).
         self.fn_depth += 1;
+        self.check_write_before_reject(def);
         let trail_depth = std::mem::take(&mut self.trail_depth);
         let race_depth = std::mem::take(&mut self.race_depth);
         let trail_shape = std::mem::take(&mut self.trail_shape);
@@ -1549,6 +1650,17 @@ fn declared_function(stmt: &Stmt) -> Option<(String, Signature, bool, Pos)> {
         _ => return None,
     };
     Some((name.clone(), Signature::of(def, &name), rejects(def), pos))
+}
+
+/// Whether an expression reads any of these names.
+fn mentions_any(expr: &Expr, names: &HashSet<String>) -> bool {
+    let mut found = false;
+    walk_expr(expr, &mut |inner| {
+        if let Expr::Name { name, .. } = inner {
+            found |= names.contains(name);
+        }
+    });
+    found
 }
 
 /// Whether a function can hand its call back (§3). A `reject()` anywhere in it

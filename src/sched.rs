@@ -137,7 +137,14 @@ impl Retry {
     /// it has not tried, and the arguments to try them with. Kept even when
     /// there are none left, because the crash still needs to say what the call
     /// was and what the one candidate said about it.
+    ///
+    /// Where there *is* something left, the arguments are marked shared on the
+    /// way in. Holding a handle is free — that is what copy-on-write is for —
+    /// but the next candidate has to be handed what the caller wrote, not what
+    /// the one that rejected did to it (§5.1). Marking them is what makes a
+    /// write in the rejecting candidate split its own copy.
     pub fn at(name: &str, rest: Vec<Value>, args: crate::vm::CallArgs) -> Retry {
+        let args = if rest.is_empty() { args } else { args.retained() };
         Retry { name: Some(name.to_string()), rest, args, rejected: Vec::new() }
     }
 }

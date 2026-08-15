@@ -1748,6 +1748,17 @@ impl CallArgs {
         CallArgs { positional: Vec::new(), named: Vec::new() }
     }
 
+    /// The same arguments, marked shared so that a write in the candidate that
+    /// is about to run splits a copy of its own rather than the ones behind it
+    /// (§3, §5.1). A reference is left alone: `&` is where a call is *meant* to
+    /// reach the caller's value.
+    pub fn retained(&self) -> CallArgs {
+        CallArgs {
+            positional: self.positional.iter().map(copy_value).collect(),
+            named: self.named.iter().map(|(n, v)| (n.clone(), copy_value(v))).collect(),
+        }
+    }
+
     fn describe(&self) -> String {
         let named: Vec<String> = self.named.iter().map(|(n, _)| format!("{n} =")).collect();
         if named.is_empty() {

@@ -263,6 +263,18 @@ crash: no `parse` took 1 argument(s)
 body there is no call to hand back, and it crashes saying so; `check` reports it
 before it runs.
 
+**[D] Rejecting is cheap; writing first is not.** Holding a call's arguments so
+that a rejection can hand them on costs a *handle*, not a copy — that is what
+copy-on-write is for (§5.1). The copy happens on the **write**: the retained
+arguments are marked shared, so writing to one splits a node the next candidate
+still needs, and it is thrown away with the call. `check` warns where a write
+that reaches an argument precedes a `reject()`; a local of the function's own is
+not one, and nothing is said about it.
+
+A write through a `&` parameter is worse than a copy and warns for the other
+reason: it reached the caller's own value, and it stays there even though the
+call was handed back — cancellation's rule (§9.5) in another place.
+
 **[D] A shadow that never rejects is an error.** Two functions of one name and
 one shape are only useful because the later can hand a call back — so a later
 one that accepts everything an earlier one accepts and contains no `reject()`
