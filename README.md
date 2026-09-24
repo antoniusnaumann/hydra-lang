@@ -193,10 +193,11 @@ because the dot is what passes it:
 So `rows.push(x)` is the same error as `push(rows, x)`, and `&rows.push(x)` is
 how it is written.
 
-**`reject()` hands the call back.** A signature says what a function can be
-given; only the body can say what it can be used for. `reject("why")` leaves the
-function and returns the call to resolution, which carries on down the same list
-— so two functions may share a name *and* a shape:
+**`.reject` hands the call back.** A signature says what a function can be
+given; only the body can say what it can be used for. A candidate that answers
+`.reject` returns the call to resolution, which carries on down the same list —
+so two functions may share a name *and* a shape. `reject()` is
+`return .reject`, and `reject("why")` is `return .reject, "why"`:
 
 ```hydra
 fn parse(text)
@@ -213,15 +214,35 @@ parse("ab")      // "the quick one"
 parse("abcdef")  // "the careful one" — the quick one handed it back
 ```
 
-Every refusal is printed with the crash if nobody takes the call. A later
-function that accepts everything an earlier one accepts and never rejects makes
-it unreachable, which `check` reports as an error rather than leaving dead code
-in the file.
+**A result nothing consumes goes to where the statement stands.** In a
+function, an ordinary one is dropped and one starting with `.reject` returns
+from the function unchanged — so a rejection passes through any number of
+helpers with nothing written to pass it on:
+
+```hydra
+fn reject_if(cond)
+	if cond
+		return .reject, "invalid value"
+	end
+end
+
+fn parse(text)
+	reject_if(len(text) > 3)   // hands parse's call back when it rejects
+	return "the quick one"
+end
+```
+
+At the top level of a file an ordinary result is printed and a `.reject` is an
+unhandled rejection, which crashes listing every refusal of the call. Any
+binding consumes a result — `_ = f()` says so explicitly — and consuming one
+value of a call consumes them all. A later function that accepts everything an
+earlier one accepts and has no way to reject makes it unreachable, which
+`check` reports as an error rather than leaving dead code in the file.
 
 Rejecting is cheap: holding the arguments for the fall-back is a handle, not a
 copy. The copy happens on a **write** — the retained arguments are marked shared,
 so writing to one splits a node the next candidate still needs — so `check` warns
-where a write that reaches an argument comes before a `reject()`. Look first,
+where a write that reaches an argument comes before a rejection. Look first,
 then write.
 
 **A concrete arity beats a variadic.** A `*` parameter accepts everything

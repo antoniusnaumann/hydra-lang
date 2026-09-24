@@ -401,3 +401,8 @@ pub struct Program {
     pub comments: HashMap<u32, (u32, String)>,
     pub line_count: u32,
 }
+
+/// `_`, the name a binding site gives a value it does not keep (§8.1).
+pub fn is_discard_name(name: &str) -> bool {
+    name == "_"
+}

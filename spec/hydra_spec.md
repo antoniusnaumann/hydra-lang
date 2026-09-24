@@ -90,6 +90,9 @@ it is never exported by `use` and never reachable through `::`.
 
 **[D]** `ALL_CAPS` is convention only and has no semantics.
 
+**[D]** A lone **`_`** is a binding site that keeps nothing: `_ = f()` and
+`value, _ := f()` consume the value and bind no name (§8.1).
+
 ### Literals
 
 ```hydra
@@ -230,10 +233,11 @@ f(1)         // "one" — the shadowing one rejects a single argument
 f(1, 2)      // "two"
 ```
 
-**[D] `reject()` hands the call back.** A signature says what a function can be
-*given*; only the body can say what it can be *used for*. `reject()` leaves the
-function and returns the call to resolution, which carries on down the same
-list — so two functions may share a name **and** a shape:
+**[D] `.reject` hands the call back.** A signature says what a function can be
+*given*; only the body can say what it can be *used for*. A candidate whose
+answer starts with the symbol **`.reject`** returns the call to resolution, which
+carries on down the same list — so two functions may share a name **and** a
+shape:
 
 ```hydra
 fn parse(text)
@@ -250,26 +254,49 @@ parse("ab")      // "the quick one"    — the later one, as always
 parse("abcdef")  // "the careful one"  — the quick one handed it back
 ```
 
-**[D]** The message is optional and is what a crash prints. When nothing takes
-the call, every refusal is listed with it, nearest first:
+**[D]** `reject` is an ordinary builtin with two overloads:
+
+```hydra
+fn reject()
+	return .reject
+end
+fn reject(message)
+	return .reject, message
+end
+```
+
+It leaves the function because its answer is a `.reject` that nothing consumes
+(§8.1) — the same way any helper's does. `return .reject`, `reject()`, and a
+helper's `.reject` left unconsumed are the same thing at the call boundary. The
+values after `.reject` are the rejection's payload.
+
+**[D]** When **every** candidate rejects, the call answers with the rejection of
+the last one tried, unchanged. Consumed, it is a value like any other; left
+unconsumed, it travels on (§8.1). If it reaches the top level of a file, the
+crash prints its payload and every refusal of the call that ran out of
+candidates, nearest first — here for two that both rejected, the earlier one
+without a message:
 
 ```
-crash: no `parse` took 1 argument(s)
-  parse(text) rejected it: this one only does short ones
-  parse(text) rejected it
+crash: unhandled rejection
+  the top level of a file has no call to hand it back to
+  no `parse` took 1 argument(s)
+    parse(text) rejected it: this one only does short ones
+    parse(text) rejected it
 ```
 
-**[D]** `reject()` belongs in a **function**. At a file's toplevel or in a trail
-body there is no call to hand back, and it crashes saying so; `check` reports it
-before it runs.
+**[D]** A `.reject` has somewhere to go only in a **function**. At a file's top
+level, or in a trail — which cannot return from its function (§9.6) — one that
+nothing consumes crashes; `check` reports a literal one before it runs.
 
 **[D] Rejecting is cheap; writing first is not.** Holding a call's arguments so
 that a rejection can hand them on costs a *handle*, not a copy — that is what
 copy-on-write is for (§5.1). The copy happens on the **write**: the retained
 arguments are marked shared, so writing to one splits a node the next candidate
 still needs, and it is thrown away with the call. `check` warns where a write
-that reaches an argument precedes a `reject()`; a local of the function's own is
-not one, and nothing is said about it.
+that reaches an argument precedes a rejection — `reject(…)`, `.reject`, or a
+call to a function of the same file that can reject; a local of the function's
+own is not one, and nothing is said about it.
 
 A write through a `&` parameter is worse than a copy and warns for the other
 reason: it reached the caller's own value, and it stays there even though the
@@ -277,10 +304,13 @@ call was handed back — cancellation's rule (§9.5) in another place.
 
 **[D] A shadow that never rejects is an error.** Two functions of one name and
 one shape are only useful because the later can hand a call back — so a later
-one that accepts everything an earlier one accepts and contains no `reject()`
+one that accepts everything an earlier one accepts and has no way to reject
 makes the earlier unreachable, and `check` reports that rather than leaving dead
-code in the file. A **variadic** never shadows a concrete arity, since it is
-tried only after every one of them.
+code in the file. A way to reject is a `reject(…)`, a `.reject`, or a
+statement or `return` calling something that can — a function of the file
+that rejects, or anything the file cannot see into (an import, a parameter, a
+field), since an error must be certain (§11). A **variadic** never shadows a
+concrete arity, since it is tried only after every one of them.
 
 **[D]** A **`&` mismatch is not a rejection.** It is reported against the
 candidate that accepted the call, because a missing `&` is a mistake to fix,
@@ -677,6 +707,56 @@ a dead trail (§9.5), in which case it is isolated to that trail.
 **[D]** When a **live** trail crashes: mark every sibling cancelled, let each
 finish its in-flight statement, print the diagnostic, exit non-zero.
 
+### 8.1 Unconsumed values
+
+**[D]** Every expression produces one or more values. An expression written as
+a **statement** whose result nothing consumes hands that result to the context
+it stands in, immediately and per statement — results are never accumulated
+across statements. `if`, `for`, `while` and the blocks are statements, not
+expressions, so the statements in their bodies are statement level too.
+
+**[D]** A call's several values are **one** result: `foo()` answering
+`.reject, "reason"` is handled as `(.reject, "reason")`.
+
+**[D]** A result is **consumed** by anything that takes it: a binding, an
+argument, an operand, a `return`. `_ = foo()` consumes it explicitly, and
+consuming one value of a call consumes them all — `x := foo()` takes the first
+and drops the rest.
+
+**[D]** What an unconsumed result does:
+
+| Where | Ordinary result | Result starting with `.reject` |
+|---|---|---|
+| Function body | dropped | the function returns it, unchanged |
+| Trail inside a function | dropped | crash — a trail cannot return (§9.6) |
+| File top level, its trails included | printed | crash — unhandled rejection |
+
+So a rejection travels through any number of helpers with nothing written to
+pass it on:
+
+```hydra
+fn reject_if(cond)
+	if cond
+		return .reject, "invalid value"
+	end
+end
+
+fn foo(x)
+	reject_if(x < 0)    // `.reject, "invalid value"` — foo returns it
+	return x
+end
+```
+
+At the call boundary it is a rejection like any other (§3).
+
+**[D]** At the top level, a result is printed as `print` would print it, and a
+call's several values are printed on one line, separated by `, `. A single
+`.null` — what `print` answers, and what a function without `return` answers —
+is not printed.
+
+**[D]** There are no handlers yet: no `try`, no `catch`, nothing to register.
+The three rows above are the whole of it.
+
 ---
 
 ## 9. Concurrency
@@ -831,6 +911,8 @@ maybe-list would be enormous and would be ignored within a week.
 | `parallel` / `race` written syntactically inside a cell | §4 |
 | Rows of a block with differing separator counts | §4 |
 | Compound keyword split across lines or across `\|\|` | §2 |
+| A later function that covers an earlier one's shape and cannot reject | §3 |
+| `reject(…)` or `.reject` left unconsumed at the top level or in a trail | §8.1 |
 
 **Warnings:**
 
@@ -842,6 +924,7 @@ maybe-list would be enormous and would be ignored within a week.
 - An unused private (`_name`).
 - A `&` reference crossing into a trail — the only way to share mutable data
   between trails, and worth a second look every time.
+- A write that reaches an argument before a rejection (§3).
 
 ---
 

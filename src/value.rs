@@ -416,8 +416,9 @@ impl Native {
             ),
             Native::Receive => info!(None, "receive", "receive(from*)", &[("from", Variadic)]),
             Native::Channel => info!(None, "channel", "channel()", &[]),
-            // The message is what a crash prints when nothing accepted the
-            // call, so it is worth writing but never required (§3).
+            // `reject()` answers `.reject`, and `reject(message)` answers
+            // `.reject, message` — the message is what a crash prints when the
+            // rejection reaches nothing that takes it (§3, §8.1).
             Native::Reject => {
                 info!(None, "reject", "reject(message = .null)", &[("message", Def)])
             }
@@ -639,6 +640,7 @@ impl Native {
     pub fn returns(self) -> usize {
         match self {
             Native::Receive
+            | Native::Reject
             | Native::FsSizeOr
             | Native::FsModifiedOr
             | Native::FsReadOr

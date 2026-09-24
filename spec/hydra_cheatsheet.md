@@ -143,13 +143,41 @@ isolated to that trail (reported on stderr, fatal under strict mode).
 
 ---
 
-`reject("why")` leaves a function and hands its call back to resolution, which
-tries the next candidate — so two functions may share a name *and* a shape. The
-messages are printed by the crash if nobody takes the call. Rejecting is cheap —
-holding the arguments is a handle, not a copy — but a *write* before one splits
-a copy that is then thrown away, which `check` warns about. A later function
-that accepts everything an earlier one does and never rejects makes it
-unreachable, which `check` reports.
+A statement whose result nothing consumes hands it to where it stands:
+
+```hydra
+fn reject_if(cond)
+	if cond
+		return .reject, "invalid value"
+	end
+end
+
+fn foo(x)
+	reject_if(x < 0)    // unconsumed `.reject`: foo returns it
+	ignored := 42       // consumed: nothing happens
+	42                  // unconsumed, ordinary: dropped
+	return x
+end
+
+_ = foo(-1)             // `_` consumes it
+foo(3)                  // top level: prints 3
+foo(-1)                 // top level: crash — unhandled rejection
+```
+
+In a function an ordinary result is dropped and a `.reject` returns from it; at
+the top level an ordinary result is printed (except a lone `.null`) and a
+`.reject` crashes. `if`/`for`/`while` bodies are statement level too. A trail
+cannot return, so a `.reject` there crashes.
+
+A candidate that answers `.reject` hands its call back to resolution, which
+tries the next candidate — so two functions may share a name *and* a shape.
+`reject()` is `return .reject` and `reject(msg)` is `return .reject, msg`. When
+every candidate rejects, the call answers with the rejection, and if that goes
+unhandled the crash lists every refusal. Rejecting is cheap — holding the
+arguments is a handle, not a copy — but a *write* before one splits a copy that
+is then thrown away, which `check` warns about. A later function that accepts
+everything an earlier one does and has no way to reject makes it unreachable,
+which `check` reports.
 
 ---
 

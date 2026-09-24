@@ -14,7 +14,7 @@ print("working in \(where)")
 note, bytes := fs::write(fs::join(where, "notes", "first.txt"), "one\n")
 print("wrote \(bytes) bytes to \(note)")
 
-fs::write(note, "two\n", mode = .append)
+_ = fs::write(note, "two\n", mode = .append)
 print(fs::lines(note))
 
 // A reader is two functions: one that crashes when the file is not there, and
@@ -28,8 +28,8 @@ print("\(note.fs::name()) is \(note.fs::size()) bytes, and a \(note.fs::extensio
 
 // `list` answers with full paths, sorted, so a program over a directory is
 // reproducible (§4).
-fs::write(fs::join(where, "notes", "second.txt"), "three\n")
-fs::write(fs::join(where, "notes", "ignore.md"), "not this one\n")
+_ = fs::write(fs::join(where, "notes", "second.txt"), "three\n")
+_ = fs::write(fs::join(where, "notes", "ignore.md"), "not this one\n")
 
 for entry in fs::list(fs::join(where, "notes"), match = "*.txt")
 	print("  \(entry.fs::name()): \(entry.fs::size()) bytes")

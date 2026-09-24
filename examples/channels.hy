@@ -6,8 +6,8 @@
 // A handoff. `receive` answers with the value and the trail that sent it; the
 // second may be ignored, and usually is (§1, §6.2).
 parallel
-	send("ready") || msg, ch := receive()
-	              || print("got \(msg) from trail \(ch)")
+	_ = send("ready") || msg, ch := receive()
+	                  || print("got \(msg) from trail \(ch)")
 end
 
 // One producer, one worker, no queue and no pool object. `send` with no index
@@ -16,7 +16,7 @@ end
 total := 0
 parallel
 	for job in [1, 2, 3] || while alive()
-	send(job)            || work, ch := receive()
+	_ = send(job)        || work, ch := receive()
 	end                  || if ch == .null
 	                     || break
 	                     || end
@@ -29,14 +29,14 @@ print("the worker ran \(total)")
 // and does not wait. Both answer `.false` only when every eligible trail has
 // already ended (§5).
 parallel
-	send(.config, mode = .broadcast) || print("a took \(receive())") || print("b took \(receive())")
+	_ = send(.config, mode = .broadcast) || print("a took \(receive())") || print("b took \(receive())")
 end
 
 // An index addresses one sibling, and `channel()` says where "here" is, which
 // is what makes a pipeline writable (§3, §6.3).
 parallel
-	send("work", 1) || job, from := receive()
-	                || print("trail \(channel()) took \(job) from \(from)")
+	_ = send("work", 1) || job, from := receive()
+	                    || print("trail \(channel()) took \(job) from \(from)")
 end
 
 // A losing trail parked in `receive` is woken with the closed answer and then

@@ -35,6 +35,21 @@ impl Root {
     }
 }
 
+/// What a statement's unconsumed result means where the statement stands
+/// (§8.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unconsumed {
+    /// File top level, including a trail of a top-level block: an ordinary
+    /// value is printed, and `.reject` has nowhere to go.
+    TopLevel,
+    /// A function body: an ordinary value is dropped, and `.reject` returns
+    /// from the function with the whole result.
+    Function,
+    /// A trail inside a function: dropped as in the function, but a trail
+    /// cannot return from its function (§9.6), so `.reject` has nowhere to go.
+    TrailInFunction,
+}
+
 #[derive(Clone, Debug)]
 pub enum Instr {
     PushNum(f64),
@@ -51,6 +66,10 @@ pub enum Instr {
     MakeSym,
     MakeClosure { name: Arc<str>, params: Arc<Vec<ParamInfo>>, chunk: Arc<Chunk> },
     Pop,
+    /// The result of an expression written as a statement, which nothing
+    /// consumed (§8.1). `spread` says the expression was a call, so the extras
+    /// a call leaves behind are part of this result and not a stale answer.
+    Unconsumed { spread: bool, at: Unconsumed },
 
     /// Read a variable: dereference a `&` transparently, then copy (§5.1).
     Load(Root),
@@ -224,6 +243,9 @@ pub struct Compiler {
     iter_depth: usize,
     /// True while compiling a trail body, so `return` can be rejected (§9.6).
     in_trail: bool,
+    /// True inside a function body, trails of its blocks included: that is
+    /// where an unconsumed `.reject` has a call to hand back (§8.1).
+    in_fn: bool,
 }
 
 pub fn compile_program(program: &Program) -> Result<Arc<Chunk>> {
@@ -243,6 +265,7 @@ impl Compiler {
             scope_depth: 0,
             iter_depth: 0,
             in_trail,
+            in_fn: false,
         }
     }
 
@@ -327,10 +350,24 @@ impl Compiler {
                 // The last name's value is on top, so the names are bound from
                 // the back.
                 for name in names.iter().rev() {
+                    // `_` names a value only to say it was seen (§8.1).
+                    if is_discard_name(name) {
+                        self.emit(Instr::Pop, *pos);
+                        continue;
+                    }
                     self.emit(Instr::Declare(Arc::from(name.as_str())), *pos);
                 }
             }
             Stmt::Assign { targets, op, value, pos } => {
+                if let ([target], None) = (targets.as_slice(), &op) {
+                    if is_discard(target) {
+                        // `_ = f()` consumes the whole result and keeps none of
+                        // it (§8.1).
+                        self.expr(value)?;
+                        self.emit(Instr::Pop, *pos);
+                        return Ok(());
+                    }
+                }
                 if let ([target], _) = (targets.as_slice(), &op) {
                     let (root, segs) = self.place(target)?;
                     self.expr(value)?;
@@ -351,6 +388,10 @@ impl Compiler {
                     self.expr(value)?;
                     self.emit(Instr::TakeValues(targets.len()), *pos);
                     for target in targets.iter().rev() {
+                        if is_discard(target) {
+                            self.emit(Instr::Pop, *pos);
+                            continue;
+                        }
                         let (root, segs) = self.place(target)?;
                         self.emit(Instr::StoreUnder { root, segs }, *pos);
                     }
@@ -358,7 +399,13 @@ impl Compiler {
             }
             Stmt::Expr { expr, .. } => {
                 self.expr(expr)?;
-                self.emit(Instr::Pop, pos);
+                let at = match (self.in_fn, self.in_trail) {
+                    (false, _) => Unconsumed::TopLevel,
+                    (true, false) => Unconsumed::Function,
+                    (true, true) => Unconsumed::TrailInFunction,
+                };
+                let spread = matches!(expr, Expr::Call { .. });
+                self.emit(Instr::Unconsumed { spread, at }, pos);
             }
             Stmt::Return { values, pos } => {
                 if self.in_trail {
@@ -848,6 +895,7 @@ impl Compiler {
 
     fn closure(&mut self, def: &Arc<ClosureDef>, name: &str, pos: Pos) -> Result<()> {
         let mut sub = Compiler::new(&self.file, self.in_trail);
+        sub.in_fn = true;
         // The prologue fills in the parameters the call did not supply.
         for (index, param) in def.params.iter().enumerate() {
             let Some(default) = &param.default else { continue };
@@ -950,6 +998,7 @@ impl Compiler {
         label: Option<&str>,
     ) -> Result<Arc<Chunk>> {
         let mut sub = Compiler::new(&self.file, true);
+        sub.in_fn = self.in_fn;
         sub.loops.push(LoopCtx {
             label: label.map(str::to_string),
             is_trail: true,
@@ -967,4 +1016,8 @@ impl Compiler {
         debug_assert!(ctx.breaks.is_empty() && ctx.continues.is_empty());
         Ok(Arc::new(sub.finish(format!("trail {column}"), Vec::new())))
     }
+}
+
+fn is_discard(target: &Expr) -> bool {
+    matches!(target, Expr::Name { name, .. } if is_discard_name(name))
 }

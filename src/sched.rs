@@ -106,13 +106,10 @@ pub struct Frame {
     /// defaults to evaluate. Named arguments can leave holes, so this is a
     /// mask and not a count.
     pub provided: Vec<bool>,
-    /// A frame a *call* opened, as against a module body or a trail: only in
-    /// one of those does `reject()` mean anything (§3).
-    pub is_call: bool,
-    /// What a `reject()` in this frame falls back to: the candidates the call
-    /// has not tried yet, the arguments to try them with, and what the ones
-    /// before it said on the way out. Absent where there is nothing left to
-    /// fall back to and nothing has been said yet.
+    /// Where a `.reject` this frame answers with goes (§3): the candidates the
+    /// call has not tried yet, the arguments to try them with, and what the
+    /// ones before it said on the way out. Absent for a module body or a
+    /// trail, which no call opened.
     pub retry: Option<Box<Retry>>,
 }
 
@@ -122,8 +119,8 @@ pub struct RejectedBy {
     pub message: Option<String>,
 }
 
-/// Where a `reject()` goes: the rest of the candidate list, in the order the
-/// call would have tried them.
+/// Where a rejected call goes: the rest of the candidate list, in the order
+/// the call would have tried them.
 pub struct Retry {
     /// How the call was written, for the diagnostic.
     pub name: Option<String>,
@@ -133,7 +130,7 @@ pub struct Retry {
 }
 
 impl Retry {
-    /// What a call leaves behind for a `reject()` in the callee: the candidates
+    /// What a call leaves behind in case the callee rejects: the candidates
     /// it has not tried, and the arguments to try them with. Kept even when
     /// there are none left, because the crash still needs to say what the call
     /// was and what the one candidate said about it.
@@ -295,6 +292,11 @@ pub struct Task {
     /// binding site that names them. Written by every return, read by the one
     /// instruction that spreads them (channels §6.2).
     pub extras: Vec<Value>,
+    /// What the candidates of the last call that ran out of them said, while
+    /// the `.reject` it answered is still on its way somewhere. Diagnostic
+    /// only: printed if that `.reject` reaches a statement with nothing to hand
+    /// it to (§8.1), and dropped as soon as anything consumes a value.
+    pub rejection: Option<String>,
 }
 
 impl Task {

@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use crate::ast::BlockKind;
-use crate::compile::{compile_program, Chunk, Instr, Root};
+use crate::compile::{compile_program, Chunk, Instr, Root, Unconsumed};
 use crate::errors::{Crash, HydraError, Pos, Site};
 use crate::lexer::is_private;
 use crate::parser::parse;
@@ -229,7 +229,6 @@ impl Vm {
                 call_site: Pos::NONE,
                 is_module_body: true,
                 provided: Vec::new(),
-                is_call: false,
                 retry: None,
             }],
             stack: Vec::new(),
@@ -241,6 +240,7 @@ impl Vm {
             is_trail: false,
             module,
             extras: Vec::new(),
+            rejection: None,
             channel: None,
             delivery: None,
         };
@@ -420,6 +420,44 @@ impl Vm {
             Instr::Pop => {
                 task.pop();
             }
+            Instr::Unconsumed { spread, at } => {
+                let first = task.pop();
+                // Only a call leaves extras that belong to this statement; any
+                // others are an earlier call's, already passed over.
+                let extras =
+                    if *spread { std::mem::take(&mut task.extras) } else { Vec::new() };
+                if is_reject(&first) {
+                    let mut values = Vec::with_capacity(1 + extras.len());
+                    values.push(first);
+                    values.extend(extras);
+                    return match at {
+                        // The function returns the result unchanged, and the
+                        // call it was handed decides what that means (§8.1).
+                        Unconsumed::Function => self.pop_frame(task, values),
+                        Unconsumed::TopLevel => Err(self.unhandled(
+                            task,
+                            &values,
+                            "the top level of a file has no call to hand it back to",
+                        )?),
+                        Unconsumed::TrailInFunction => Err(self.unhandled(
+                            task,
+                            &values,
+                            "a trail cannot return from its function (§9.6), so it has \
+                             no call to hand it back to",
+                        )?),
+                    };
+                }
+                task.rejection = None;
+                if *at == Unconsumed::TopLevel && !(extras.is_empty() && is_null(&first)) {
+                    let mut texts = Vec::with_capacity(1 + extras.len());
+                    for value in std::iter::once(&first).chain(extras.iter()) {
+                        texts.push(to_text(&deref(value)?));
+                    }
+                    let mut out = std::io::stdout().lock();
+                    let _ = writeln!(out, "{}", texts.join(", "));
+                    let _ = out.flush();
+                }
+            }
             Instr::MakeList(n) => {
                 let at = task.stack.len() - *n;
                 let items: Vec<Value> = task.stack.split_off(at);
@@ -483,6 +521,7 @@ impl Vm {
             }
             Instr::Declare(name) => {
                 let value = task.pop();
+                task.rejection = None;
                 if task.should_stop() {
                     return Ok(Flow::Stop);
                 }
@@ -497,6 +536,7 @@ impl Vm {
             }
             Instr::Store { root, segs } => {
                 let value = task.pop();
+                task.rejection = None;
                 let path = self.take_path(task, *segs)?;
                 // Evaluate → check the cancel flag → only then store (§9.5).
                 if task.should_stop() {
@@ -609,8 +649,8 @@ impl Vm {
                     return Err(rejected(None, &[callee], &args, &[]));
                 };
                 // One candidate, because the callee was written as something
-                // other than a name — a `reject()` in it has nothing to fall
-                // back to, and says so.
+                // other than a name — a rejection is the call's answer, and
+                // what it said is kept for the crash if nothing consumes it.
                 let retry = Retry { name: None, rest: Vec::new(), args, rejected: Vec::new() };
                 return self.enter_with(task, callee, bound, Some(retry));
             }
@@ -694,10 +734,10 @@ impl Vm {
             Instr::Return(count) => {
                 let at = task.stack.len() - count;
                 let values: Vec<Value> = task.stack.split_off(at);
-                return Ok(self.pop_frame(task, values));
+                return self.pop_frame(task, values);
             }
             Instr::ReturnNull => {
-                return Ok(self.pop_frame(task, vec![Value::null()]));
+                return self.pop_frame(task, vec![Value::null()]);
             }
 
             Instr::PushScope => {
@@ -914,6 +954,8 @@ impl Vm {
         bound: Vec<Option<Value>>,
         retry: Option<Retry>,
     ) -> Result<Flow, Crash> {
+        // A new call: whatever an earlier one refused is no longer the story.
+        task.rejection = None;
         let specs = param_specs(&callee).expect("a callee that bound its arguments");
         // `&name` in the signature says the caller must mark it, and the caller
         // is the only one who can (§5.1). This is checked *after* resolution,
@@ -967,16 +1009,20 @@ impl Vm {
                     call_site,
                     is_module_body: false,
                     provided,
-                    is_call: true,
                     retry: retry.map(Box::new),
                 });
                 Ok(Flow::Next)
             }
             Value::Native(native) => {
                 let out = match native {
-                    // Not a value at all: it leaves the function and hands the
-                    // call to the next candidate (§3).
-                    Native::Reject => return self.reject(task, &bound),
+                    // `fn reject() return .reject end` and
+                    // `fn reject(msg) return .reject, msg end` (§3): an answer
+                    // like any other, which a statement then hands on (§8.1).
+                    Native::Reject => {
+                        let mut values = vec![Value::Sym(sym(REJECT))];
+                        values.extend(bound.into_iter().flatten());
+                        NativeOut::Values(values)
+                    }
                     Native::Send => self.send(task, &bound)?,
                     Native::Receive => self.receive(task, &bound)?,
                     Native::Channel => {
@@ -1055,68 +1101,6 @@ impl Vm {
             }
             // A module's builtins live with the module (spec/hydra_fs.md).
             other => crate::fs::call(other, &args),
-        }
-    }
-
-    /// Return from a frame with everything it answered: the first value is the
-    /// meaningful one and the rest are additional information, held until the
-    /// binding site names them or the next call replaces them (channels §6.2).
-    /// `reject(message)` — leave this function and hand the call back to
-    /// resolution, which tries the next candidate that accepts the same
-    /// arguments (§3).
-    ///
-    /// It is the one way a function can say "not this call" after looking at
-    /// the values, which no signature can express. What every candidate said on
-    /// the way out is kept, and printed by the crash if none of them took it.
-    fn reject(&self, task: &mut Task, args: &[Option<Value>]) -> Result<Flow, Crash> {
-        let message = match args.first().cloned().flatten() {
-            Some(value) => match deref(&value)? {
-                Value::Sym(s) if s == sym("null") => None,
-                other => Some(to_text(&other)),
-            },
-            None => None,
-        };
-
-        let Some(frame) = task.frames.last() else {
-            return Err(Crash::new("`reject()` belongs in a function"));
-        };
-        if !frame.is_call {
-            return Err(Crash::new(
-                "`reject()` belongs in a function: there is no call here to hand back",
-            ));
-        }
-        let signature = frame.chunk.signature();
-
-        // Leave the frame, exactly as a return does, and then keep going with
-        // the call rather than with the caller.
-        let frame = task.frames.pop().expect("the frame checked above");
-        task.stack.truncate(frame.stack_base);
-        let mut retry = frame.retry.map(|r| *r).unwrap_or(Retry {
-            name: None,
-            rest: Vec::new(),
-            args: CallArgs::empty(),
-            rejected: Vec::new(),
-        });
-        retry.rejected.push(RejectedBy { signature, message });
-
-        match Vm::resolve(&retry.rest, &retry.args) {
-            Some((callee, bound, rest)) => {
-                let next = Retry {
-                    name: retry.name.clone(),
-                    rest,
-                    args: retry.args.clone(),
-                    rejected: retry.rejected,
-                };
-                self.enter_with(task, callee, bound, Some(next))
-            }
-            // Nothing left to fall back to, so the call itself failed — with
-            // every refusal behind it.
-            None => Err(rejected(
-                retry.name.as_deref(),
-                &retry.rest,
-                &retry.args,
-                &retry.rejected,
-            )),
         }
     }
 
@@ -1245,8 +1229,18 @@ impl Vm {
         }
     }
 
-    fn pop_frame(&self, task: &mut Task, values: Vec<Value>) -> Flow {
-        let frame = task.frames.pop().expect("a frame to return from");
+    /// Return from a frame with everything it answered: the first value is the
+    /// meaningful one and the rest are additional information, held until the
+    /// binding site names them or the next call replaces them (channels §6.2).
+    ///
+    /// A call's answer that starts with `.reject` is the candidate handing the
+    /// call back, however it got there — `return .reject`, `reject(…)`, or a
+    /// statement whose `.reject` nothing consumed (§3, §8.1). Resolution then
+    /// tries the next candidate that accepts the same arguments. With none
+    /// left, the rejection is the call's answer, unchanged, and what every
+    /// candidate said is kept for the crash if nothing consumes it.
+    fn pop_frame(&self, task: &mut Task, values: Vec<Value>) -> Result<Flow, Crash> {
+        let mut frame = task.frames.pop().expect("a frame to return from");
         task.stack.truncate(frame.stack_base);
         if frame.is_module_body {
             // Declarations may have opened shadowing levels, so the namespace
@@ -1254,10 +1248,36 @@ impl Vm {
             *self.module(frame.module).scope.write().unwrap_or_else(|e| e.into_inner()) =
                 frame.scope().clone();
         }
+        if let (true, Some(mut retry)) =
+            (values.first().is_some_and(is_reject), frame.retry.take().map(|r| *r))
+        {
+            let message = match values.get(1) {
+                Some(value) => match deref(value)? {
+                    Value::Sym(s) if s == sym("null") => None,
+                    other => Some(to_text(&other)),
+                },
+                None => None,
+            };
+            retry.rejected.push(RejectedBy { signature: frame.chunk.signature(), message });
+            if let Some((callee, bound, rest)) = Vm::resolve(&retry.rest, &retry.args) {
+                let next = Retry {
+                    name: retry.name.clone(),
+                    rest,
+                    args: retry.args.clone(),
+                    rejected: retry.rejected,
+                };
+                // The caller's frame is on top again and still points just
+                // past its call, so the next candidate is called from there.
+                return self.enter_with(task, callee, bound, Some(next));
+            }
+            task.rejection = Some(
+                rejected(retry.name.as_deref(), &[], &retry.args, &retry.rejected).message,
+            );
+        }
         match frame.on_return {
             OnReturn::PushValue => {
                 if task.frames.is_empty() {
-                    return Flow::Done;
+                    return Ok(Flow::Done);
                 }
                 let mut answered = values.into_iter();
                 let value = answered.next().unwrap_or_else(Value::null);
@@ -1268,11 +1288,26 @@ impl Vm {
                 self.bind_module(task, module, &name, &alias, unqualified);
             }
         }
-        if task.frames.is_empty() {
-            Flow::Done
-        } else {
-            Flow::Next
+        Ok(if task.frames.is_empty() { Flow::Done } else { Flow::Next })
+    }
+
+    /// The crash for a `.reject` that reached a statement with nothing to hand
+    /// it back to (§8.1): what it carried, and — when it came out of a call
+    /// that ran out of candidates — what each of them said.
+    fn unhandled(&self, task: &mut Task, values: &[Value], why: &str) -> Result<Crash, Crash> {
+        let mut said = Vec::new();
+        for value in &values[1..] {
+            said.push(to_text(&deref(value)?));
         }
+        let mut message = String::from("unhandled rejection");
+        if !said.is_empty() {
+            message.push_str(&format!(": {}", said.join(", ")));
+        }
+        message.push_str(&format!("\n  {why}"));
+        if let Some(note) = task.rejection.take() {
+            message.push_str(&format!("\n  {}", note.replace('\n', "\n  ")));
+        }
+        Ok(Crash::new(message))
     }
 
     // --- places -------------------------------------------------------------
@@ -1473,7 +1508,6 @@ impl Vm {
                 call_site: Pos::NONE,
                 is_module_body: false,
                 provided: Vec::new(),
-                is_call: false,
                 retry: None,
             }],
             stack: Vec::new(),
@@ -1485,6 +1519,7 @@ impl Vm {
             is_trail: true,
             module: task.module,
             extras: Vec::new(),
+            rejection: None,
             channel: Some(channel),
             delivery: None,
         };
@@ -1644,7 +1679,6 @@ impl Vm {
             call_site: Pos::NONE,
             is_module_body: true,
             provided: Vec::new(),
-            is_call: false,
             retry: None,
         });
         Ok(Flow::Next)
@@ -1744,10 +1778,6 @@ pub struct CallArgs {
 }
 
 impl CallArgs {
-    fn empty() -> CallArgs {
-        CallArgs { positional: Vec::new(), named: Vec::new() }
-    }
-
     /// The same arguments, marked shared so that a write in the candidate that
     /// is about to run splits a copy of its own rather than the ones behind it
     /// (§3, §5.1). A reference is left alone: `&` is where a call is *meant* to
@@ -2137,4 +2167,15 @@ pub fn run_file(path: &Path, options: Options) -> Result<RunResult, HydraError> 
     let module = vm.new_module(&stem(path), canonical);
     vm.spawn_root(chunk, module);
     Ok(vm.run())
+}
+
+/// The symbol a candidate answers with to hand its call back (§3).
+const REJECT: &str = "reject";
+
+fn is_reject(value: &Value) -> bool {
+    matches!(value, Value::Sym(s) if *s == sym(REJECT))
+}
+
+fn is_null(value: &Value) -> bool {
+    matches!(value, Value::Sym(s) if *s == sym("null"))
 }

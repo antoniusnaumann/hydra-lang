@@ -152,7 +152,9 @@ kept := box.n
 // --- when nobody takes it -----------------------------------------------------
 
 #[test]
-fn every_refusal_is_printed_with_the_crash() {
+fn every_refusal_is_printed_when_the_rejection_goes_unhandled() {
+    // Nothing took the call, so it answers with the rejection, and a statement
+    // at the top level has nowhere to hand that (§8.1).
     let src = "
 fn pick(n)
 \treject(\"the first wants something else\")
@@ -160,9 +162,10 @@ end
 fn pick(n)
 \treject()
 end
-x := pick(1)
+pick(1)
 ";
     let crash = crash_of(src);
+    assert!(crash.contains("unhandled rejection"), "{crash}");
     assert!(crash.contains("no `pick` took 1 argument(s)"), "{crash}");
     // The one that ran last is nearest the call, so it is listed first.
     assert!(crash.contains("pick(n) rejected it\n"), "{crash}");
@@ -171,18 +174,40 @@ x := pick(1)
 
 #[test]
 fn a_lone_function_that_rejects_says_so() {
-    let crash = crash_of("fn only(n)\n\treject(\"nothing behind me\")\nend\nx := only(1)\n");
-    assert!(crash.contains("no `only` took 1 argument(s)"), "{crash}");
+    let crash = crash_of("fn only(n)\n\treject(\"nothing behind me\")\nend\nonly(1)\n");
+    assert!(crash.contains("unhandled rejection: nothing behind me"), "{crash}");
     assert!(crash.contains("only(n) rejected it: nothing behind me"), "{crash}");
 }
 
 #[test]
-fn reject_belongs_in_a_function() {
+fn a_rejection_nothing_takes_is_the_answer_of_the_call() {
+    // `reject(msg)` is `return .reject, msg`: consumed, it is a value like any
+    // other, and the last candidate tried is the one whose answer it is.
+    let src = "
+fn pick(n)
+\treject(\"the first wants something else\")
+end
+fn pick(n)
+\treject()
+end
+x, why := pick(1)
+";
+    assert_eq!(eval(src, "x"), ".reject");
+    assert_eq!(eval(src, "why"), "the first wants something else");
+}
+
+#[test]
+fn a_rejection_at_the_top_level_has_nowhere_to_go() {
     let crash = crash_of("reject(\"nope\")\n");
-    assert!(crash.contains("belongs in a function"), "{crash}");
-    // A trail body is not a function body either.
+    assert!(crash.contains("unhandled rejection: nope"), "{crash}");
+    assert!(crash.contains("top level"), "{crash}");
+    // A trail of a top-level block is still the top level.
     let crash = crash_of("parallel\n\treject(\"x\") || y := 1\nend\n");
-    assert!(crash.contains("belongs in a function"), "{crash}");
+    assert!(crash.contains("unhandled rejection: x"), "{crash}");
+    // A trail cannot return from its function (§9.6), so it cannot hand back
+    // the function's call either.
+    let crash = crash_of("fn f(a)\n\tparallel\n\t\treject() || y := 1\n\tend\nend\nf(1)\n");
+    assert!(crash.contains("cannot return from its function"), "{crash}");
 }
 
 // --- what `check` says (§3, §11) ----------------------------------------------
@@ -260,9 +285,50 @@ fn writing_before_rejecting_is_worth_a_warning() {
 #[test]
 fn reject_outside_a_function_is_an_error() {
     assert_eq!(codes("reject()\n"), vec!["reject-outside-function"]);
+    assert_eq!(codes(".reject\n"), vec!["reject-outside-function"]);
     assert_eq!(
         codes("parallel\n\treject() || y := 1\nend\n"),
         vec!["reject-outside-function"]
     );
     assert_eq!(codes("fn f(a)\n\treject()\nend\n"), Vec::<&str>::new());
+    // Consumed, it is only a value (§8.1).
+    assert_eq!(codes("x := reject()\nprint(x)\n"), Vec::<&str>::new());
+}
+
+#[test]
+fn a_trail_cannot_reject_for_its_function() {
+    assert_eq!(
+        codes("fn f(a)\n\tparallel\n\t\treject() || print(a)\n\tend\nend\n"),
+        vec!["reject-in-trail"]
+    );
+}
+
+#[test]
+fn a_shadow_can_reject_through_a_helper() {
+    let shadowed = |src: &str| codes(src).contains(&"unreachable-overload");
+    let earlier = "fn f(a)\n\treturn 1\nend\n";
+    // `return .reject` is `reject()` spelled out.
+    assert!(!shadowed(&format!("{earlier}fn f(a)\n\tif a\n\t\treturn .reject\n\tend\n\treturn 2\nend\n")));
+    // A helper's `.reject`, unconsumed, is the shadow's own (§8.1) — through
+    // any number of helpers.
+    let helpers = "fn deny(c)\n\tif c\n\t\treturn .reject, \"no\"\n\tend\nend\nfn guard(c)\n\tdeny(c)\nend\n";
+    assert!(!shadowed(&format!("{helpers}{earlier}fn f(a)\n\tguard(a)\n\treturn 2\nend\n")));
+    assert!(!shadowed(&format!("{helpers}{earlier}fn f(a)\n\treturn guard(a)\nend\n")));
+    // Consumed, it goes nowhere, and the shadow never rejects.
+    assert!(shadowed(&format!("{helpers}{earlier}fn f(a)\n\t_ = guard(a)\n\treturn 2\nend\n")));
+    // A call the file cannot see into might reject, and an error has to allow
+    // for that.
+    assert!(!shadowed(&format!("{earlier}fn f(a)\n\ta()\n\treturn 2\nend\n")));
+    // A builtin never does.
+    assert!(shadowed(&format!("{earlier}fn f(a)\n\tprint(a)\n\treturn 2\nend\n")));
+}
+
+#[test]
+fn writing_before_a_helper_rejects_is_worth_a_warning_too() {
+    let warned = |src: &str| codes(src).contains(&"write-before-reject");
+    let helper = "fn deny(c)\n\tif c\n\t\treturn .reject\n\tend\nend\n";
+    assert!(warned(&format!("{helper}fn f(d)\n\td.n = 1\n\tdeny(d.n > 0)\nend\n")));
+    assert!(warned("fn f(d)\n\td.n = 1\n\treturn .reject\nend\n"));
+    // A call the file cannot see into is not enough for a warning.
+    assert!(!warned("fn f(d, g)\n\td.n = 1\n\tg()\nend\n"));
 }

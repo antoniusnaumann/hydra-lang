@@ -14,6 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::ast::*;
 use crate::errors::{Diagnostic, Pos, Report, Site};
@@ -252,6 +253,8 @@ struct Checker<'a> {
     /// Names declared more than once. A call one of them rejects goes to the
     /// next (§3), so no single signature is guaranteed.
     overloaded: HashSet<String>,
+    /// Which of the file's functions can hand a call back (§3, §8.1).
+    rejecting: Rejecting,
     read: HashSet<String>,
     externs: HashSet<String>,
     modules: HashMap<String, ModuleInfo>,
@@ -279,6 +282,7 @@ impl<'a> Checker<'a> {
             receiver_call: false,
             mutated: HashSet::new(),
             overloaded: HashSet::new(),
+            rejecting: Rejecting::default(),
             read: HashSet::new(),
             externs: options.externs.iter().cloned().collect(),
             modules: HashMap::new(),
@@ -307,6 +311,7 @@ impl<'a> Checker<'a> {
 
     fn run(&mut self, program: &Program) {
         collect_names(&program.body, &mut self.mutated, &mut self.overloaded);
+        self.rejecting = Rejecting::of(&program.body);
         self.check_shadowed_overloads(&program.body);
         self.load_modules(&program.body);
         self.push_scope();
@@ -366,9 +371,8 @@ impl<'a> Checker<'a> {
                         }
                     }
                 }
-                Stmt::Expr { expr, pos } => {
-                    if let Some((name, at)) = self.rejects_here(expr, *pos) {
-                        let _ = name;
+                Stmt::Expr { .. } | Stmt::Return { .. } => {
+                    if let Some((surely, at)) = self.rejects_here(stmt) {
                         if let Some((written, _)) = wrote.clone() {
                             let how = if by_ref.contains(&written) {
                                 format!(
@@ -381,9 +385,10 @@ impl<'a> Checker<'a> {
                                      does not need"
                                 )
                             };
+                            let verb = if surely { "rejects" } else { "can reject" };
                             self.warn(
                                 format!(
-                                    "this rejects after writing: {how}. Rejecting first costs \
+                                    "this {verb} after writing: {how}. Rejecting first costs \
                                      nothing, because holding the arguments is only a handle"
                                 ),
                                 at,
@@ -395,25 +400,39 @@ impl<'a> Checker<'a> {
                 }
                 _ => {}
             }
-            // A `reject()` in a branch is still after the write above it.
-            for inner in nested_bodies(stmt) {
+            // A `reject()` in a branch is still after the write above it. A
+            // nested function's hands back its own call, and a trail's none.
+            for inner in own_bodies(stmt) {
                 self.walk_for_reject(inner, from_caller, by_ref, wrote);
             }
         }
     }
 
-    /// Where a statement is a bare `reject(…)` call, and nothing else.
-    fn rejects_here(&self, expr: &Expr, pos: Pos) -> Option<(String, Pos)> {
-        let Expr::Call { callee, .. } = expr else { return None };
-        let name = match callee.as_ref() {
-            Expr::Name { name, .. } => name.as_str(),
-            Expr::Namespace { module, name, .. } if module.is_empty() => name.as_str(),
+    /// Where a statement hands its function's call back — `reject(…)`, a bare
+    /// `.reject`, or a `return` of one — or can, by calling a function of this
+    /// file that does (§3, §8.1). `true` for the first kind.
+    fn rejects_here(&self, stmt: &Stmt) -> Option<(bool, Pos)> {
+        let (expr, pos) = match stmt {
+            Stmt::Expr { expr, pos } => (expr, *pos),
+            Stmt::Return { values, pos } => (values.first()?, *pos),
             _ => return None,
         };
-        if name != Native::Reject.name() || self.lookup(name).is_some() {
-            return None;
+        if self.explicit_reject(expr) {
+            return Some((true, pos));
         }
-        Some((name.to_string(), pos))
+        self.rejecting.yields(expr, false).then_some((false, pos))
+    }
+
+    /// `reject(…)` — the builtin, not a shadow of it — or a literal `.reject`.
+    fn explicit_reject(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Sym(symbol) => is_reject_symbol(symbol),
+            Expr::Call { callee, .. } => {
+                matches!(called_name(callee), Some((None, name)) if name == Native::Reject.name())
+                    && self.lookup(Native::Reject.name()).is_none()
+            }
+            _ => false,
+        }
     }
 
     /// A later function that accepts everything an earlier one of the same name
@@ -426,15 +445,15 @@ impl<'a> Checker<'a> {
     fn check_shadowed_overloads(&mut self, body: &[Stmt]) {
         let mut seen: Vec<(String, Signature, Pos)> = Vec::new();
         for stmt in body {
-            if let Some((name, signature, rejects, pos)) = declared_function(stmt) {
-                if !rejects {
+            if let Some((name, signature, def, pos)) = declared_function(stmt) {
+                if !self.rejecting.def_can(def, true) {
                     for (earlier, earlier_signature, earlier_pos) in &seen {
                         if *earlier == name && covers(&signature, earlier_signature) {
                             self.error(
                                 format!(
                                     "this `{name}` accepts everything the one on line {} does \
                                      and never rejects, so that one can never run: \
-                                     give this one a `reject()`, or a shape of its own",
+                                     give this one a way to reject, or a shape of its own",
                                     earlier_pos.line
                                 ),
                                 pos,
@@ -617,6 +636,10 @@ impl<'a> Checker<'a> {
     }
 
     fn declare(&mut self, name: &str, binding: Binding) {
+        // `_` keeps nothing, so there is nothing to bind (§8.1).
+        if is_discard_name(name) {
+            return;
+        }
         if let Some(scope) = self.scopes.last_mut() {
             scope.names.insert(name.to_string(), binding);
         }
@@ -742,6 +765,7 @@ impl<'a> Checker<'a> {
                         "effect-in-race",
                     );
                 }
+                self.unconsumed_reject(expr, *pos);
                 self.expr(expr);
             }
             Stmt::Return { values, pos } => {
@@ -951,7 +975,7 @@ impl<'a> Checker<'a> {
     fn assign_target(&mut self, target: &Expr, pos: Pos) {
         match target {
             Expr::Name { name, .. } => {
-                if self.is_bound(name) || !self.names_are_knowable {
+                if self.is_bound(name) || !self.names_are_knowable || is_discard_name(name) {
                     return;
                 }
                 if let Some(declared_at) = self.trail_local_pos(name) {
@@ -1193,19 +1217,6 @@ impl<'a> Checker<'a> {
         {
             return;
         }
-        // `reject()` hands a call back to resolution, and outside a function
-        // there is no call to hand (§3).
-        if name == Native::Reject.name() {
-            if self.fn_depth == 0 {
-                self.error(
-                    "`reject()` belongs in a function: it hands that function's call \
-                     back to resolution, and there is no call here to hand",
-                    pos,
-                    "reject-outside-function",
-                );
-            }
-            return;
-        }
         if !CHANNEL_NATIVES.iter().any(|n| n.name() == name) {
             return;
         }
@@ -1248,6 +1259,31 @@ impl<'a> Checker<'a> {
                     "no-such-channel",
                 );
             }
+        }
+    }
+
+    /// A statement that surely hands back a `.reject` nothing consumes, where
+    /// there is no call to hand it to: the top level of a file, or a trail,
+    /// which cannot return from its function (§8.1, §9.6). Consumed —
+    /// `x := reject()` — it is a value like any other, and says nothing.
+    fn unconsumed_reject(&mut self, expr: &Expr, pos: Pos) {
+        if !self.names_are_knowable || !self.explicit_reject(expr) {
+            return;
+        }
+        if self.fn_depth == 0 {
+            self.error(
+                "this rejects at the top level of a file, where there is no call to hand \
+                 back: a `.reject` nothing consumes belongs in a function",
+                pos,
+                "reject-outside-function",
+            );
+        } else if self.trail_depth > 0 {
+            self.error(
+                "this rejects inside a trail, which cannot return from its function (§9.6), \
+                 so there is no call to hand back",
+                pos,
+                "reject-in-trail",
+            );
         }
     }
 
@@ -1640,7 +1676,7 @@ fn walk_closure_stmts(expr: &Expr, f: &mut impl FnMut(&Stmt)) {
 
 /// A function declared in a statement list: its name, its shape, whether it
 /// ever rejects, and where it was written.
-fn declared_function(stmt: &Stmt) -> Option<(String, Signature, bool, Pos)> {
+fn declared_function(stmt: &Stmt) -> Option<(String, Signature, &ClosureDef, Pos)> {
     let (name, def, pos) = match stmt {
         Stmt::FnDecl { name, def, pos } => (name.clone(), def, *pos),
         Stmt::Decl { names, value: Expr::Closure(def), pos } => match names.as_slice() {
@@ -1649,7 +1685,7 @@ fn declared_function(stmt: &Stmt) -> Option<(String, Signature, bool, Pos)> {
         },
         _ => return None,
     };
-    Some((name.clone(), Signature::of(def, &name), rejects(def), pos))
+    Some((name.clone(), Signature::of(def, &name), def.as_ref(), pos))
 }
 
 /// Whether an expression reads any of these names.
@@ -1663,27 +1699,121 @@ fn mentions_any(expr: &Expr, names: &HashSet<String>) -> bool {
     found
 }
 
-/// Whether a function can hand its call back (§3). A `reject()` anywhere in it
-/// counts, including one inside a closure it defines: §11 reports what is
-/// guaranteed, and a nested one is not guaranteed *not* to run.
-fn rejects(def: &ClosureDef) -> bool {
-    let mut found = false;
-    let mut look = |expr: &Expr| {
-        let name = match expr {
-            Expr::Call { callee, .. } => match callee.as_ref() {
-                Expr::Name { name, .. } => Some(name.as_str()),
-                Expr::Namespace { module, name, .. } if module.is_empty() => Some(name.as_str()),
-                _ => None,
-            },
-            _ => None,
+/// Which of a file's functions can hand a call back (§3, §8.1): a `reject(…)`
+/// or a bare `.reject` as a statement, a `return` of one, or a statement or
+/// `return` that calls a function which can. Worked out to a fixpoint, since
+/// the helpers call each other.
+///
+/// Two answers, because the two diagnostics need opposite mistakes. `known`
+/// counts only what the file can see, which is what a warning may rest on;
+/// `possible` also counts a call it cannot see into — an import, a parameter,
+/// a field — which is what an error must allow for (§11). A `.reject` that
+/// travels through a variable is not followed by either.
+#[derive(Default)]
+struct Rejecting {
+    known: HashSet<String>,
+    possible: HashSet<String>,
+    /// Every name the file declares a function under.
+    functions: HashSet<String>,
+}
+
+impl Rejecting {
+    fn of(body: &[Stmt]) -> Rejecting {
+        let mut defs: Vec<(String, Arc<ClosureDef>)> = Vec::new();
+        walk_stmts(body, &mut |stmt| match stmt {
+            Stmt::FnDecl { name, def, .. } => defs.push((name.clone(), def.clone())),
+            Stmt::Decl { names, value: Expr::Closure(def), .. } if names.len() == 1 => {
+                defs.push((names[0].clone(), def.clone()))
+            }
+            _ => {}
+        });
+        let mut rejecting = Rejecting {
+            functions: defs.iter().map(|(name, _)| name.clone()).collect(),
+            ..Rejecting::default()
         };
-        found |= name == Some(Native::Reject.name());
-    };
-    match &def.body {
-        ClosureBody::Expr(expr) => walk_expr(expr, &mut look),
-        ClosureBody::Block(body) => walk_exprs(body, &mut look),
+        for assume in [false, true] {
+            loop {
+                let found: Vec<String> = defs
+                    .iter()
+                    .filter(|(name, def)| {
+                        !rejecting.set(assume).contains(name) && rejecting.def_can(def, assume)
+                    })
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                if found.is_empty() {
+                    break;
+                }
+                rejecting.set_mut(assume).extend(found);
+            }
+        }
+        rejecting
     }
-    found
+
+    fn set(&self, assume: bool) -> &HashSet<String> {
+        if assume { &self.possible } else { &self.known }
+    }
+
+    fn set_mut(&mut self, assume: bool) -> &mut HashSet<String> {
+        if assume { &mut self.possible } else { &mut self.known }
+    }
+
+    /// Whether this function can hand its own call back. Only its own
+    /// statements count: a nested function hands back *its* call, and a trail
+    /// cannot return from the function at all (§9.6).
+    fn def_can(&self, def: &ClosureDef, assume: bool) -> bool {
+        match &def.body {
+            ClosureBody::Expr(expr) => self.yields(expr, assume),
+            ClosureBody::Block(body) => self.body_can(body, assume),
+        }
+    }
+
+    fn body_can(&self, body: &[Stmt], assume: bool) -> bool {
+        body.iter().any(|stmt| {
+            let here = match stmt {
+                Stmt::Expr { expr, .. } => self.yields(expr, assume),
+                Stmt::Return { values, .. } => {
+                    values.first().is_some_and(|value| self.yields(value, assume))
+                }
+                _ => false,
+            };
+            here || own_bodies(stmt).into_iter().any(|inner| self.body_can(inner, assume))
+        })
+    }
+
+    /// Whether this expression's result can start with `.reject`. A variable
+    /// is taken to hold an ordinary value; a call is asked about its callee.
+    fn yields(&self, expr: &Expr, assume: bool) -> bool {
+        match expr {
+            Expr::Sym(symbol) => is_reject_symbol(symbol),
+            Expr::Call { callee, .. } => match called_name(callee) {
+                Some((None, name)) if self.functions.contains(name) => {
+                    self.set(assume).contains(name)
+                }
+                Some((None, name)) if name == Native::Reject.name() => true,
+                Some((None, name)) if Native::lookup(name).is_some() => false,
+                // A builtin module's functions answer values, never `.reject`.
+                Some((Some(module), _)) if BUILTIN_MODULES.contains(&module) => false,
+                _ => assume,
+            },
+            _ => false,
+        }
+    }
+}
+
+/// The name a call is written with: `f(…)`, `::f(…)` and `x.f(…)` have no
+/// module, `m::f(…)` and `x.m::f(…)` have `m`.
+fn called_name(callee: &Expr) -> Option<(Option<&str>, &str)> {
+    match callee {
+        Expr::Name { name, .. } => Some((None, name)),
+        Expr::Namespace { module, name, .. } if module.is_empty() => Some((None, name)),
+        Expr::Namespace { module, name, .. } => Some((Some(module), name)),
+        Expr::Method { module, name, .. } => Some((module.as_deref(), name)),
+        _ => None,
+    }
+}
+
+fn is_reject_symbol(symbol: &SymLit) -> bool {
+    symbol.is_static() && symbol.name == "reject"
 }
 
 /// Whether `later` accepts every call `earlier` does, so nothing could ever
@@ -1721,6 +1851,16 @@ fn nested_bodies(stmt: &Stmt) -> Vec<&[Stmt]> {
         | Stmt::ParallelFor { body, .. }
         | Stmt::ParallelWhile { body, .. } => vec![body.as_slice()],
         Stmt::Parallel { trails, .. } => trails.iter().map(|t| t.body.as_slice()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The statement lists that belong to the same function as the statement:
+/// branches and loop bodies, but not a nested function's body or a trail's.
+fn own_bodies(stmt: &Stmt) -> Vec<&[Stmt]> {
+    match stmt {
+        Stmt::If { branches, .. } => branches.iter().map(|b| b.body.as_slice()).collect(),
+        Stmt::For { body, .. } | Stmt::While { body, .. } => vec![body.as_slice()],
         _ => Vec::new(),
     }
 }

@@ -24,12 +24,40 @@ print(parse("abcdef"))
 // It reaches every way a call can be written, including through a dot.
 print("xy".parse())
 
-// The messages are what a crash prints when nobody takes the call. Both of
-// these reject, so this one would end the program with
+// `reject(msg)` is `return .reject, msg`: it leaves the function because a
+// `.reject` that nothing consumes returns from the function it is in (§8.1).
+// That is what lets a helper reject on its caller's behalf, through any
+// number of calls, with nothing written to pass it on.
+fn reject_if(cond, why)
+	if cond
+		return .reject, why
+	end
+end
+
+fn describe_number(n)
+	return "some number"
+end
+
+fn describe_number(n)
+	reject_if(n < 0, "negative numbers go to the general one")
+	return "a non-negative number"
+end
+
+print(describe_number(4))
+print(describe_number(-4))
+
+// Consumed, a rejection is a value like any other.
+verdict, why := reject_if(.true, "just looking")
+print("\(verdict) because \(why)")
+
+// When every candidate rejects, the call answers with the rejection. Left
+// unconsumed at the top level it ends the program, listing every refusal:
 //
-//	crash: no `strict` took 1 argument(s)
-//	  strict(n) rejected it: negative numbers are not for me either
-//	  strict(n) rejected it: I only take numbers above ten
+//	crash: unhandled rejection: I only take numbers above ten
+//	  the top level of a file has no call to hand it back to
+//	  no `strict` took 1 argument(s)
+//	    strict(n) rejected it: negative numbers are not for me either
+//	    strict(n) rejected it: I only take numbers above ten
 //
 // fn strict(n)
 //	reject("I only take numbers above ten")
@@ -37,7 +65,7 @@ print("xy".parse())
 // fn strict(n)
 //	reject("negative numbers are not for me either")
 // end
-// print(strict(1))
+// strict(1)
 
 // Rejecting costs nothing: holding the arguments for the fall-back is a handle
 // and not a copy. A *write* is what costs — it splits a node the next candidate

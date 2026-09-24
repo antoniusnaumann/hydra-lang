@@ -45,7 +45,7 @@ print("regions: \([first, second, third])")
 // and the only way two trails can fill one list.
 seen := []
 parallel for region in [first, second, third]
-	push(&seen, region)
+	_ = push(&seen, region)
 end
 print("\(len(seen)) trails reported")
 
