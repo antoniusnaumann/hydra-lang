@@ -106,7 +106,7 @@ pub struct Frame {
     /// defaults to evaluate. Named arguments can leave holes, so this is a
     /// mask and not a count.
     pub provided: Vec<bool>,
-    /// Where a `.reject` this frame answers with goes (§3): the candidates the
+    /// Where a `:reject` this frame answers with goes (§3): the candidates the
     /// call has not tried yet, the arguments to try them with, and what the
     /// ones before it said on the way out. Absent for a module body or a
     /// trail, which no call opened.
@@ -117,6 +117,8 @@ pub struct Frame {
 pub struct RejectedBy {
     pub signature: String,
     pub message: Option<String>,
+    /// Refusals from a helper whose unconsumed result rejected this candidate.
+    pub cause: Option<String>,
 }
 
 /// Where a rejected call goes: the rest of the candidate list, in the order
@@ -196,8 +198,8 @@ pub struct BlockCtx {
     pub spawn_done: bool,
     /// Channel indices whose trail has ended.
     pub finished: Vec<usize>,
-    /// Values in flight: buffered by `.detach` and `.broadcast`, and offered by
-    /// a `.wait` whose sender is parked behind them. FIFO, so messages between
+    /// Values in flight: buffered by `:detach` and `:broadcast`, and offered by
+    /// a `:wait` whose sender is parked behind them. FIFO, so messages between
     /// one pair arrive in the order they were sent (channels §5).
     pub mail: VecDeque<Msg>,
     /// Trails parked in `send` or `receive`.
@@ -211,7 +213,7 @@ pub struct Msg {
     /// every trail but the sender.
     pub to: Option<Vec<usize>>,
     pub value: Value,
-    /// The sender, when it is parked until someone takes this (mode `.wait`).
+    /// The sender, when it is parked until someone takes this (mode `:wait`).
     pub waiter: Option<TaskId>,
 }
 
@@ -293,8 +295,8 @@ pub struct Task {
     /// instruction that spreads them (channels §6.2).
     pub extras: Vec<Value>,
     /// What the candidates of the last call that ran out of them said, while
-    /// the `.reject` it answered is still on its way somewhere. Diagnostic
-    /// only: printed if that `.reject` reaches a statement with nothing to hand
+    /// the `:reject` it answered is still on its way somewhere. Diagnostic
+    /// only: printed if that `:reject` reaches a statement with nothing to hand
     /// it to (§8.1), and dropped as soon as anything consumes a value.
     pub rejection: Option<String>,
 }

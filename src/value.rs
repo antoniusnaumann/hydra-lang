@@ -58,7 +58,7 @@ const MAX_REDIRECTS: usize = 64;
 
 // --- symbols ----------------------------------------------------------------
 
-/// An interned tag such as `.null` (§2, §5).
+/// An interned tag such as `:null` (§2, §5).
 ///
 /// Symbols are compared by identity. The intern table holds *weak* entries, so
 /// symbols minted from input data can be collected again — without that, a
@@ -92,7 +92,7 @@ impl std::hash::Hash for Sym {
 
 impl fmt::Debug for Sym {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, ".{}", self.0)
+        write!(f, ":{}", self.0)
     }
 }
 
@@ -291,6 +291,10 @@ pub enum Native {
     Receive,
     Channel,
     Reject,
+    Break,
+    Continue,
+    Exit,
+    Panic,
 
     // --- fs (spec/hydra_fs.md) ---------------------------------------------
     FsJoin,
@@ -335,6 +339,10 @@ pub const NATIVES: &[Native] = &[
     Native::Receive,
     Native::Channel,
     Native::Reject,
+    Native::Break,
+    Native::Continue,
+    Native::Exit,
+    Native::Panic,
     Native::FsJoin,
     Native::FsParent,
     Native::FsName,
@@ -411,16 +419,18 @@ impl Native {
             Native::Send => info!(
                 None,
                 "send",
-                "send(value, to*, mode = .wait)",
+                "send(value, to*, mode = :wait)",
                 &[("value", Plain), ("to", Variadic), ("mode", Def)]
             ),
             Native::Receive => info!(None, "receive", "receive(from*)", &[("from", Variadic)]),
             Native::Channel => info!(None, "channel", "channel()", &[]),
-            // `reject()` answers `.reject`, and `reject(message)` answers
-            // `.reject, message` — the message is what a crash prints when the
-            // rejection reaches nothing that takes it (§3, §8.1).
+            // `reject(msg)` constructs one tagged list: [:reject, msg].
+            Native::Break => info!(None, "break", "break()", &[]),
+            Native::Continue => info!(None, "continue", "continue()", &[]),
+            Native::Exit => info!(None, "exit", "exit(code = 0)", &[("code", Def)]),
+            Native::Panic => info!(None, "panic", "panic(msg)", &[("msg", Plain)]),
             Native::Reject => {
-                info!(None, "reject", "reject(message = .null)", &[("message", Def)])
+                info!(None, "reject", "reject(msg = :null)", &[("msg", Def)])
             }
 
             // --- fs: paths ------------------------------------------------
@@ -477,13 +487,13 @@ impl Native {
             Native::FsList => info!(
                 FS,
                 "list",
-                "list(dir, *, match = \"*\", recursive = .false)",
+                "list(dir, *, match = \"*\", recursive = :false)",
                 &[("dir", Plain), ("", Star), ("match", Def), ("recursive", Def)]
             ),
             Native::FsListOr => info!(
                 FS,
                 "list",
-                "list(dir, fallback, *, match = \"*\", recursive = .false)",
+                "list(dir, fallback, *, match = \"*\", recursive = :false)",
                 &[
                     ("dir", Plain),
                     ("fallback", Plain),
@@ -497,7 +507,7 @@ impl Native {
             Native::FsWrite => info!(
                 FS,
                 "write",
-                "write(path, text, *, mode = .replace, parents = .true)",
+                "write(path, text, *, mode = :replace, parents = :true)",
                 &[
                     ("path", Plain),
                     ("text", Plain),
@@ -509,7 +519,7 @@ impl Native {
             Native::FsCopy => info!(
                 FS,
                 "copy",
-                "copy(source, target, *, overwrite = .true, parents = .true)",
+                "copy(source, target, *, overwrite = :true, parents = :true)",
                 &[
                     ("source", Plain),
                     ("target", Plain),
@@ -521,7 +531,7 @@ impl Native {
             Native::FsMove => info!(
                 FS,
                 "move",
-                "move(source, target, *, overwrite = .false, parents = .true)",
+                "move(source, target, *, overwrite = :false, parents = :true)",
                 &[
                     ("source", Plain),
                     ("target", Plain),
@@ -533,13 +543,13 @@ impl Native {
             Native::FsRemove => info!(
                 FS,
                 "remove",
-                "remove(path, *, recursive = .false)",
+                "remove(path, *, recursive = :false)",
                 &[("path", Plain), ("", Star), ("recursive", Def)]
             ),
             Native::FsMakeDir => info!(
                 FS,
                 "make_dir",
-                "make_dir(path, *, parents = .true)",
+                "make_dir(path, *, parents = :true)",
                 &[("path", Plain), ("", Star), ("parents", Def)]
             ),
 
@@ -640,7 +650,6 @@ impl Native {
     pub fn returns(self) -> usize {
         match self {
             Native::Receive
-            | Native::Reject
             | Native::FsSizeOr
             | Native::FsModifiedOr
             | Native::FsReadOr
@@ -708,7 +717,7 @@ impl Value {
         }
     }
 
-    /// `.null` and `.false` are falsy. *Everything else is truthy*, including
+    /// `:null` and `:false` are falsy. *Everything else is truthy*, including
     /// `0`, `""` and `[]` (§5).
     pub fn truthy(&self) -> bool {
         match self {
@@ -795,7 +804,7 @@ pub fn resolve_index(raw: isize, len: usize) -> Result<usize, Crash> {
 
 /// Turn an evaluated key into a path segment.
 ///
-/// `d.k` is exactly `d[.k]` (§5), so there is one code path here and not two.
+/// `d.k` is exactly `d[:k]` (§5), so there is one code path here and not two.
 pub fn path_segment(key: &Value) -> Result<PathSeg, Crash> {
     match key {
         Value::Sym(s) => Ok(PathSeg::Key(s.clone())),
@@ -1301,9 +1310,9 @@ fn to_text_at(v: &Value, depth: u32) -> String {
         Value::Str(s) => s.to_string(),
         Value::Sym(s) => {
             if crate::lexer::is_symbol_name(s.name()) {
-                format!(".{}", s.name())
+                format!(":{}", s.name())
             } else {
-                format!(".\"{}\"", crate::lexer::escape_string(s.name()))
+                format!(":\"{}\"", crate::lexer::escape_string(s.name()))
             }
         }
         Value::List(rc) => {

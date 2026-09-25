@@ -41,7 +41,7 @@ fn run_executes_a_program_and_it_can_print() {
     assert!(text.contains("regions: [eu, us-east, ap]"), "{text}");
     assert!(text.contains("3 trails reported"), "{text}");
     // `alive()` is true outside any trail (§9.5).
-    assert!(text.contains("outside a trail, alive() is .true"), "{text}");
+    assert!(text.contains("outside a trail, alive() is :true"), "{text}");
 }
 
 #[test]
@@ -49,6 +49,21 @@ fn print_ends_with_a_newline_unless_told_otherwise() {
     let out = hydra(&["run", "tests/fixtures/printing.hy"]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(stdout(&out), "one\ntwo three\n");
+}
+
+#[test]
+fn commented_continuation_fixtures_run_as_documented() {
+    for (file, expected) in [
+        ("tests/fixtures/loop_control.hy", "4\n:break\nHydra\n4\ndone\n"),
+        ("tests/fixtures/continuations.hy", "42\n30\n4\n20\n30\n7\n"),
+        ("tests/fixtures/continuation_boundaries.hy", "32\n-2\n:bar\n1\n:reject\n[:reject, :null]\n"),
+        ("tests/fixtures/continuation_atoms.hy", ":some-other-prop+interesting_added_info\n17\n[:a.b, :trailing-, :x*y]\n9\n17\n"),
+        ("tests/fixtures/continuation_trails.hy", "42, 26\n32, 40\n32, 34\n"),
+    ] {
+        let out = hydra(&["run", file, "--strict"]);
+        assert!(out.status.success(), "{file}: {}", stderr(&out));
+        assert_eq!(stdout(&out), expected, "{file}");
+    }
 }
 
 #[test]
@@ -125,7 +140,7 @@ fn fmt_prints_the_canonical_form_and_check_verifies_it() {
 
     let out = hydra(&["fmt", "tests/fixtures/unformatted.hy"]);
     assert!(out.status.success());
-    assert_eq!(stdout(&out), "if a\n\tx := 1 + 2\n\td := { .k : &x }\nend\n");
+    assert_eq!(stdout(&out), "if a\n\tx := 1 + 2\n\td := { :k : &x }\nend\n");
 
     let out = hydra(&["fmt", "tests/fixtures/unformatted.hy", "--check"]);
     assert_eq!(out.status.code(), Some(1));
@@ -138,7 +153,7 @@ fn fmt_formats_standard_input_onto_standard_output() {
     let source = std::fs::read_to_string("tests/fixtures/unformatted.hy").expect("reads");
     let out = hydra_stdin(&["fmt", "-"], &source);
     assert!(out.status.success(), "{}", stderr(&out));
-    assert_eq!(stdout(&out), "if a\n\tx := 1 + 2\n\td := { .k : &x }\nend\n");
+    assert_eq!(stdout(&out), "if a\n\tx := 1 + 2\n\td := { :k : &x }\nend\n");
 
     let canonical = stdout(&out);
 
@@ -170,4 +185,42 @@ fn usage_is_available() {
     assert!(stdout(&out).contains("hydra run"));
     let out = hydra(&["nonsense"]);
     assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn rejection_messages_are_silent_if_a_signature_accepts() {
+    let out = hydra(&["run", "tests/fixtures/rejection_fallback.hy"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "accepted\n:reject: just data\n");
+    assert_eq!(stderr(&out), "");
+}
+
+#[test]
+fn the_standard_rejection_handler_reports_all_messages_and_fails() {
+    let out = hydra(&["run", "tests/fixtures/rejection_exhausted.hy"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "");
+    let diagnostic = stderr(&out);
+    assert!(diagnostic.contains("unhandled rejection"), "{diagnostic}");
+    for message in ["inner newest declined", "inner fallback declined", "outer fallback declined"] {
+        assert_eq!(diagnostic.matches(message).count(), 1, "{diagnostic}");
+    }
+    assert!(!diagnostic.contains("unreachable"));
+}
+
+#[test]
+fn exit_uses_the_requested_status_without_a_crash_diagnostic() {
+    let out = hydra(&["run", "tests/fixtures/exit.hy"]);
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(stdout(&out), "before exit\n");
+    assert_eq!(stderr(&out), "");
+}
+
+#[test]
+fn panic_reports_the_message_and_call_trace_and_fails() {
+    let out = hydra(&["run", "tests/fixtures/panic.hy"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "");
+    assert!(stderr(&out).contains("panic: something went wrong"));
+    assert!(stderr(&out).contains("called from"));
 }

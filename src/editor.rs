@@ -18,7 +18,7 @@ pub const CLASSES: &[(&str, &str, &str)] = &[
     ("punctuation.trail", "#ff8a6580", ""),
     ("keyword.control", "#c586c0", ""),
     ("keyword.other", "#569cd6", ""),
-    ("entity.symbol", "#4ec9b0", ""),
+    ("punctuation.delimiter", "#d4d4d4", ""),
     ("entity.namespace", "#4ec9b0", ""),
     ("variable", "#9cdcfe", ""),
     ("variable.property", "#9cdcfe", ""),
@@ -30,7 +30,8 @@ pub const CLASSES: &[(&str, &str, &str)] = &[
 ];
 
 const CONTROL: &[&str] =
-    &["if", "else", "else if", "for", "in", "while", "return", "break", "continue", "end"];
+    &["if", "else", "else if", "for", "in", "while", "return", "end"];
+const CONTROL_HANDLERS: &[&str] = &["exit", "panic", "reject"];
 const OTHER: &[&str] = &["fn", "use", "and", "or", "not", "as"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,7 +56,11 @@ pub fn class_of(tok: &Token, prev: Option<&Token>, next: Option<&Token>) -> Opti
         Tok::Newline | Tok::Eof => None,
         Tok::Str { .. } => Some("string"),
         Tok::Num { .. } => Some("constant.numeric"),
-        Tok::Sym { .. } => Some("entity.symbol"),
+        Tok::Sym { .. } => Some(if tok.static_str().is_some_and(|name| CONTROL_HANDLERS.contains(&name.as_str())) {
+            "keyword.control"
+        } else {
+            "constant"
+        }),
         Tok::Kw(kw) => Some(if kw.starts_with("parallel") || kw.starts_with("race") {
             // `parallel`, `race`, and every compound built on them, coloured as
             // one unit (§13).
@@ -79,7 +84,7 @@ pub fn class_of(tok: &Token, prev: Option<&Token>, next: Option<&Token>) -> Opti
                 return Some("entity.namespace");
             }
             if next.map(|t| t.is_op("(")).unwrap_or(false) {
-                return Some("entity.function");
+                return Some(if CONTROL_HANDLERS.contains(&name.as_str()) && !prev.is_some_and(|t| t.is_op(".")) { "keyword.control" } else { "entity.function" });
             }
             if prev.map(|t| t.is_op(".")).unwrap_or(false) {
                 return Some("variable.property");
@@ -100,7 +105,14 @@ pub fn semantic_tokens(src: &str, file: &str) -> Result<Vec<SemanticToken>> {
     for (i, tok) in lexed.tokens.iter().enumerate() {
         let prev = i.checked_sub(1).map(|j| &lexed.tokens[j]);
         let next = lexed.tokens.get(i + 1);
-        if let Some(class) = class_of(tok, prev, next) {
+        if let Tok::Sym { .. } = &tok.kind {
+            out.push(SemanticToken { line: tok.pos.line, col: tok.pos.col, len: 1, class: "punctuation.delimiter" });
+            out.push(SemanticToken { line: tok.pos.line, col: tok.pos.col + 1, len: tok.len - 1, class: class_of(tok, prev, next).expect("atom class") });
+        } else if let Some(mut class) = class_of(tok, prev, next) {
+            if class == "keyword.control" && prev.is_some_and(|t| t.is_op("::"))
+                && i.checked_sub(2).is_some_and(|j| matches!(lexed.tokens[j].kind, Tok::Ident(_))) {
+                class = "entity.function";
+            }
             out.push(SemanticToken { line: tok.pos.line, col: tok.pos.col, len: tok.len, class });
         }
     }
@@ -137,11 +149,25 @@ pub fn tmlanguage_json() -> String {
     patterns.push(rule("keyword.other", &format!("\\b({})\\b", OTHER.join("|"))));
 
     patterns.push(rule("punctuation.trail", r"\|\|"));
-    patterns.push(rule(
-        "entity.symbol",
-        // A symbol's name may contain `-`, as long as it is internal (§2).
-        r#"\.(\"[^\"]*\"|[A-Za-z_][A-Za-z0-9_]*(-[A-Za-z0-9_]+)*)"#,
+    let qualified_control = r"(?<![\w.:])(::)(exit|panic|reject)(?=[ \t]*\()";
+    patterns.push(format!(
+        "    {{ \"match\": \"{}\", \"captures\": {{ \"1\": {{ \"name\": \"punctuation.delimiter.hydra\" }}, \"2\": {{ \"name\": \"keyword.control.hydra\" }} }} }}",
+        escape_json(qualified_control)
     ));
+    patterns.push(rule("punctuation.delimiter", "::"));
+    patterns.push(rule("keyword.control", r"(?<![\w.:])(?:exit|panic|reject)(?=[ \t]*\()"));
+    let control_atom = r#"(:)(\"exit\"|\"panic\"|\"reject\"|(?:exit|panic|reject)(?=$|[\s()\[\]{},:\"]|//|\|\|))(:)?"#;
+    patterns.push(format!(
+        "    {{ \"match\": \"{}\", \"captures\": {{ \"1\": {{ \"name\": \"punctuation.delimiter.hydra\" }}, \"2\": {{ \"name\": \"keyword.control.hydra\" }}, \"3\": {{ \"name\": \"punctuation.delimiter.hydra\" }} }} }}",
+        escape_json(control_atom)
+    ));
+    // Match the prefix and payload separately so only the atom text is constant.
+    let atom = r#"(:)(\"[^\"]*\"|[A-Za-z_](?:(?!//|\|\|)[^\s()\[\]{},:\"])*)(:)?"#;
+    patterns.push(format!(
+        "    {{ \"match\": \"{}\", \"captures\": {{ \"1\": {{ \"name\": \"punctuation.delimiter.hydra\" }}, \"2\": {{ \"name\": \"constant.hydra\" }}, \"3\": {{ \"name\": \"punctuation.delimiter.hydra\" }} }} }}",
+        escape_json(atom)
+    ));
+    patterns.push(rule("punctuation.delimiter", ":"));
     patterns.push(rule("entity.namespace", "[A-Za-z_][A-Za-z0-9_]*(?=::)"));
     patterns.push(rule("entity.function", r"[A-Za-z_][A-Za-z0-9_]*(?=\()"));
     patterns.push(rule("constant.numeric", r"\b[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?\b"));

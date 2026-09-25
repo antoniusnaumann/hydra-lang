@@ -1,18 +1,20 @@
 //! The parser (spec §3) and the parallel-block transposer (spec §4).
 //!
-//! Ordinary statements are one line each, so the parser is a straightforward
-//! precedence climber. The unusual part is `parallel` / `race`: those blocks are
+//! Expressions aggressively continue across single newlines; blank lines stop
+//! continuation. The parser is a straightforward precedence climber.
+//! The unusual part is `parallel` / `race`: those blocks are
 //! parsed **column-wise**, by splitting every row on top-level `||` and
 //! concatenating cell *k* of every row into trail *k*'s token stream. Every
 //! token keeps its original position, so a diagnostic from inside a trail
 //! points at the real source line and not at the transposed one (§4 step 6).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::ast::*;
 use crate::errors::{HydraError, Pos, Result};
 use crate::lexer::{
-    compound_assign, static_text, tokenize, StrPiece, Tok, Token, TRAIL_LABEL, TRAIL_SEP,
+    compound_assign, static_text, tokenize, StrPiece, Tok, Token, TRAIL_SEP,
 };
 
 /// Keywords that end a block body without being part of it.
@@ -31,10 +33,28 @@ fn spine_has_call(expr: &Expr) -> bool {
 }
 
 pub fn parse(src: &str, file: &str) -> Result<Program> {
+    parse_with_tokens(src, file).map(|(program, _)| program)
+}
+
+/// Return the parsed program and its tokens for the formatter.
+pub(crate) fn parse_with_tokens(src: &str, file: &str) -> Result<(Program, Vec<Token>)> {
     let lexed = tokenize(src, file)?;
+    let mut comment_lines: HashSet<u32> = lexed.comments.keys().copied().collect();
+    for token in &lexed.tokens {
+        if !token.is_newline() && !token.is_eof() {
+            comment_lines.remove(&token.pos.line);
+        }
+    }
     let mut parser = Parser::new(lexed.tokens, file, false);
+    parser.comment_lines = comment_lines;
     let body = parser.parse_program()?;
-    Ok(Program { body, file: file.to_string(), comments: lexed.comments, line_count: lexed.line_count })
+    let program = Program {
+        body,
+        file: file.to_string(),
+        comments: lexed.comments,
+        line_count: lexed.line_count,
+    };
+    Ok((program, parser.toks))
 }
 
 pub struct Parser<'a> {
@@ -44,11 +64,13 @@ pub struct Parser<'a> {
     /// True while parsing a transposed trail stream. A `parallel` or `race`
     /// block may not appear syntactically inside a cell (§4).
     in_cell: bool,
+    /// Comment-only lines are transparent; truly blank lines are boundaries.
+    comment_lines: HashSet<u32>,
 }
 
 impl<'a> Parser<'a> {
     pub fn new(toks: Vec<Token>, file: &'a str, in_cell: bool) -> Parser<'a> {
-        Parser { toks, i: 0, file, in_cell }
+        Parser { toks, i: 0, file, in_cell, comment_lines: HashSet::new() }
     }
 
     // --- token access -------------------------------------------------------
@@ -77,7 +99,39 @@ impl<'a> Parser<'a> {
         Err(HydraError::new(message, self.file, pos))
     }
 
+    /// Look past one line ending and any comment-only lines, but never a
+    /// blank line. This lookahead does not commit until syntax requests it.
+    fn continued_index(&self, index: usize) -> usize {
+        let index = index.min(self.toks.len() - 1);
+        if !self.toks[index].is_newline() {
+            return index;
+        }
+        let mut next = (index + 1).min(self.toks.len() - 1);
+        while self.toks[next].is_newline()
+            && self.comment_lines.contains(&self.toks[next].pos.line)
+        {
+            next += 1;
+        }
+        if self.toks[next].is_newline() { index } else { next }
+    }
+
+    fn soft_newline(&mut self) {
+        self.i = self.continued_index(self.i);
+    }
+
+    fn continue_before(&mut self, accepts: impl FnOnce(&Token) -> bool) {
+        let next = self.continued_index(self.i);
+        if accepts(&self.toks[next]) {
+            self.i = next;
+        }
+    }
+
+    fn following_op(&self, op: &str) -> bool {
+        self.toks[self.continued_index(self.i + 1)].is_op(op)
+    }
+
     fn eat_op(&mut self, op: &str) -> bool {
+        self.continue_before(|t| t.is_op(op));
         if self.peek().is_op(op) {
             self.advance();
             true
@@ -96,6 +150,7 @@ impl<'a> Parser<'a> {
     }
 
     fn expect_op(&mut self, op: &str) -> Result<Token> {
+        self.continue_before(|t| t.is_op(op));
         if self.peek().is_op(op) {
             Ok(self.advance())
         } else {
@@ -112,6 +167,7 @@ impl<'a> Parser<'a> {
     }
 
     fn expect_ident(&mut self, what: &str) -> Result<(String, Pos)> {
+        self.soft_newline();
         let pos = self.pos();
         match self.peek().ident() {
             Some(name) => {
@@ -123,7 +179,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// A newline terminates a statement; end of file does too (§1).
+    /// A newline not consumed by continuation ends a statement, as does EOF.
     fn expect_end_of_statement(&mut self) -> Result<()> {
         if self.peek().is_newline() {
             self.advance();
@@ -180,13 +236,11 @@ impl<'a> Parser<'a> {
 
     /// An optional `as name` label on a loop or block (§9.6).
     fn parse_label(&mut self) -> Result<Option<String>> {
+        self.continue_before(|t| t.is_kw("as"));
         if !self.eat_kw("as") {
             return Ok(None);
         }
-        let (name, pos) = self.expect_ident("a label name")?;
-        if name == TRAIL_LABEL {
-            return self.err("`trail` is a reserved label and cannot be declared", pos);
-        }
+        let (name, _) = self.expect_ident("a label name")?;
         Ok(Some(name))
     }
 
@@ -206,8 +260,6 @@ impl<'a> Parser<'a> {
                 "parallel" | "race" => return self.parse_parallel_rows(kw, pos),
                 "parallel for" | "race for" => return self.parse_parallel_for(kw, pos),
                 "parallel while" | "race while" => return self.parse_parallel_while(kw, pos),
-                "break" => return self.parse_break(pos),
-                "continue" => return self.parse_continue(pos),
                 "return" => return self.parse_return(pos),
                 "end" => return self.err("`end` without a matching block", pos),
                 _ => {}
@@ -221,12 +273,15 @@ impl<'a> Parser<'a> {
         // list or a dict.
         let expr = self.parse_expr()?;
         let mut targets = vec![expr];
-        while self.peek().is_op(",") {
-            self.advance();
+        while self.eat_op(",") {
             targets.push(self.parse_expr()?);
         }
         let several = targets.len() > 1;
 
+        self.continue_before(|t| {
+            t.is_op(":=") || t.is_op("=")
+                || matches!(t.kind, Tok::Op(op) if compound_assign(op).is_some())
+        });
         if self.peek().is_op(":=") {
             self.advance();
             let value = self.parse_expr()?;
@@ -341,9 +396,11 @@ impl<'a> Parser<'a> {
     /// §6.1).
     fn parse_params(&mut self) -> Result<Vec<Param>> {
         self.expect_op("(")?;
+        self.soft_newline();
         let mut params: Vec<Param> = Vec::new();
         if !self.peek().is_op(")") {
             loop {
+                self.soft_newline();
                 let keyword_only = params.iter().any(|p| p.variadic);
                 let star_pos = self.pos();
                 if self.eat_op("*") {
@@ -487,41 +544,6 @@ impl<'a> Parser<'a> {
         Ok(Stmt::While { cond, body, label, pos, end_pos })
     }
 
-    fn parse_break(&mut self, pos: Pos) -> Result<Stmt> {
-        self.advance();
-        let target = match self.peek().ident() {
-            Some(name) if name == TRAIL_LABEL => {
-                self.advance();
-                BreakTarget::Trail
-            }
-            Some(name) => {
-                let name = name.to_string();
-                self.advance();
-                BreakTarget::Label(name)
-            }
-            None => BreakTarget::Innermost,
-        };
-        self.expect_end_of_statement()?;
-        Ok(Stmt::Break { target, pos })
-    }
-
-    fn parse_continue(&mut self, pos: Pos) -> Result<Stmt> {
-        self.advance();
-        let label = match self.peek().ident() {
-            Some(name) if name == TRAIL_LABEL => {
-                return self.err("`continue trail` does not exist; only `break trail` does", self.pos())
-            }
-            Some(name) => {
-                let name = name.to_string();
-                self.advance();
-                Some(name)
-            }
-            None => None,
-        };
-        self.expect_end_of_statement()?;
-        Ok(Stmt::Continue { label, pos })
-    }
-
     fn parse_return(&mut self, pos: Pos) -> Result<Stmt> {
         self.advance();
         let mut values = Vec::new();
@@ -655,9 +677,17 @@ impl<'a> Parser<'a> {
         for column in 0..width {
             let mut stream: Vec<Token> = Vec::new();
             let mut first_pos: Option<Pos> = None;
+            let mut previous_line = None;
             for row in &rows {
+                if previous_line.is_some_and(|line| {
+                    (line + 1..row.line).any(|gap| !self.comment_lines.contains(&gap))
+                }) {
+                    stream.push(Token::new(Tok::Newline, Pos::new(row.line - 1, 1)));
+                }
+                previous_line = Some(row.line);
                 let cell = &row.cells[column];
                 if cell.tokens.is_empty() {
+                    stream.push(Token::new(Tok::Newline, Pos::new(row.line, 1)));
                     continue;
                 }
                 first_pos.get_or_insert(cell.pos);
@@ -668,6 +698,11 @@ impl<'a> Parser<'a> {
             stream.push(Token::new(Tok::Eof, self.pos()));
             let mut sub = Parser::new(stream, self.file, true);
             let body = sub.parse_program()?;
+            for row in &mut rows {
+                row.cells[column].tokens = sub.toks.iter()
+                    .filter(|t| t.pos.line == row.line && !t.is_newline() && !t.is_eof())
+                    .cloned().collect();
+            }
             trails.push(TrailDef { body, column, pos: first_pos.unwrap_or(pos) });
         }
 
@@ -769,30 +804,36 @@ impl<'a> Parser<'a> {
     // --- expressions (§3 precedence table) ---------------------------------
 
     pub fn parse_expr(&mut self) -> Result<Expr> {
+        self.soft_newline();
         self.parse_or()
     }
 
     fn parse_or(&mut self) -> Result<Expr> {
         let mut left = self.parse_and()?;
+        self.continue_before(|t| t.is_kw("or"));
         while self.peek().is_kw("or") {
             let pos = self.advance().pos;
             let right = self.parse_and()?;
             left = Expr::Binary { op: "or", left: Box::new(left), right: Box::new(right), pos };
+            self.continue_before(|t| t.is_kw("or"));
         }
         Ok(left)
     }
 
     fn parse_and(&mut self) -> Result<Expr> {
         let mut left = self.parse_not()?;
+        self.continue_before(|t| t.is_kw("and"));
         while self.peek().is_kw("and") {
             let pos = self.advance().pos;
             let right = self.parse_not()?;
             left = Expr::Binary { op: "and", left: Box::new(left), right: Box::new(right), pos };
+            self.continue_before(|t| t.is_kw("and"));
         }
         Ok(left)
     }
 
     fn parse_not(&mut self) -> Result<Expr> {
+        self.soft_newline();
         if self.peek().is_kw("not") {
             let pos = self.advance().pos;
             let operand = self.parse_not()?;
@@ -836,6 +877,7 @@ impl<'a> Parser<'a> {
         next: fn(&mut Parser<'a>) -> Result<Expr>,
     ) -> Result<Expr> {
         let mut left = next(self)?;
+        self.continue_before(|t| matches!(t.kind, Tok::Op(op) if ops.contains(&op)));
         while let Tok::Op(op) = self.peek().kind {
             if !ops.contains(&op) {
                 break;
@@ -843,11 +885,13 @@ impl<'a> Parser<'a> {
             let pos = self.advance().pos;
             let right = next(self)?;
             left = Expr::Binary { op, left: Box::new(left), right: Box::new(right), pos };
+            self.continue_before(|t| matches!(t.kind, Tok::Op(op) if ops.contains(&op)));
         }
         Ok(left)
     }
 
     fn parse_unary(&mut self) -> Result<Expr> {
+        self.soft_newline();
         let pos = self.pos();
         if self.peek().is_op("-") {
             self.advance();
@@ -938,6 +982,7 @@ impl<'a> Parser<'a> {
     fn parse_postfix(&mut self) -> Result<Expr> {
         let mut expr = self.parse_primary()?;
         loop {
+            self.continue_before(|t| [".", "(", "[", "::"].iter().any(|op| t.is_op(op)));
             let pos = self.pos();
             if self.peek().is_op("(") {
                 self.advance();
@@ -955,15 +1000,17 @@ impl<'a> Parser<'a> {
             }
             if self.peek().is_op(".") {
                 self.advance();
+                self.soft_newline();
                 // A name with a call after it is a *method* callee: the
                 // receiver decides which call it is (§5.2). A name with `::`
                 // after it names the module the call comes from, and then
                 // nothing is left to decide (§7).
                 if let Some(name) = self.peek().ident().map(str::to_string) {
-                    if self.peek_at(1).is_op("::") {
+                    if self.following_op("::") {
                         self.advance();
-                        self.advance();
+                        self.expect_op("::")?;
                         let (call, _) = self.expect_ident("a name after `::`")?;
+                        self.continue_before(|t| t.is_op("("));
                         if !self.peek().is_op("(") {
                             return self.err(
                                 "a qualified name is a function, so it needs a call: \
@@ -979,7 +1026,7 @@ impl<'a> Parser<'a> {
                         };
                         continue;
                     }
-                    if self.peek_at(1).is_op("(") {
+                    if self.following_op("(") {
                         self.advance();
                         expr = Expr::Method { obj: Box::new(expr), module: None, name, pos };
                         continue;
@@ -987,7 +1034,7 @@ impl<'a> Parser<'a> {
                 }
                 let key = match &self.peek().kind {
                     Tok::Ident(name) => SymLit::plain(name.clone(), false, pos),
-                    // `headers."content-type"` is `headers[."content-type"]`,
+                    // `headers."content-type"` is `headers[:"content-type"]`,
                     // and it may interpolate like any other quoted symbol (§2).
                     Tok::Str { parts } => self.sym_lit(parts, true, pos)?,
                     _ => return self.err(
@@ -1016,17 +1063,19 @@ impl<'a> Parser<'a> {
     /// `arg = [ ident "=" ] expr`. A named argument fills the parameter it
     /// names; they come after the positional ones.
     fn parse_args(&mut self) -> Result<Vec<Arg>> {
+        self.soft_newline();
         let mut args: Vec<Arg> = Vec::new();
         if self.peek().is_op(")") {
             return Ok(args);
         }
         loop {
+            self.soft_newline();
             let pos = self.pos();
             // `name = value` is a named argument. There is no ambiguity with an
             // assignment: assignment is a statement, never an expression (§3).
             // A keyword cannot be a name, so say that rather than "expected an
             // expression" when someone writes `f(end = 1)`.
-            if matches!(self.peek().kind, Tok::Kw(_)) && self.peek_at(1).is_op("=") {
+            if matches!(self.peek().kind, Tok::Kw(_)) && self.following_op("=") {
                 return self.err(
                     format!(
                         "`{}` is a keyword and cannot be an argument name",
@@ -1035,7 +1084,7 @@ impl<'a> Parser<'a> {
                     pos,
                 );
             }
-            let named = self.peek().ident().is_some() && self.peek_at(1).is_op("=");
+            let named = self.peek().ident().is_some() && self.following_op("=");
             if named {
                 let (name, _) = self.expect_ident("an argument name")?;
                 self.expect_op("=")?;
@@ -1091,6 +1140,7 @@ impl<'a> Parser<'a> {
             }
             Tok::Op("[") => {
                 self.advance();
+                self.soft_newline();
                 let mut items = Vec::new();
                 if !self.peek().is_op("]") {
                     loop {
@@ -1117,9 +1167,11 @@ impl<'a> Parser<'a> {
 
     fn parse_dict(&mut self, pos: Pos) -> Result<Expr> {
         self.advance(); // {
+        self.soft_newline();
         let mut entries: Vec<(SymLit, Expr)> = Vec::new();
         if !self.peek().is_op("}") {
             loop {
+                self.soft_newline();
                 let key_pos = self.pos();
                 let key = match &self.peek().kind {
                     Tok::Sym { parts, quoted } => self.sym_lit(parts, *quoted, key_pos)?,

@@ -145,7 +145,7 @@ fn run(path: &Path, args: &[String]) -> ExitCode {
                     eprintln!("{crash}");
                     ExitCode::from(1)
                 }
-                None => ExitCode::SUCCESS,
+                None => ExitCode::from(result.exit_code.unwrap_or(0)),
             }
         }
     }

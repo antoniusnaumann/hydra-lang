@@ -1,9 +1,9 @@
 //! The formatter (spec §12).
 //!
 //! The formatter owns column padding and its output is the canonical form. The
-//! rule that shapes the whole design is rule 4: **never move a line break**,
-//! because a newline terminates a statement. So formatting is per line —
-//! re-render the line's tokens with canonical spacing, and put it at the indent
+//! rule that shapes the whole design is rule 4: preserve continuation boundaries,
+//! because newlines and blank lines control continuation. Formatting is per
+//! line: re-render its tokens with canonical spacing, and put it at the indent
 //! its nesting level implies.
 //!
 //! Two consequences worth stating:
@@ -15,22 +15,21 @@
 //!   widest in their column (rule 5). A one-character edit therefore re-pads
 //!   the block, which §12 accepts as the price of aligned columns.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
 use crate::errors::Result;
-use crate::lexer::{is_identifier, is_symbol_name, static_text, tokenize, StrPiece, Tok, Token};
-use crate::parser::parse;
+use crate::lexer::{is_identifier, is_symbol_name, static_text, StrPiece, Tok, Token};
+use crate::parser::parse_with_tokens;
 
 /// Format a source file. The output is canonical and formatting it again
 /// changes nothing (rule 6).
 pub fn format_source(src: &str, file: &str) -> Result<String> {
-    let lexed = tokenize(src, file)?;
-    let program = parse(src, file)?;
+    let (program, tokens) = parse_with_tokens(src, file)?;
 
     let line_count = src.lines().count().max(1) as u32;
     let mut lines: HashMap<u32, Vec<Token>> = HashMap::new();
-    for token in &lexed.tokens {
+    for token in &tokens {
         if matches!(token.kind, Tok::Newline | Tok::Eof) {
             continue;
         }
@@ -40,8 +39,24 @@ pub fn format_source(src: &str, file: &str) -> Result<String> {
     let mut f = Formatter {
         indent: vec![0; (line_count + 2) as usize],
         rows: HashMap::new(),
+        statement_starts: HashSet::new(),
     };
     f.statements(&program.body, 0);
+
+    // Only separate complete statements. A closure's `end` may be followed by
+    // a call or operator continuing the same expression; a blank would change
+    // its meaning. Parallel rows likewise share boundaries across columns.
+    let significant: Vec<_> = tokens.iter().filter(|t| !t.is_newline() && !t.is_eof()).collect();
+    let mut separate_after = HashSet::new();
+    for pair in significant.windows(2) {
+        let (end, next) = (pair[0], pair[1]);
+        if end.is_kw("end") && next.pos.line > end.pos.line
+            && !next.is_kw("end") && f.statement_starts.contains(&next.pos.line)
+            && !f.rows.contains_key(&end.pos.line)
+        {
+            separate_after.insert(end.pos.line);
+        }
+    }
 
     let mut out = String::new();
     for line in 1..=line_count {
@@ -53,7 +68,7 @@ pub fn format_source(src: &str, file: &str) -> Result<String> {
                 None => String::new(),
             },
         };
-        let comment = lexed.comments.get(&line).map(|(_, text)| text.clone());
+        let comment = program.comments.get(&line).map(|(_, text)| text.clone());
 
         let mut rendered = String::new();
         if !text.is_empty() || comment.is_some() {
@@ -71,6 +86,11 @@ pub fn format_source(src: &str, file: &str) -> Result<String> {
         }
         out.push_str(&rendered);
         out.push('\n');
+        if separate_after.contains(&line)
+            && (lines.contains_key(&(line + 1)) || program.comments.contains_key(&(line + 1)))
+        {
+            out.push('\n');
+        }
     }
     Ok(out)
 }
@@ -85,6 +105,8 @@ struct Formatter {
     indent: Vec<usize>,
     /// Pre-rendered, column-padded rows of `parallel` blocks, by line.
     rows: HashMap<u32, String>,
+    /// Lines starting independent statements or branches, safe to separate.
+    statement_starts: HashSet<u32>,
 }
 
 impl Formatter {
@@ -115,6 +137,7 @@ impl Formatter {
     }
 
     fn statement(&mut self, stmt: &Stmt, depth: usize) {
+        self.statement_starts.insert(stmt.pos().line);
         self.set(stmt.pos().line, depth);
         match stmt {
             Stmt::If { branches, end_pos, .. } => {
@@ -122,6 +145,7 @@ impl Formatter {
                     self.fill(branch.pos.line + 1, end_pos.line.saturating_sub(1), depth + 1);
                 }
                 for branch in branches {
+                    self.statement_starts.insert(branch.pos.line);
                     self.statements(&branch.body, depth + 1);
                     self.set(branch.pos.line, depth);
                     if let Some(cond) = &branch.cond {
@@ -315,7 +339,7 @@ fn render(tokens: &[Token]) -> String {
         if i > 0 && !variadic[i] && needs_space(&tokens[i - 1], tok, prefix[i - 1]) {
             out.push(' ');
         }
-        out.push_str(&text_of(tok, i.checked_sub(1).map(|j| &tokens[j])));
+        out.push_str(&text_of(tok, i.checked_sub(1).map(|j| &tokens[j]), tokens.get(i + 1)));
     }
     out
 }
@@ -324,24 +348,29 @@ fn render(tokens: &[Token]) -> String {
 /// the expressions inside its interpolations (rule 3a), and a key written as a
 /// quoted string — `headers."name"` — which the lexer produced as a lookup dot
 /// followed by a string rather than as one symbol token.
-fn text_of(tok: &Token, prev: Option<&Token>) -> String {
+fn text_of(tok: &Token, prev: Option<&Token>, next: Option<&Token>) -> String {
     match &tok.kind {
         Tok::Str { parts } => {
             if let (Some(prev), Some(literal)) = (prev, static_text(parts)) {
                 // A *key lookup* keeps its quotes unless the key is a plain
                 // identifier: `d.total-1` subtracts, so a hyphenated key can
-                // only be written `d."x-req-id"` or `d[.x-req-id]`.
+                // only be written `d."x-req-id"` or `d[:x-req-id]`.
                 if prev.is_op(".") && is_identifier(&literal) {
                     return literal;
                 }
             }
             format!("\"{}\"", render_parts(parts))
         }
+        // A bare atom would swallow a following lookup dot: `:"a".key`
+        // must not become the single atom `:a.key`.
+        Tok::Sym { parts, .. } if next.is_some_and(|t| t.is_op(".")) => {
+            format!(":\"{}\"", render_parts(parts))
+        }
         Tok::Sym { parts, quoted } => match static_text(parts) {
-            // Rule 3a: a quoted symbol whose content is a valid identifier is
+            // Rule 3a: a quoted symbol whose content is a valid bare atom is
             // rewritten bare. One that interpolates never can be.
-            Some(name) if !*quoted || is_symbol_name(&name) => format!(".{name}"),
-            _ => format!(".\"{}\"", render_parts(parts)),
+            Some(name) if !*quoted || is_symbol_name(&name) => format!(":{name}"),
+            _ => format!(":\"{}\"", render_parts(parts)),
         },
         _ => tok.text(),
     }

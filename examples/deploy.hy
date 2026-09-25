@@ -21,21 +21,22 @@ fn warm(name, img)
 	wait_ready(h, 60)
 	if not healthy(h)
 		drain(h)
-		return .failed
+		return :failed
 	end
+
 	return h
 end
 
 manifest := json::decode(read_file("deploy.json"))
-img := manifest.image // same as manifest[.image]
+img := manifest.image // same as manifest[:image]
 
 for name in REGIONS
 	print("target \(name) -> \(img)")
 end
 
-eu := .null
-us := .null
-ap := .null
+eu := :null
+us := :null
+ap := :null
 
 parallel
 	eu = warm("eu", img) || us = warm("us", img) || ap = warm("ap", img)
@@ -44,7 +45,7 @@ end
 
 down := 0
 for h in [eu, us, ap]
-	if h == .failed or not live(h)
+	if h == :failed or not live(h)
 		down = down + 1
 	end
 end
@@ -52,4 +53,5 @@ end
 if down > 0
 	rollback()
 end
+
 print("\(3 - down)/3 regions live")

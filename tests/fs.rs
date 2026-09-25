@@ -96,11 +96,11 @@ use fs
 text, why := fs::read(\"gone.txt\", \"\")
 size, also := fs::size(\"gone.txt\", 0)
 ";
-    assert_eq!(fs.eval(src, "why"), ".not_found");
-    assert_eq!(fs.eval(src, "also"), ".not_found");
-    // On the way through, the reason is `.null`.
+    assert_eq!(fs.eval(src, "why"), ":not_found");
+    assert_eq!(fs.eval(src, "also"), ":not_found");
+    // On the way through, the reason is `:null`.
     fs.file("there.txt", "x");
-    assert_eq!(fs.eval("use fs\n_, why := fs::read(\"there.txt\", \"\")\n", "why"), ".null");
+    assert_eq!(fs.eval("use fs\n_, why := fs::read(\"there.txt\", \"\")\n", "why"), ":null");
 }
 
 #[test]
@@ -161,11 +161,11 @@ fn append_adds_and_new_refuses() {
     let src = "
 use fs as *
 write(\"log.txt\", \"one\\n\")
-write(\"log.txt\", \"two\\n\", mode = .append)
+write(\"log.txt\", \"two\\n\", mode = :append)
 both := lines(\"log.txt\")
 ";
     assert_eq!(fs.eval(src, "both"), "[one, two]");
-    let crash = fs.crash_of("use fs as *\nwrite(\"a.txt\", \"x\")\nwrite(\"a.txt\", \"y\", mode = .new)\n");
+    let crash = fs.crash_of("use fs as *\nwrite(\"a.txt\", \"x\")\nwrite(\"a.txt\", \"y\", mode = :new)\n");
     assert!(crash.contains("cannot write a.txt"), "{crash}");
 }
 
@@ -178,8 +178,8 @@ use fs as *
 first := remove(\"gone.txt\")
 again := remove(\"gone.txt\")
 ";
-    assert_eq!(fs.eval(src, "first"), ".true");
-    assert_eq!(fs.eval(src, "again"), ".false");
+    assert_eq!(fs.eval(src, "first"), ":true");
+    assert_eq!(fs.eval(src, "again"), ":false");
 
     // A tree needs saying so.
     let src = "
@@ -187,10 +187,10 @@ use fs as *
 write(\"tree/a/b.txt\", \"x\")
 refused := is_dir(\"tree\")
 ";
-    assert_eq!(fs.eval(src, "refused"), ".true");
+    assert_eq!(fs.eval(src, "refused"), ":true");
     let crash = fs.crash_of("use fs as *\nremove(\"tree\")\n");
-    assert!(crash.contains("recursive = .true"), "{crash}");
-    assert_eq!(fs.eval("use fs as *\nx := remove(\"tree\", recursive = .true)\n", "x"), ".true");
+    assert!(crash.contains("recursive = :true"), "{crash}");
+    assert_eq!(fs.eval("use fs as *\nx := remove(\"tree\", recursive = :true)\n", "x"), ":true");
 }
 
 #[test]
@@ -218,7 +218,7 @@ write(\"src/notes.txt\", \"n\")
 write(\"src/deep/c.hy\", \"c\")
 all := list(\"src\")
 only := list(\"src\", match = \"*.hy\")
-deep := list(\"src\", match = \"*.hy\", recursive = .true)
+deep := list(\"src\", match = \"*.hy\", recursive = :true)
 ";
     assert_eq!(fs.eval(src, "all"), "[src/a.hy, src/b.hy, src/deep, src/notes.txt]");
     assert_eq!(fs.eval(src, "only"), "[src/a.hy, src/b.hy]");

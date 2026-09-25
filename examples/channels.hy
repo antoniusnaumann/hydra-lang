@@ -12,24 +12,24 @@ end
 
 // One producer, one worker, no queue and no pool object. `send` with no index
 // goes to whoever asks first, and the worker leaves its loop when the channel
-// comes back `.null` — the one answer a producer cannot fake (§4).
+// comes back `:null` — the one answer a producer cannot fake (§4).
 total := 0
 parallel
 	for job in [1, 2, 3] || while alive()
 	_ = send(job)        || work, ch := receive()
-	end                  || if ch == .null
-	                     || break
+	end                  || if ch == :null
+	                     || break()
 	                     || end
 	                     || total = total + work
 	                     || end
 end
 print("the worker ran \(total)")
 
-// `.broadcast` buffers one copy for every eligible trail; `.detach` buffers one
-// and does not wait. Both answer `.false` only when every eligible trail has
+// `:broadcast` buffers one copy for every eligible trail; `:detach` buffers one
+// and does not wait. Both answer `:false` only when every eligible trail has
 // already ended (§5).
 parallel
-	_ = send(.config, mode = .broadcast) || print("a took \(receive())") || print("b took \(receive())")
+	_ = send(:config, mode = :broadcast) || print("a took \(receive())") || print("b took \(receive())")
 end
 
 // An index addresses one sibling, and `channel()` says where "here" is, which
@@ -43,7 +43,7 @@ end
 // runs no further statement — cancellation is value-level, and this is the one
 // place "never interrupted" bends (§6.5).
 race
-	done := .true || v, ch := receive()
+	done := :true || v, ch := receive()
 	              || print("this never runs")
 end
 print("the race is over")

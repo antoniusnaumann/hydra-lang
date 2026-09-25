@@ -5,10 +5,10 @@
 //!
 //! * **Defaults absorb the ordinary failures.** Writing to a directory that
 //!   does not exist creates it; making one that already exists is fine;
-//!   removing what is not there answers `.false`.
+//!   removing what is not there answers `:false`.
 //! * **Anything left crashes.** A denied permission or a file that is not there
 //!   when you asked to read it ends the program, because there are no
-//!   exceptions (§8) and a silent `.null` reaching the next line is how a
+//!   exceptions (§8) and a silent `:null` reaching the next line is how a
 //!   script destroys data.
 //! * **A reader opts out with a `fallback`, and then says why.** That is a
 //!   second overload rather than a sentinel: `read(path)` crashes and
@@ -66,7 +66,7 @@ fn ok(value: Value) -> Result<Vec<Value>, Crash> {
     Ok(vec![value])
 }
 
-/// A reader's answer on the way out: the value, and `.null` for "nothing went
+/// A reader's answer on the way out: the value, and `:null` for "nothing went
 /// wrong". The second is dropped in silence where a binding does not name it
 /// (channels §6.2).
 fn ok_with_reason(value: Value) -> Result<Vec<Value>, Crash> {
@@ -155,7 +155,7 @@ fn truthy(value: Option<Value>, default: bool) -> Result<bool, Crash> {
     }
 }
 
-/// Make the parents of a path, which is what `parents = .true` asks for.
+/// Make the parents of a path, which is what `parents = :true` asks for.
 fn make_parents(path: &Path) -> std::io::Result<()> {
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => std::fs::create_dir_all(parent),
@@ -314,7 +314,7 @@ pub fn call(native: Native, args: &[Option<Value>]) -> Result<Vec<Value>, Crash>
             let overwrite = truthy(arg(3), !moving)?;
             if !overwrite && Path::new(&target).exists() {
                 return Err(Crash::new(format!(
-                    "{target} is already there: pass `overwrite = .true` to replace it"
+                    "{target} is already there: pass `overwrite = :true` to replace it"
                 )));
             }
             if truthy(arg(4), true)? {
@@ -358,7 +358,7 @@ pub fn call(native: Native, args: &[Option<Value>]) -> Result<Vec<Value>, Crash>
                 Ok(()) => ok(boolean(true)),
                 Err(e) if at.is_dir() && !recursive => Err(Crash::new(format!(
                     "cannot remove the directory {path}: {e}; \
-                     pass `recursive = .true` to remove a tree"
+                     pass `recursive = :true` to remove a tree"
                 ))),
                 Err(e) => Err(Crash::new(format!("cannot remove {path}: {e}"))),
             }

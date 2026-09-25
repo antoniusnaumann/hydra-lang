@@ -29,13 +29,13 @@ fn a_receiver_with_no_field_becomes_the_first_argument() {
     let src = "
 text := \"hello\".len()
 list := [1, 2, 3].len()
-d := { .region : \"eu\" }
-asked := d.has(.region)
-missing := d.get(.retries, 3)
+d := { :region : \"eu\" }
+asked := d.has(:region)
+missing := d.get(:retries, 3)
 ";
     assert_eq!(eval(src, "text"), "5");
     assert_eq!(eval(src, "list"), "3");
-    assert_eq!(eval(src, "asked"), ".true");
+    assert_eq!(eval(src, "asked"), ":true");
     assert_eq!(eval(src, "missing"), "3");
 }
 
@@ -45,7 +45,7 @@ fn a_field_holding_a_closure_wins_and_is_not_passed_the_receiver() {
 fn greet(who)
 \treturn \"free \\(who)\"
 end
-obj := { .greet : fn(who) \"field \\(who)\" }
+obj := { :greet : fn(who) \"field \\(who)\" }
 answered := obj.greet(\"eu\")
 ";
     assert_eq!(eval(src, "answered"), "field eu");
@@ -58,7 +58,7 @@ fn a_field_that_is_not_callable_falls_through_to_the_function() {
 fn count(thing, extra)
 \treturn len(thing) + extra
 end
-obj := { .count : 3, .other : 1 }
+obj := { :count : 3, :other : 1 }
 answered := obj.count(10)
 ";
     assert_eq!(eval(src, "answered"), "12");
@@ -98,9 +98,9 @@ fn an_ampersand_reaches_through_the_dots_to_the_first_call() {
 fn bump(&box, by)
 \treturn box.n + by
 end
-d := { .n : 0 }
+d := { :n : 0 }
 field := &d.n
-nested := { .inner : { .n : 5 } }
+nested := { :inner : { :n : 5 } }
 answered := &nested.inner.bump(2)
 
 rows := []
@@ -140,27 +140,27 @@ fn a_reference_through_a_call_that_has_no_receiver_is_an_error() {
 fn a_field_call_is_handed_no_receiver_so_there_is_nothing_to_mark() {
     // Fields still win (§5.2), so this is the marker being wrong rather than
     // the call.
-    let crash = crash_of("obj := { .greet : fn(who) \"hi\" }\nx := &obj.greet(\"eu\")\n");
+    let crash = crash_of("obj := { :greet : fn(who) \"hi\" }\nx := &obj.greet(\"eu\")\n");
     assert!(crash.contains("nothing for the `&` to mark"), "{crash}");
 }
 
 #[test]
 fn a_bare_dot_is_still_a_key_read() {
     // Nothing is bound or partially applied by writing the dot without a call.
-    let crash = crash_of("d := { .a : 1 }\nx := d.len\n");
+    let crash = crash_of("d := { :a : 1 }\nx := d.len\n");
     assert!(crash.contains("no key .len"), "{crash}");
 }
 
 #[test]
 fn neither_a_field_nor_a_function_says_so() {
-    let crash = crash_of("d := { .a : 1 }\nx := d.nope()\n");
+    let crash = crash_of("d := { :a : 1 }\nx := d.nope()\n");
     assert!(crash.contains("no field `.nope` and no function `nope`"), "{crash}");
 }
 
 #[test]
 fn a_quoted_key_is_not_a_function_name() {
     // `d."x-y"(…)` is an ordinary field call and crashes when it is missing.
-    let crash = crash_of("d := { .a : 1 }\nx := d.\"not a name\"()\n");
+    let crash = crash_of("d := { :a : 1 }\nx := d.\"not a name\"()\n");
     assert!(crash.contains("no key"), "{crash}");
 }
 

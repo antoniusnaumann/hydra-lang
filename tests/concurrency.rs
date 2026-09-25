@@ -124,12 +124,12 @@ end
 #[test]
 fn alive_is_true_in_a_live_trail() {
     let src = "
-seen := .null
+seen := :null
 parallel
 \tseen = alive() ||
 end
 ";
-    assert_eq!(eval(src, "seen"), ".true");
+    assert_eq!(eval(src, "seen"), ":true");
 }
 
 // --- race (§9.4) ------------------------------------------------------------
@@ -137,7 +137,7 @@ end
 #[test]
 fn race_is_decided_by_the_first_completion() {
     let src = "
-winner := .null
+winner := :null
 race
 \twinner = \"short\" || slow := 1
 \t                  || slow = 2
@@ -163,7 +163,7 @@ end
 fn nothing_records_the_winner() {
     // §9.4: if you need to know, write it down as the trail's last statement.
     let src = "
-who := .null
+who := :null
 race
 \twho = \"a\" || who = \"b\"
 end
@@ -180,7 +180,7 @@ fn an_in_flight_call_runs_to_the_end_and_its_result_is_discarded() {
     // of that trail runs.
     let src = "
 log := \"\"
-result := .null
+result := :null
 fn work()
 \tlog = log + \"effect\"
 \treturn \"value\"
@@ -196,7 +196,7 @@ end
         to_text(&result.root_scope.lookup(name).expect("binding").read().unwrap().clone())
     };
     assert_eq!(read("log"), "weffect", "the call completed but the trail stopped after it");
-    assert_eq!(read("result"), ".null", "the pending assignment was discarded");
+    assert_eq!(read("result"), ":null", "the pending assignment was discarded");
 }
 
 #[test]
@@ -228,7 +228,7 @@ end
 #[test]
 fn alive_goes_false_inside_a_cancelled_trail() {
     let src = "
-status := .null
+status := :null
 fn check()
 \tstatus = alive()
 \treturn 1
@@ -237,7 +237,7 @@ race
 \tr := check() || w := 1
 end
 ";
-    assert_eq!(eval(src, "status"), ".false");
+    assert_eq!(eval(src, "status"), ":false");
 }
 
 #[test]
@@ -298,40 +298,19 @@ end
 // --- control flow inside trails (§9.6) --------------------------------------
 
 #[test]
-fn break_ends_the_current_trail() {
-    let src = "
-log := \"\"
-parallel
-\tlog = log + \"a\" || log = log + \"x\"
-\tbreak           ||
-\tlog = log + \"b\" ||
-end
-";
-    assert_eq!(eval(src, "log"), "ax");
+fn a_plain_trail_does_not_register_a_loop_handler() {
+    let result = run("parallel\n:break || x := 1\nend\n");
+    assert!(result.crash.unwrap().message.contains("no enclosing loop"));
 }
 
 #[test]
-fn break_trail_reaches_out_of_a_loop() {
-    let src = "
-log := \"\"
-parallel
-\tfor n in [1, 2, 3] || log = log + \"x\"
-\t\tlog = log + \"n\" ||
-\t\tbreak trail      ||
-\tend                ||
-end
-";
-    assert_eq!(eval(src, "log"), "xn");
-}
-
-#[test]
-fn break_with_a_label_still_targets_the_loop() {
+fn break_targets_the_loop_inside_a_trail() {
     let src = "
 log := \"\"
 parallel
 \tfor n in [1, 2, 3] as scan || log = log + \"x\"
 \t\tlog = log + \"n\"         ||
-\t\tbreak scan               ||
+\t\tbreak()                  ||
 \tend                        ||
 \tlog = log + \"after\"       ||
 end

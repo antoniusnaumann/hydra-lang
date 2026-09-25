@@ -14,7 +14,7 @@ print("working in \(where)")
 note, bytes := fs::write(fs::join(where, "notes", "first.txt"), "one\n")
 print("wrote \(bytes) bytes to \(note)")
 
-_ = fs::write(note, "two\n", mode = .append)
+_ = fs::write(note, "two\n", mode = :append)
 print(fs::lines(note))
 
 // A reader is two functions: one that crashes when the file is not there, and
@@ -45,5 +45,5 @@ print("\(total) characters across the notes")
 
 // Removing what is not there is not a failure — it answers whether there was
 // anything to remove (§5).
-print("cleaned up: \(fs::remove(where, recursive = .true))")
-print("again: \(fs::remove(where, recursive = .true))")
+print("cleaned up: \(fs::remove(where, recursive = :true))")
+print("again: \(fs::remove(where, recursive = :true))")

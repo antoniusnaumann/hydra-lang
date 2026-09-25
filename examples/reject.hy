@@ -24,13 +24,13 @@ print(parse("abcdef"))
 // It reaches every way a call can be written, including through a dot.
 print("xy".parse())
 
-// `reject(msg)` is `return .reject, msg`: it leaves the function because a
-// `.reject` that nothing consumes returns from the function it is in (§8.1).
+// `reject(msg)` is `return [:reject, msg]`: it leaves the function because a
+// `[:reject, msg]` that nothing consumes returns from its function (§8.1).
 // That is what lets a helper reject on its caller's behalf, through any
 // number of calls, with nothing written to pass it on.
 fn reject_if(cond, why)
 	if cond
-		return .reject, why
+		return [:reject, why]
 	end
 end
 
@@ -47,13 +47,15 @@ print(describe_number(4))
 print(describe_number(-4))
 
 // Consumed, a rejection is a value like any other.
-verdict, why := reject_if(.true, "just looking")
+result := reject_if(:true, "just looking")
+verdict := result[0]
+why := result[1]
 print("\(verdict) because \(why)")
 
 // When every candidate rejects, the call answers with the rejection. Left
 // unconsumed at the top level it ends the program, listing every refusal:
 //
-//	crash: unhandled rejection: I only take numbers above ten
+//	crash: unhandled rejection
 //	  the top level of a file has no call to hand it back to
 //	  no `strict` took 1 argument(s)
 //	    strict(n) rejected it: negative numbers are not for me either
@@ -73,7 +75,7 @@ print("\(verdict) because \(why)")
 // and not about the one above:
 //
 // fn keen(box)
-//	box.tried = .true    // splits a copy…
+//	box.tried = :true    // splits a copy…
 //	reject("not mine")   // …that nobody wanted
 // end
 

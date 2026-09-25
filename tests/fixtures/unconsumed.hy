@@ -16,7 +16,7 @@ pair()
 "text"
 3 + 4
 
-// Nothing: `print` answers `.null`, and so does a function without `return`.
+// Nothing: `print` answers `:null`, and so does a function without `return`.
 quiet()
 
 // `_` consumes it, and so does any binding.

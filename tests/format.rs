@@ -50,7 +50,7 @@ fn no_space_between_a_reference_and_its_lvalue() {
     // `&a`, never `& a` (rule 2).
     assert_eq!(fmt_idempotent("f(& a)\n"), "f(&a)\n");
     assert_eq!(fmt_idempotent("x := & a\n"), "x := &a\n");
-    assert_eq!(fmt_idempotent("d := { .x : & a }\n"), "d := { .x : &a }\n");
+    assert_eq!(fmt_idempotent("d := { :x : & a }\n"), "d := { :x : &a }\n");
     assert_eq!(fmt_idempotent("list := [& a, & b]\n"), "list := [&a, &b]\n");
     // Binary `&` keeps its spaces.
     assert_eq!(fmt_idempotent("x := flags&MASK\n"), "x := flags & MASK\n");
@@ -63,16 +63,16 @@ fn no_space_between_a_reference_and_its_lvalue() {
 #[test]
 fn dict_literals_normalise() {
     // Rule 3a: spaces inside the braces and around the colon.
-    assert_eq!(fmt_idempotent("d := {.a:1,.b:2}\n"), "d := { .a : 1, .b : 2 }\n");
+    assert_eq!(fmt_idempotent("d := {:a:1,:b:2}\n"), "d := { :a : 1, :b : 2 }\n");
     assert_eq!(fmt_idempotent("d := {   }\n"), "d := {}\n");
     // A quoted symbol whose content is a valid symbol name is rewritten bare,
     // and a name may contain `-` (§2).
-    assert_eq!(fmt_idempotent("d := { .\"name\" : 1 }\n"), "d := { .name : 1 }\n");
-    assert_eq!(fmt_idempotent("d := { .\"x-req-id\" : 1 }\n"), "d := { .x-req-id : 1 }\n");
+    assert_eq!(fmt_idempotent("d := { :\"name\" : 1 }\n"), "d := { :name : 1 }\n");
+    assert_eq!(fmt_idempotent("d := { :\"x-req-id\" : 1 }\n"), "d := { :x-req-id : 1 }\n");
     // One that is not a name at all stays quoted.
     assert_eq!(
-        fmt_idempotent("d := { .\"a b\" : 1 }\n"),
-        "d := { .\"a b\" : 1 }\n"
+        fmt_idempotent("d := { :\"a b\" : 1 }\n"),
+        "d := { :\"a b\" : 1 }\n"
     );
     // A *key lookup* is not a symbol literal: `d.total-1` subtracts, so a
     // hyphenated key keeps its quotes.
@@ -154,14 +154,14 @@ fn interpolations_normalise_like_ordinary_expressions() {
     // §12 rule 3a: `\(a + b)`, never `\( a+b )`.
     assert_eq!(fmt_idempotent("x := \"n \\( a+b )\"\n"), "x := \"n \\(a + b)\"\n");
     assert_eq!(fmt_idempotent("x := \"\\(f( 1,2 ))\"\n"), "x := \"\\(f(1, 2))\"\n");
-    assert_eq!(fmt_idempotent("x := .\"\\( prefix )-id\"\n"), "x := .\"\\(prefix)-id\"\n");
+    assert_eq!(fmt_idempotent("x := :\"\\( prefix )-id\"\n"), "x := :\"\\(prefix)-id\"\n");
     // A string nested inside an interpolation normalises too.
     assert_eq!(
         fmt_idempotent("x := \"a \\(f(\"b \\( c )\"))\"\n"),
         "x := \"a \\(f(\"b \\(c)\"))\"\n"
     );
     // An interpolated symbol can never be rewritten bare.
-    assert_eq!(fmt_idempotent("d := { .\"\\(k)\" : 1 }\n"), "d := { .\"\\(k)\" : 1 }\n");
+    assert_eq!(fmt_idempotent("d := { :\"\\(k)\" : 1 }\n"), "d := { :\"\\(k)\" : 1 }\n");
 }
 
 #[test]
@@ -207,4 +207,58 @@ fn a_multi_value_binding_is_spaced_like_any_other_comma_list() {
     assert_eq!(fmt_idempotent("d.x , d.y = f()\n"), "d.x, d.y = f()\n");
     // A binary `*` still gets its spaces.
     assert_eq!(fmt_idempotent("y := f(a , b*2)\n"), "y := f(a, b * 2)\n");
+}
+
+#[test]
+fn continued_lookups_keep_lookup_boundaries_and_quotes() {
+    for (source, expected) in [
+        ("foo\n.bar-baz", "foo\n.bar - baz\n"),
+        ("foo\n.\"a-b\"", "foo\n.\"a-b\"\n"),
+        ("foo\n.\"name\"", "foo\n.name\n"),
+        ("32\n\n-a", "32\n\n-a\n"),
+        (":\"some-other+info\"", ":some-other+info\n"),
+        ("{:a+b::c*d}", "{ :a+b : :c*d }\n"),
+        ("parallel\nfoo||bar\n.\"a-b\"||.c-d\nend", "parallel\n\tfoo    || bar\n\t.\"a-b\" || .c - d\nend\n"),
+    ] {
+        assert_eq!(fmt_idempotent(source), expected, "{source:?}");
+    }
+}
+
+#[test]
+fn formatting_does_not_merge_an_atom_with_its_lookup() {
+    assert_eq!(fmt_idempotent(":\"a\".key"), ":\"a\".key\n");
+    assert_eq!(fmt_idempotent(":a .key"), ":\"a\".key\n");
+    assert_eq!(fmt_idempotent(":a\n.key"), ":a\n.key\n");
+    assert_eq!(fmt_idempotent("\"\\(:a .key)\""), "\"\\(:\"a\".key)\"\n");
+}
+
+#[test]
+fn completed_blocks_are_separated_without_splitting_consecutive_ends() {
+    assert_eq!(
+        fmt_idempotent("if a\nif b\nf()\nend\nend // done\n// next\ng()\n"),
+        "if a\n\tif b\n\t\tf()\n\tend\nend // done\n\n// next\ng()\n"
+    );
+    assert_eq!(
+        fmt_idempotent("if a\nif b\nf()\nend\ng()\nelse if c\nif c\nh()\nend\nelse if d\ni()\nend\n"),
+        "if a\n\tif b\n\t\tf()\n\tend\n\n\tg()\nelse if c\n\tif c\n\t\th()\n\tend\n\nelse if d\n\ti()\nend\n"
+    );
+    assert_eq!(fmt_idempotent("fn f()\nend\n\n\nf()\n"), "fn f()\nend\n\n\nf()\n");
+    assert_eq!(fmt_idempotent("f := fn()\nreturn 1\nend\nf()\n"), "f := fn()\n\treturn 1\nend\n\nf()\n");
+}
+
+#[test]
+fn spacing_after_end_preserves_closure_continuations() {
+    for suffix in ["()", ".field", "[0]", "+ 1"] {
+        let src = format!("f := fn()\n\treturn 1\nend\n{suffix}\n");
+        assert_eq!(fmt_idempotent(&src), src);
+    }
+}
+
+#[test]
+fn spacing_after_end_preserves_other_parallel_columns() {
+    let src = "parallel\nif ok || x := foo\nend || .bar\nf() || .baz\nend\ng()\n";
+    assert_eq!(
+        fmt_idempotent(src),
+        "parallel\n\tif ok || x := foo\n\tend   || .bar\n\tf()   || .baz\nend\n\ng()\n"
+    );
 }

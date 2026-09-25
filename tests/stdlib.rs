@@ -39,7 +39,7 @@ fn a_by_reference_parameter_must_be_passed_with_an_ampersand() {
 fn bump(&box)
 \tbox.n = box.n + 1
 end
-d := { .n : 0 }
+d := { :n : 0 }
 bump(&d)
 after := d.n
 ";
@@ -51,7 +51,7 @@ after := d.n
 fn bump(&box)
 \tbox.n = box.n + 1
 end
-d := { .n : 0 }
+d := { :n : 0 }
 bump(d)
 ";
     assert!(crash_of(src).contains("by reference"), "{}", crash_of(src));
@@ -92,7 +92,7 @@ x := f(1, c = 2)
 ";
     assert_eq!(eval(src, "x"), "13");
     // The builtin's parameter is `terminator`, because `end` is a keyword.
-    assert_eq!(eval("x := print(\"hi\", terminator = \"\")\n", "x"), ".null");
+    assert_eq!(eval("x := print(\"hi\", terminator = \"\")\n", "x"), ":null");
     assert_eq!(eval("rows := []\nn := push(value = 1, list = &rows)\n", "n"), "1");
 }
 
@@ -203,47 +203,47 @@ fn builtins_are_shadowable_global_names() {
 fn len_counts_elements_keys_and_characters() {
     assert_eq!(expr("len([1, 2, 3])"), "3");
     assert_eq!(expr("len([])"), "0");
-    assert_eq!(expr("len({ .a : 1, .b : 2 })"), "2");
+    assert_eq!(expr("len({ :a : 1, :b : 2 })"), "2");
     assert_eq!(expr("len(\"hello\")"), "5");
     // Characters, not bytes: source is UTF-8 (§1).
     assert_eq!(expr("len(\"héllo\")"), "5");
     assert!(crash_of("x := len(3)\n").contains("counts a list"));
-    assert!(crash_of("x := len(.sym)\n").contains("counts a list"));
+    assert!(crash_of("x := len(:sym)\n").contains("counts a list"));
 }
 
 #[test]
 fn has_answers_without_crashing() {
-    assert_eq!(expr("has({ .a : 1 }, .a)"), ".true");
-    assert_eq!(expr("has({ .a : 1 }, .b)"), ".false");
-    assert_eq!(expr("has([1, 2], 1)"), ".true");
-    assert_eq!(expr("has([1, 2], 2)"), ".false");
+    assert_eq!(expr("has({ :a : 1 }, :a)"), ":true");
+    assert_eq!(expr("has({ :a : 1 }, :b)"), ":false");
+    assert_eq!(expr("has([1, 2], 1)"), ":true");
+    assert_eq!(expr("has([1, 2], 2)"), ":false");
     // The negative-index rule applies first.
-    assert_eq!(expr("has([1, 2], 0 - 1)"), ".true");
-    assert_eq!(expr("has([], 0 - 1)"), ".false");
-    // Asking about the wrong kind of thing is a bug, not a `.false`.
-    assert!(crash_of("x := has([1], .a)\n").contains("has no key"));
-    assert!(crash_of("x := has(3, .a)\n").contains("cannot index"));
+    assert_eq!(expr("has([1, 2], 0 - 1)"), ":true");
+    assert_eq!(expr("has([], 0 - 1)"), ":false");
+    // Asking about the wrong kind of thing is a bug, not a `:false`.
+    assert!(crash_of("x := has([1], :a)\n").contains("has no key"));
+    assert!(crash_of("x := has(3, :a)\n").contains("cannot index"));
 }
 
 #[test]
 fn get_returns_the_fallback_and_does_not_create() {
-    assert_eq!(expr("get({ .a : 1 }, .a, 0)"), "1");
-    assert_eq!(expr("get({ .a : 1 }, .b, 0)"), "0");
+    assert_eq!(expr("get({ :a : 1 }, :a, 0)"), "1");
+    assert_eq!(expr("get({ :a : 1 }, :b, 0)"), "0");
     assert_eq!(expr("get([10, 20], 1, 0)"), "20");
-    assert_eq!(expr("get([10, 20], 5, .missing)"), ".missing");
+    assert_eq!(expr("get([10, 20], 5, :missing)"), ":missing");
 
     // Reading does not create the key (§5).
-    let src = "d := { .a : 1 }\nseen := get(d, .b, 0)\nstill := has(d, .b)\n";
-    assert_eq!(eval(src, "still"), ".false");
+    let src = "d := { :a : 1 }\nseen := get(d, :b, 0)\nstill := has(d, :b)\n";
+    assert_eq!(eval(src, "still"), ":false");
 
     // The result copies, like every other read (§5.1).
     let src = "
 d := {}
-first := get(d, .k, [])
-second := get(d, .k, [])
+first := get(d, :k, [])
+second := get(d, :k, [])
 shared := first === second
 ";
-    assert_eq!(eval(src, "shared"), ".false");
+    assert_eq!(eval(src, "shared"), ":false");
 }
 
 #[test]
@@ -273,7 +273,7 @@ fn push_without_a_reference_crashes_rather_than_doing_nothing() {
 fn push_copies_the_value_in_unless_it_is_a_reference() {
     let src = "
 rows := []
-item := { .n : 1 }
+item := { :n : 1 }
 push(&rows, item)
 item.n = 2
 kept := rows[0].n
@@ -282,7 +282,7 @@ kept := rows[0].n
 
     let src = "
 rows := []
-item := { .n : 1 }
+item := { :n : 1 }
 push(&rows, &item)
 item.n = 2
 seen := rows[0].n
@@ -293,7 +293,7 @@ seen := rows[0].n
 #[test]
 fn push_reaches_a_list_nested_in_a_structure() {
     let src = "
-state := { .rows : [] }
+state := { :rows : [] }
 push(&state.rows, \"x\")
 n := len(state.rows)
 ";
@@ -332,8 +332,8 @@ n := len(rows)
 #[test]
 fn print_writes_the_text_form_and_returns_null() {
     // stdout is not captured here; `tests/cli.rs` checks what it writes.
-    assert_eq!(eval("x := print(\"hi\")\n", "x"), ".null");
-    assert_eq!(eval("x := print(\"hi\", \"\")\n", "x"), ".null");
+    assert_eq!(eval("x := print(\"hi\")\n", "x"), ":null");
+    assert_eq!(eval("x := print(\"hi\", \"\")\n", "x"), ":null");
 }
 
 // --- qualified builtins (§7) ------------------------------------------------
@@ -341,7 +341,7 @@ fn print_writes_the_text_form_and_returns_null() {
 #[test]
 fn a_builtin_is_reachable_through_a_leading_namespace_selector() {
     // Qualified syntax wins: `::name` is the language's own namespace.
-    assert_eq!(eval("rows := []\n::push(&rows, 1)\nn := ::len(rows)\n", "n"), "1");
+    assert_eq!(eval("rows := []\n\n::push(&rows, 1)\nn := ::len(rows)\n", "n"), "1");
 
     // Past a local shadow.
     let src = "

@@ -1,5 +1,5 @@
 //! Values a statement produces and nothing consumes (spec §8.1): dropped in a
-//! function unless they start with `.reject`, which returns from it; printed at
+//! function unless they start with `:reject`, which returns from it; printed at
 //! the top level of a file.
 
 use std::process::Command;
@@ -37,7 +37,7 @@ fn codes(src: &str) -> Vec<&'static str> {
 const HELPERS: &str = "
 fn reject_if(cond)
 \tif cond
-\t\treturn .reject, \"invalid value\"
+\t\treturn :reject, \"invalid value\"
 \tend
 end
 fn guard(x)
@@ -61,7 +61,7 @@ bad, why := foo(-3)
     );
     assert_eq!(eval(&src, "ok"), "3");
     // The whole result, unchanged.
-    assert_eq!(eval(&src, "bad"), ".reject");
+    assert_eq!(eval(&src, "bad"), ":reject");
     assert_eq!(eval(&src, "why"), "invalid value");
 }
 
@@ -82,7 +82,7 @@ fn spelled(x)
 end
 fn spelled(x)
 \tif x < 0
-\t\treturn .reject
+\t\treturn :reject
 \tend
 \treturn \"quick\"
 end
@@ -115,7 +115,7 @@ kept := keeps(-1)
 went := ignores(-1)
 "
     );
-    assert_eq!(eval(&src, "kept"), ".reject");
+    assert_eq!(eval(&src, "kept"), ":reject");
     assert_eq!(eval(&src, "went"), "went on");
 }
 
@@ -126,7 +126,7 @@ fn a_statement_in_a_branch_or_a_loop_is_still_a_statement() {
 fn scan(items)
 \tfor item in items
 \t\tif item == 2
-\t\t\treject_if(.true)
+\t\t\treject_if(:true)
 \t\tend
 \tend
 \treturn \"clean\"
@@ -136,20 +136,21 @@ dirty := scan([1, 2, 3])
 "
     );
     assert_eq!(eval(&src, "clean"), "clean");
-    assert_eq!(eval(&src, "dirty"), ".reject");
+    assert_eq!(eval(&src, "dirty"), ":reject");
 }
 
 #[test]
 fn a_bare_reject_symbol_is_a_rejection_too() {
-    let src = "fn f(x)\n\tif x\n\t\t.reject\n\tend\n\treturn 1\nend\na := f(.false)\nb := f(.true)\n";
+    // A blank line prevents the atom from continuing the `if` condition.
+    let src = "fn f(x)\n\tif x\n\n\t\t:reject\n\tend\n\treturn 1\nend\na := f(:false)\nb := f(:true)\n";
     assert_eq!(eval(src, "a"), "1");
-    assert_eq!(eval(src, "b"), ".reject");
+    assert_eq!(eval(src, "b"), ":reject");
 }
 
 #[test]
 fn an_ordinary_value_in_a_function_is_dropped() {
     let src = "fn f()\n\t42\n\t\"text\"\nend\nx := f()\n";
-    assert_eq!(eval(src, "x"), ".null");
+    assert_eq!(eval(src, "x"), ":null");
 }
 
 // --- where there is no call to hand it back to ---------------------------------
@@ -157,14 +158,15 @@ fn an_ordinary_value_in_a_function_is_dropped() {
 #[test]
 fn a_rejection_that_reaches_the_top_level_is_a_crash() {
     let crash = crash_of(&format!("{HELPERS}guard(-1)\n"));
-    assert!(crash.contains("unhandled rejection: invalid value"), "{crash}");
+    assert!(crash.contains("unhandled rejection"), "{crash}");
+    assert!(crash.contains("invalid value"), "{crash}");
     // Which call ran out of candidates, and what it said.
-    assert!(crash.contains("guard(x) rejected it: invalid value"), "{crash}");
+    assert!(crash.contains("guard(x) rejected it"), "{crash}");
 }
 
 #[test]
 fn what_a_consumed_rejection_said_is_not_blamed_on_the_next() {
-    let crash = crash_of(&format!("{HELPERS}x := guard(-1)\n.reject\n"));
+    let crash = crash_of(&format!("{HELPERS}x := guard(-1)\n\n:reject\n"));
     assert!(crash.contains("unhandled rejection"), "{crash}");
     assert!(!crash.contains("guard"), "{crash}");
 }

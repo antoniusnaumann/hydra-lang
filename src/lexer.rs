@@ -7,10 +7,8 @@
 //!   spaces or tabs, never a newline, so `else` at end of line followed by `if`
 //!   on the next line is two tokens and means something different (§2).
 //!
-//! * **Symbol versus key lookup.** A dot in leading position opens a symbol; a
-//!   dot directly after an expression is a lookup. The lexer decides from the
-//!   preceding token, which is why that decision lives here and not in the
-//!   parser.
+//! * **Atoms and lookups are distinct.** `:name` opens an atom; a dot is
+//!   always a lookup operator. `:=` and `::` keep their existing meanings.
 //!
 //! * **Strings are not opaque.** `\(expr)` is lexed *recursively*, so a string
 //!   token carries a token stream for each interpolation. That is what §1 means
@@ -22,10 +20,9 @@ use std::fmt;
 
 use crate::errors::{HydraError, Pos, Result};
 
-/// Keywords (§2). `trail` is not here: it is a reserved *label*, meaningful
-/// only after `break` (§9.6), so the parser gives it meaning.
+/// Keywords (§2). Loop control uses ordinary atoms.
 pub const KEYWORDS: &[&str] = &[
-    "fn", "use", "if", "else", "for", "in", "while", "return", "break", "continue", "end", "and",
+    "fn", "use", "if", "else", "for", "in", "while", "return", "end", "and",
     "or", "not", "parallel", "race", "as",
 ];
 
@@ -79,9 +76,6 @@ pub fn compound_assign(op: &str) -> Option<&'static str> {
 
 /// The trail separator (§2). Not logical or — Hydra has no `||` operator.
 pub const TRAIL_SEP: &str = "||";
-
-/// `break trail` targets the innermost trail; `trail` is a reserved label.
-pub const TRAIL_LABEL: &str = "trail";
 
 /// One piece of a string literal or a quoted symbol.
 #[derive(Clone, Debug, PartialEq)]
@@ -200,10 +194,10 @@ impl Token {
             Tok::Str { parts } => format!("\"{}\"", raw_text(parts)),
             Tok::Sym { parts, quoted } => {
                 // §12 rule 3a: a quoted symbol whose content is a valid
-                // identifier is rewritten bare. An interpolated one never is.
+                // bare atom is rewritten bare. An interpolated one never is.
                 match static_text(parts) {
-                    Some(name) if !*quoted || is_symbol_name(&name) => format!(".{name}"),
-                    _ => format!(".\"{}\"", raw_text(parts)),
+                    Some(name) if !*quoted || is_symbol_name(&name) => format!(":{name}"),
+                    _ => format!(":\"{}\"", raw_text(parts)),
                 }
             }
             Tok::Kw(k) => (*k).to_string(),
@@ -239,21 +233,18 @@ pub fn is_identifier(text: &str) -> bool {
     }
 }
 
-/// A **symbol** name may also contain `-`, as long as it is internal:
-/// `[A-Za-z_][A-Za-z0-9_]*(-[A-Za-z0-9_]+)*`. Nothing is lost by it, because
-/// subtracting one symbol from another is nonsense, so `.x-req-id` can only
-/// have been meant as one name.
-///
-/// This holds for a symbol *literal* only, never for a key lookup: in
-/// `d.total-1` the thing left of the `-` is a value, and subtracting from it is
-/// perfectly sensible. A hyphenated key is `d[.x-req-id]` or `d."x-req-id"`.
+/// Bare atoms start like identifiers and consume everything up to whitespace,
+/// a structural delimiter, a comment (`//`), or a trail separator (`||`).
+/// Lookup names still use the ordinary identifier rules.
 pub fn is_symbol_name(text: &str) -> bool {
-    !text.is_empty()
-        && !text.ends_with('-')
-        && text.split('-').enumerate().all(|(i, part)| match i {
-            0 => is_identifier(part),
-            _ => !part.is_empty() && part.chars().all(is_ident_char),
-        })
+    text.chars().next().is_some_and(is_ident_start)
+        && text.chars().all(|c| !is_symbol_delimiter(c))
+        && !text.contains("//")
+        && !text.contains("||")
+}
+
+fn is_symbol_delimiter(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',' | ':' | '"')
 }
 
 /// A leading underscore marks an item private (§2).
@@ -366,7 +357,7 @@ impl<'a> Lexer<'a> {
     ///
     /// With `interpolation` set, the scan stops at the `)` that closes a
     /// `\(…)` — leaving the cursor on it — and a newline before that point is
-    /// an error, since a statement is one line (§1).
+    /// an error: string literals and interpolations stay on one physical line (§1).
     fn scan(&mut self, out: &mut Vec<Token>, interpolation: bool) -> Result<()> {
         let mut depth = 0i32;
         while !self.at_end() {
@@ -374,7 +365,7 @@ impl<'a> Lexer<'a> {
             let produced = out.len();
             let c = self.peek().unwrap();
 
-            if c == ' ' || c == '\t' || c == '\r' {
+            if c.is_whitespace() && c != '\n' {
                 self.bump();
                 continue;
             }
@@ -431,8 +422,10 @@ impl<'a> Lexer<'a> {
                 continue;
             }
 
-            if c == '.' {
-                let tok = self.dot(pos, out.last())?;
+            if c == ':' && !self.starts_with(":=")
+                && (!self.starts_with("::") || matches!(out.last().map(|t| &t.kind), Some(Tok::Sym { .. })))
+            {
+                let tok = self.colon(pos, out.last())?;
                 out.push(tok);
                 set_len(out, produced, self.i - before);
                 continue;
@@ -530,19 +523,13 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// A symbol's name, where a `-` joins two runs of identifier characters and
-    /// a trailing one is left for the operator it must be.
     fn take_symbol_name(&mut self) -> String {
-        let mut name = self.take_ident();
-        while self.peek() == Some('-') {
-            let Some(after) = self.peek_at(1) else { break };
-            if !is_ident_char(after) {
-                break;
-            }
-            self.bump();
-            name.push('-');
-            // A run after a `-` may start with a digit: `.a-1` is one name.
-            name.push_str(&self.take_ident());
+        let mut name = String::new();
+        while self.peek().is_some_and(|c| !is_symbol_delimiter(c))
+            && !self.starts_with("//")
+            && !self.starts_with("||")
+        {
+            name.push(self.bump().unwrap());
         }
         name
     }
@@ -555,28 +542,26 @@ impl<'a> Lexer<'a> {
         word
     }
 
-    /// A dot in leading position starts a symbol; a dot directly after an
-    /// expression is a key lookup (§2).
-    fn dot(&mut self, pos: Pos, prev: Option<&Token>) -> Result<Token> {
-        let lookup = match prev.map(|t| &t.kind) {
+    /// A colon followed immediately by a name or quote opens an atom in
+    /// expression-leading position. After an atom it is the dict separator,
+    /// so even `{:key::value}` remains an unambiguous compact dict.
+    fn colon(&mut self, pos: Pos, prev: Option<&Token>) -> Result<Token> {
+        let after_value = match prev.map(|t| &t.kind) {
             Some(Tok::Ident(_)) | Some(Tok::Num { .. }) | Some(Tok::Str { .. })
             | Some(Tok::Sym { .. }) => true,
             Some(Tok::Op(o)) => matches!(*o, ")" | "]" | "}"),
             _ => false,
         };
-        if lookup {
-            self.bump();
-            return Ok(Token::new(Tok::Op("."), pos));
+        self.bump();
+        if after_value {
+            return Ok(Token::new(Tok::Op(":"), pos));
         }
-
-        self.bump(); // the dot
         if self.peek() == Some('"') {
-            // `."\(prefix)-id"` is how a symbol is built from data (§2).
             let parts = self.string()?;
             return Ok(Token::new(Tok::Sym { parts, quoted: true }, pos));
         }
         if !matches!(self.peek(), Some(c) if is_ident_start(c)) {
-            return Err(self.err("expected a name or a quoted string after `.`", pos));
+            return Ok(Token::new(Tok::Op(":"), pos));
         }
         let name = self.take_symbol_name();
         Ok(Token::new(Tok::Sym { parts: vec![text_piece(&name)], quoted: false }, pos))

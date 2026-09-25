@@ -17,13 +17,13 @@ Nothing here is implemented yet. §1 is the one rule the whole shape rests on;
 
 **[P] Defaults absorb the ordinary failures.** Writing to a directory that does
 not exist creates it. Making a directory that already exists is fine. Removing
-something that is not there answers `.false` rather than failing. These are the
+something that is not there answers `:false` rather than failing. These are the
 cases every script hits, and every one of them is a default rather than a
 paragraph in the documentation.
 
 **[P] Anything left crashes.** A denied permission, a full disk, a file that is
 not there when you asked to read it — those end the program with a diagnostic,
-because there are no exceptions (§8) and a silent `.null` reaching the next line
+because there are no exceptions (§8) and a silent `:null` reaching the next line
 is how a script destroys data.
 
 **[D] A reader opts out with a `fallback`, and then says why.** This is exactly
@@ -34,7 +34,7 @@ safely is one argument.
 ```hydra
 config := read("config.json")            // crashes if it is not there
 config := read("config.json", "{}")      // takes the fallback
-text, why := read("maybe.txt", "")       // and says .not_found
+text, why := read("maybe.txt", "")       // and says :not_found
 ```
 
 **[D] Every reader is two functions, not one with a sentinel.** The safe form is
@@ -42,7 +42,7 @@ an overload, and resolution by shape picks it (§3): one argument means the
 crashing one, two means the falling-back one. Nothing stands in for "no fallback
 given", so there is no value a program cannot fall back to.
 
-**[D]** The falling-back form answers with a second value: `.null` when it did
+**[D]** The falling-back form answers with a second value: `:null` when it did
 not have to fall back, and the reason when it did. Extras are dropped in silence
 (channels §6.2), so nobody who does not care ever has to look.
 
@@ -74,9 +74,9 @@ sentence it is. It also normalises: `join("a/", "/b")` is `"a/b"`.
 ## 3. Asking
 
 ```hydra
-exists(path)              // -> .true / .false
-is_file(path)             // -> .true / .false
-is_dir(path)              // -> .true / .false
+exists(path)              // -> :true / :false
+is_file(path)             // -> :true / :false
+is_dir(path)              // -> :true / :false
 
 size(path)                // -> bytes
 size(path, fallback)      // -> bytes, why
@@ -100,8 +100,8 @@ read(path, fallback)      // -> text, why
 lines(path)               // -> list of lines
 lines(path, fallback)     // -> list of lines, why
 
-list(dir, *, match = "*", recursive = .false)            // -> paths
-list(dir, fallback, *, match = "*", recursive = .false)  // -> paths, why
+list(dir, *, match = "*", recursive = :false)            // -> paths
+list(dir, fallback, *, match = "*", recursive = :false)  // -> paths, why
 ```
 
 **[P]** `list` answers with **full paths**, joined onto `dir`, because the next
@@ -113,7 +113,7 @@ program over a directory is reproducible.
 than two.
 
 ```hydra
-for entry in list("src", match = "*.hy", recursive = .true)
+for entry in list("src", match = "*:hy", recursive = :true)
 	print("\(entry.name()) is \(entry.size()) bytes")
 end
 ```
@@ -123,27 +123,27 @@ end
 ## 5. Writing
 
 ```hydra
-write(path, text, *, mode = .replace, parents = .true)       // -> path, bytes
-copy(source, target, *, overwrite = .true, parents = .true)  // -> target
-move(source, target, *, overwrite = .false, parents = .true) // -> target
-remove(path, *, recursive = .false)                          // -> .true / .false
-make_dir(path, *, parents = .true)                           // -> path
+write(path, text, *, mode = :replace, parents = :true)       // -> path, bytes
+copy(source, target, *, overwrite = :true, parents = :true)  // -> target
+move(source, target, *, overwrite = :false, parents = :true) // -> target
+remove(path, *, recursive = :false)                          // -> :true / :false
+make_dir(path, *, parents = :true)                           // -> path
 ```
 
 A writer has no falling-back overload: its ordinary failures are already
 absorbed by the defaults above, and what is left — a denied permission, a full
 disk — is not something a fallback value can stand in for.
 
-**[P]** `mode` is `.replace`, `.append` or `.new` — `.new` fails when the path
+**[P]** `mode` is `:replace`, `:append` or `:new` — `:new` fails when the path
 already exists, which is the only way to write a file without a race against
 whoever else is writing it.
 
-**[P]** `move`'s `overwrite` defaults to `.false` where `copy`'s defaults to
-`.true`, and the difference is deliberate: a copy that clobbers loses a copy, a
+**[P]** `move`'s `overwrite` defaults to `:false` where `copy`'s defaults to
+`:true`, and the difference is deliberate: a copy that clobbers loses a copy, a
 move that clobbers loses the only one.
 
 **[P]** `remove` answers whether there was anything to remove, so
-`if remove(p)` reads as "if it was there". A directory needs `recursive = .true`
+`if remove(p)` reads as "if it was there". A directory needs `recursive = :true`
 — refusing to delete a tree that was not named as one is worth the one flag.
 
 **[P]** Each of these returns something worth chaining: the path it wrote or the
@@ -178,7 +178,7 @@ if "config.json".exists() and not "build".is_dir()
 end
 
 total := 0
-parallel for file in list("src", match = "*.hy")
+parallel for file in list("src", match = "*:hy")
 	total += file.read().len()
 end
 ```
@@ -198,7 +198,7 @@ The qualifier reaching through the dot is what keeps that from being verbose:
 ```hydra
 use fs
 
-for entry in cwd().fs::list(match = "*.hy")
+for entry in cwd().fs::list(match = "*:hy")
 	print("\(entry.fs::name()) is \(entry.fs::size()) bytes")
 end
 ```
@@ -208,7 +208,7 @@ is the qualified form, and
 ```hydra
 use fs as *
 
-for entry in list(cwd(), match = "*.hy")
+for entry in list(cwd(), match = "*:hy")
 	print("\(entry.name()) is \(entry.size()) bytes")
 end
 ```
@@ -234,7 +234,7 @@ in §7 rather than here.
 ### 7.4 Binary files — **[O]**
 
 Every reader here is text, and text is UTF-8 (§1). A file that is not valid
-UTF-8 crashes with `.encoding`, or takes the fallback. There is no byte type in
+UTF-8 crashes with `:encoding`, or takes the fallback. There is no byte type in
 the language, so binary I/O needs one — a list of numbers is not it — and that
 is a language question rather than an `fs` one.
 
@@ -248,7 +248,7 @@ the one case this module does not serve, and the shape it would want —
 
 ### 7.6 Errors are a small closed set — **[P]**
 
-`.not_found`, `.denied`, `.exists`, `.is_dir`, `.not_dir`, `.encoding`, `.io`.
+`:not_found`, `:denied`, `:exists`, `:is_dir`, `:not_dir`, `:encoding`, `:io`.
 The symbol is what a program branches on; the crash message is where the
 operating system's own words go.
 

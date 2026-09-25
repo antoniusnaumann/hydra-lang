@@ -104,33 +104,31 @@ fn compound_head_followed_by_something_else_stays_simple() {
 
 #[test]
 fn symbol_versus_key_lookup() {
-    // A dot in leading position starts a symbol; a dot after an expression,
-    // a `)`, a `]`, a `}` or a literal is a lookup (§2).
-    assert_eq!(kinds(".null")[0], Tok::Sym { parts: vec![text_piece("null")], quoted: false });
+    // Colons introduce atoms; dots always introduce key lookups.
+    assert_eq!(kinds(":null")[0], Tok::Sym { parts: vec![text_piece("null")], quoted: false });
     assert_eq!(kinds("d.a")[1], Tok::Op("."));
     assert_eq!(kinds("f().a")[3], Tok::Op("."));
     assert_eq!(kinds("[1].a")[3], Tok::Op("."));
-    let ks = kinds("{ .a : 1 }.a");
+    let ks = kinds("{ :a : 1 }.a");
     assert_eq!(ks[ks.len() - 5], Tok::Op("}"));
     assert_eq!(ks[ks.len() - 4], Tok::Op("."));
-    assert_eq!(kinds("x := .true")[2], Tok::Sym { parts: vec![text_piece("true")], quoted: false });
-    assert_eq!(kinds("not .false")[1], Tok::Sym { parts: vec![text_piece("false")], quoted: false });
+    assert_eq!(kinds("x := :true")[2], Tok::Sym { parts: vec![text_piece("true")], quoted: false });
+    assert_eq!(kinds("not :false")[1], Tok::Sym { parts: vec![text_piece("false")], quoted: false });
 }
 
 #[test]
 fn a_symbols_name_may_contain_a_hyphen() {
-    // Subtracting one symbol from another is nonsense, so `.x-req-id` can only
+    // Subtracting one symbol from another is nonsense, so `:x-req-id` can only
     // have been meant as one name (§2).
     assert_eq!(
-        kinds(".x-req-id")[0],
+        kinds(":x-req-id")[0],
         Tok::Sym { parts: vec![text_piece("x-req-id")], quoted: false }
     );
-    assert_eq!(kinds(".a-1")[0], Tok::Sym { parts: vec![text_piece("a-1")], quoted: false });
-    // A space ends the name, and so does a `-` with nothing to join.
-    assert_eq!(kinds(".a - b")[0], Tok::Sym { parts: vec![text_piece("a")], quoted: false });
-    assert_eq!(kinds(".a - b")[1], Tok::Op("-"));
-    assert_eq!(kinds(".a-")[0], Tok::Sym { parts: vec![text_piece("a")], quoted: false });
-    assert_eq!(kinds(".a-")[1], Tok::Op("-"));
+    assert_eq!(kinds(":a-1")[0], Tok::Sym { parts: vec![text_piece("a-1")], quoted: false });
+    // A space ends the name; a trailing operator character does not.
+    assert_eq!(kinds(":a - b")[0], Tok::Sym { parts: vec![text_piece("a")], quoted: false });
+    assert_eq!(kinds(":a - b")[1], Tok::Op("-"));
+    assert_eq!(kinds(":a-")[0], Tok::Sym { parts: vec![text_piece("a-")], quoted: false });
 
     // A *key lookup* is not a symbol literal: there the thing left of the `-`
     // is a value, and subtracting from it is perfectly sensible.
@@ -143,10 +141,10 @@ fn a_symbols_name_may_contain_a_hyphen() {
 #[test]
 fn quoted_symbols() {
     assert_eq!(
-        kinds(".\"content-type\"")[0],
+        kinds(":\"content-type\"")[0],
         Tok::Sym { parts: vec![text_piece("content-type")], quoted: true }
     );
-    // `headers."content-type"` is `headers[."content-type"]` (§2): the lexer
+    // `headers."content-type"` is `headers[:"content-type"]` (§2): the lexer
     // produces a lookup dot followed by a string, and the parser turns the pair
     // into a key.
     let ks = kinds("headers.\"content-type\"");
@@ -214,7 +212,7 @@ fn interpolation_is_lexed_recursively() {
 #[test]
 fn a_quoted_symbol_may_interpolate() {
     // §2: which gives dynamic symbol construction without a `sym(str)` builtin.
-    let ks = kinds(r#"."\(prefix)-id""#);
+    let ks = kinds(r#":"\(prefix)-id""#);
     let Tok::Sym { parts, quoted } = &ks[0] else { panic!("a symbol, got {:?}", ks[0]) };
     assert!(*quoted);
     assert_eq!(parts.len(), 2);
@@ -247,4 +245,35 @@ fn no_bang_operator() {
     // There is no `!` operator and no `&&`; logic is and / or / not (§2).
     assert!(tokenize("!a", "t.hy").is_err());
     assert_eq!(ops("a && b"), vec!["&", "&"]);
+}
+
+#[test]
+fn atoms_consume_punctuation_until_a_delimiter() {
+    for name in ["some-other-prop+interesting_added_info", "a-", "a.b", "a!@#$%=<>?~&^", "a/b", "a|b", "a\\b", "aé"] {
+        let src = format!(":{name}");
+        let lexed = tokenize(&src, "t.hy").unwrap();
+        assert_eq!(lexed.tokens[0].static_str().as_deref(), Some(name));
+        assert_eq!(lexed.tokens[0].len, src.chars().count() as u32);
+        assert_eq!(lexed.tokens.len(), 3);
+        assert!(hydra::lexer::is_symbol_name(name));
+    }
+    for delimiter in [" ", "\t", "\n", "\r\n", "(", ")", "[", "]", "{", "}", ",", ":", "\"text\"", "// comment", "||"] {
+        let src = format!(":atom+info{delimiter}");
+        assert_eq!(tokenize(&src, "t.hy").unwrap().tokens[0].static_str().as_deref(), Some("atom+info"), "{src:?}");
+    }
+    for name in ["a b", "a:b", "a,b", "a//b", "a||b", "a(b", "a\"b"] {
+        assert!(!hydra::lexer::is_symbol_name(name), "{name:?}");
+    }
+}
+
+#[test]
+fn colon_atoms_leave_assignment_namespace_and_dict_separators_intact() {
+    assert_eq!(ops("x := ::len([])"), vec![":=", "::", "(", "[", "]", ")"]);
+    let lexed = tokenize("{:name:\"Hydra\",:status::ready}", "t.hy").unwrap();
+    let names: Vec<String> = lexed.tokens.iter().filter_map(|t| match &t.kind {
+        Tok::Sym { .. } => t.static_str(),
+        _ => None,
+    }).collect();
+    assert_eq!(names, ["name", "status", "ready"]);
+    assert_eq!(ops("{:status::ready}"), vec!["{", ":", "}"]);
 }

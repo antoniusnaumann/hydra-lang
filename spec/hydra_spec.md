@@ -19,13 +19,29 @@ Each rule is tagged:
 
 ## 1. Character level
 
-**[D]** Source is UTF-8. Newlines terminate statements; there are no semicolons.
+**[D]** Source is UTF-8. Newlines terminate statements unless the syntax
+continues across them; there are no semicolons.
 Indentation is tabs and is **purely cosmetic** — the parser ignores leading
 whitespace entirely. Blocks are closed by `end`.
 
 **[D]** `//` begins a comment that runs to end of line.
 
-**[D]** No block comments. No line-continuation character; a statement is one line.
+**[D]** No block comments or line-continuation character. Continuation is
+aggressive: a single newline is whitespace whenever the current expression or
+statement can continue. This includes leading or trailing binary operators,
+lookup dots, calls, indexing, namespace selectors, assignments, commas, and
+unfinished expressions or delimited lists. Precedence is unchanged.
+`foo\n.bar\n.baz` means `foo.bar.baz`; `32\n-a` means `32 - a`.
+If the next token cannot continue the current statement, a new statement begins.
+Block headers and a bare `return` still end at their terminating newline.
+
+A **blank line** (including a whitespace-only line) always stops continuation.
+Thus `32\n\n-a` is two statements; use the same separation before a standalone
+list, parenthesized expression, reference, or `::builtin()` when its first
+token would otherwise continue the preceding expression. An unfinished
+expression followed by a blank line is an error. Comment-only lines are
+transparent and do not count as blank lines. Strings and their interpolations
+remain confined to one physical line.
 
 **[D]** String literals are double-quoted. **Interpolation is `\(expr)`** —
 the expression is lexed and parsed recursively, so it may contain parentheses,
@@ -66,7 +82,7 @@ before `>`.
 ### Keywords
 
 ```
-fn  use  if  else  for  in  while  return  break  continue  end
+fn  use  if  else  for  in  while  return  end
 and  or  not  parallel  race  as
 ```
 
@@ -99,32 +115,36 @@ it is never exported by `use` and never reachable through `::`.
 42        3.0                        // numbers
 "text"    "hi \(name), \(a + b)"     // string, with interpolation
 [1, 2, 3]                            // list
-{ .a : 5, .x-req-id : 17 }           // dict — keys are symbols
-.null  .false  .true  .whatever      // symbols
-.content-type                        // a symbol's name may contain `-`
-."not a name"                        // quoted symbol
+{ :a : 5, :x-req-id : 17 }           // dict — keys are symbols
+:null  :false  :true  :whatever      // symbols
+:content-type                        // a symbol's name may contain `-`
+:"not a name"                        // quoted symbol
 ```
 
-**[D]** A dot in leading position starts a **symbol**. A dot directly after an
-expression is a **key lookup**. The lexer decides by the preceding token: after
-an identifier, `)`, `]`, `}`, or a literal, `.` is a lookup; otherwise it opens
-a symbol.
+**[D]** A colon introduces an **atom**: `:name` or `:"quoted name"`.
+A dot is always a **key lookup**, including across a continuing newline:
+`foo.bar` means `foo[:bar]`. A colon atom starts a new statement without
+needing a blank line. Dicts retain the separator colon:
+`{ :name : "Hydra", :status : :ready }`. `:=` and `::` retain their meanings.
 
-**[D] A symbol's name may contain `-`**, as long as it is internal:
-`[A-Za-z_][A-Za-z0-9_]*(-[A-Za-z0-9_]+)*`. Nothing is lost by it, because
-subtracting one symbol from another is nonsense, so `.x-req-id` can only ever
-have been meant as one name. Spaces still end it: `.a - b` is a subtraction.
+**[D] Bare atoms consume punctuation aggressively.** A name begins with
+`[A-Za-z_]`, then continues until whitespace or one of `(`, `)`, `[`, `]`, `{`,
+`}`, `,`, `:`, or `"`. The pairs `//` and `||` also end it, preserving comments
+and trail separators. Other punctuation, including dots and trailing operators,
+belongs to the name: `:some-other-prop+interesting_added_info`, `:a.b`, and
+`:a-` are each one atom. `:a - b` is a subtraction. The colon and collection
+delimiters preserve compact dicts such as `{:a+b::c*d}`.
 
-This holds for a symbol **literal** only, and deliberately not for a key lookup.
-In `d.total-1` the thing left of the `-` is a *value*, and subtracting from it
-is perfectly sensible, so the lookup form keeps reading `-` as the operator. A
-hyphenated key is written `d[.x-req-id]` or `d."x-req-id"`.
+This holds for a symbol **literal** only. Lookup names remain identifiers:
+`d.total-1` (also `d\n.total-1`) subtracts one. A punctuation-containing key is
+written `d[:x-req-id]` or `d."x-req-id"`. To apply a lookup to an atom, quote the
+atom or separate it from the dot with whitespace: `:"a".key` or `:a .key`.
 
-**[D] Quoted symbols.** `."not a name"` is a symbol whose name is not a valid
+**[D] Quoted symbols.** `:"not a name"` is a symbol whose name is not a valid
 symbol name. It works in every position a bare symbol does, including lookup:
-`headers."content-type"` is `headers[."content-type"]`.
+`headers."content-type"` is `headers[:"content-type"]`.
 
-**[D]** A quoted symbol may interpolate — `."\(prefix)-id"` — which gives
+**[D]** A quoted symbol may interpolate — `:"\(prefix)-id"` — which gives
 dynamic symbol construction without a separate `sym(str)` builtin.
 
 **[D] Interning.** Symbols are interned and compared by identity. Because input
@@ -155,7 +175,7 @@ modulo 32.
 program    = { stmt } ;
 
 stmt       = use | fndecl | decl | assign | if | for | while
-           | parallel | race | break | continue | return | exprstmt ;
+           | parallel | race | return | exprstmt ;
 
 use        = "use" ident ;
 fndecl     = "fn" ident "(" [ params ] ")" NEWLINE block "end" ;
@@ -167,7 +187,7 @@ arg        = [ ident "=" ] expr ;
 decl       = ident ":=" expr ;
 dict       = "{" [ dictent { "," dictent } ] "}" ;
 dictent    = symbol ":" expr ;
-symbol     = "." ident | "." string ;
+symbol     = ":" atomname | ":" string ;  (* atom boundaries: §2 *)
 string     = '"' { char | "\\(" expr ")" } '"' ;
 assign     = lvalue "=" expr ;
 lvalue     = ident | postfix "." ident | postfix "[" expr "]" ;
@@ -187,13 +207,15 @@ rows       = { row NEWLINE } ;
 row        = cell { "||" cell } ;
 cell       = { token } ;                  (* see §4 *)
 
-break      = "break" [ ident | "trail" ] ;
-continue   = "continue" [ ident ] ;
 return     = "return" [ expr ] ;
 
 expr       = ... (* precedence table below *) ;
 closure    = "fn" "(" [ params ] ")" ( expr | NEWLINE block "end" ) ;
 ```
+
+Single physical newlines may be consumed within productions according to §1.
+`NEWLINE` marks a statement or block-header boundary left after continuation.
+Blank lines are never consumed as continuation.
 
 **[D]** Whether a closure is single-expression or multi-line is decided by
 whether anything follows the `)` **on the same line**.
@@ -233,9 +255,9 @@ f(1)         // "one" — the shadowing one rejects a single argument
 f(1, 2)      // "two"
 ```
 
-**[D] `.reject` hands the call back.** A signature says what a function can be
+**[D] `:reject` hands the call back.** A signature says what a function can be
 *given*; only the body can say what it can be *used for*. A candidate whose
-answer starts with the symbol **`.reject`** returns the call to resolution, which
+answer is **`:reject`** or **`[:reject, msg]`** returns the call to resolution, which
 carries on down the same list — so two functions may share a name **and** a
 shape:
 
@@ -254,38 +276,40 @@ parse("ab")      // "the quick one"    — the later one, as always
 parse("abcdef")  // "the careful one"  — the quick one handed it back
 ```
 
-**[D]** `reject` is an ordinary builtin with two overloads:
+**[D]** `reject` is an ordinary builtin equivalent to:
 
 ```hydra
-fn reject()
-	return .reject
-end
-fn reject(message)
-	return .reject, message
+fn reject(msg = :null)
+    return [:reject, msg]
 end
 ```
 
-It leaves the function because its answer is a `.reject` that nothing consumes
-(§8.1) — the same way any helper's does. `return .reject`, `reject()`, and a
-helper's `.reject` left unconsumed are the same thing at the call boundary. The
-values after `.reject` are the rejection's payload.
+It constructs **one list value**. `reject(msg)` and `return [:reject, msg]`
+can reject a candidate, while `result := reject(msg)` keeps ordinary data:
+`result[0]` is `:reject` and `result[1]` is the message. `reject()` constructs
+`[:reject, :null]`, a rejection without a message. Bare `:reject` also remains
+a rejection. Tagged rejection lists have exactly two elements.
 
-**[D]** When **every** candidate rejects, the call answers with the rejection of
-the last one tried, unchanged. Consumed, it is a value like any other; left
-unconsumed, it travels on (§8.1). If it reaches the top level of a file, the
-crash prints its payload and every refusal of the call that ran out of
-candidates, nearest first — here for two that both rejected, the earlier one
-without a message:
+An unconsumed rejection returns from its current function (§8.1), giving
+resolution the opportunity to try the next suitable signature. **Nothing is
+printed while candidates remain.** If a candidate succeeds, all accumulated
+refusals are discarded silently.
+
+When every candidate rejects, the call answers with the last rejection value.
+If no consumer handles that value, the **standard handler reports all refusal
+messages on stderr and fails** with an unhandled-rejection crash. Refusals from
+nested helpers are retained too; each message is shown once with its signature,
+in the order candidates were tried. Consuming the result suppresses that handler.
 
 ```
 crash: unhandled rejection
   the top level of a file has no call to hand it back to
   no `parse` took 1 argument(s)
     parse(text) rejected it: this one only does short ones
-    parse(text) rejected it
+    parse(text) rejected it: unsupported input
 ```
 
-**[D]** A `.reject` has somewhere to go only in a **function**. At a file's top
+**[D]** A `:reject` has somewhere to go only in a **function**. At a file's top
 level, or in a trail — which cannot return from its function (§9.6) — one that
 nothing consumes crashes; `check` reports a literal one before it runs.
 
@@ -294,7 +318,7 @@ that a rejection can hand them on costs a *handle*, not a copy — that is what
 copy-on-write is for (§5.1). The copy happens on the **write**: the retained
 arguments are marked shared, so writing to one splits a node the next candidate
 still needs, and it is thrown away with the call. `check` warns where a write
-that reaches an argument precedes a rejection — `reject(…)`, `.reject`, or a
+that reaches an argument precedes a rejection — `reject(…)`, `:reject`, or a
 call to a function of the same file that can reject; a local of the function's
 own is not one, and nothing is said about it.
 
@@ -306,7 +330,7 @@ call was handed back — cancellation's rule (§9.5) in another place.
 one shape are only useful because the later can hand a call back — so a later
 one that accepts everything an earlier one accepts and has no way to reject
 makes the earlier unreachable, and `check` reports that rather than leaving dead
-code in the file. A way to reject is a `reject(…)`, a `.reject`, or a
+code in the file. A way to reject is a `reject(…)`, a `:reject`, or a
 statement or `return` calling something that can — a function of the file
 that rejects, or anything the file cannot see into (an import, a parameter, a
 field), since an error must be certain (§11). A **variadic** never shadows a
@@ -367,7 +391,9 @@ first line inside the block that contains **zero** separators.
    is why this step runs on tokens rather than on raw text.
 3. Verify all rows have the same cell count → otherwise a hard parse error.
 4. **Transpose**: concatenate cell *k* of every row, in row order, into trail
-   *k*'s token stream. Trim each cell.
+   *k*'s token stream. Trim each cell, retaining a newline after it. An empty
+   cell or a blank physical line stops continuation in that trail; comment-only
+   lines are transparent. Continuation never crosses into another column.
 5. Parse each trail's stream as an ordinary statement list; blocks inside a
    trail must balance within that trail.
 6. Keep the original `(line, column)` of every cell so diagnostics point at the
@@ -396,12 +422,12 @@ hard error with that suggestion.
 | string | immutable; supports `\(expr)` interpolation, and `+` concatenates two strings |
 | list | mutable, **value semantics** (§5.1) |
 | dict | mutable, **symbol keys only**, **value semantics** |
-| symbol | interned tag, e.g. `.null` |
+| symbol | interned tag, e.g. `:null` |
 | closure | captures its enclosing **scope**, not a copy of it |
 
 **[D]** There is no separate struct type — a "struct" is a dict with symbol
-keys. `d.field` is sugar for looking up the symbol `.field`, so `d.a` and
-`d[.a]` are the same operation, and a computed key is just `d[k]`.
+keys. `d.field` is sugar for looking up the symbol `:field`, so `d.a` and
+`d[:a]` are the same operation, and a computed key is just `d[k]`.
 
 ### 5.1 Value semantics and `&`
 
@@ -412,7 +438,7 @@ aliased implicitly.
 ```hydra
 b := a          // b is an independent copy
 f(a)            // f cannot touch the caller's a
-d := { .x : a } // the dict holds a copy
+d := { :x : a } // the dict holds a copy
 ```
 
 **[D]** `&lvalue` passes a reference instead — the caller marks it, never the
@@ -420,7 +446,7 @@ callee:
 
 ```hydra
 f(&a)
-d := { .x : &a }
+d := { :x : &a }
 b := &a
 list := [&a, &b]
 ```
@@ -446,11 +472,11 @@ copy that has not yet been written to still reports as identical to its source:
 
 ```hydra
 b := a
-b === a         // .true  — they still share a buffer
+b === a         // :true  — they still share a buffer
 b.x = 1         // write splits the buffer
-b === a         // .false — from here on
+b === a         // :false — from here on
 c := &a
-c === a         // .true  — always
+c === a         // :true  — always
 ```
 
 This is a deliberate simplification, accepted to keep the first implementation
@@ -473,7 +499,7 @@ things can race — bindings in the shared parent scope, and values that were
 handed over with `&`. **`&` is the marker for shared mutable state**, and is
 worth reading as such at every call site.
 
-**[D] Truthiness:** `.null` and `.false` are falsy. *Everything else is truthy*,
+**[D] Truthiness:** `:null` and `:false` are falsy. *Everything else is truthy*,
 including `0`, `""`, and `[]`.
 
 **[D]** Reading a field that does not exist is a **crash** (see §8).
@@ -483,7 +509,7 @@ including `0`, `""`, and `[]`.
 recursively.
 
 **[D]** Since `a === b` implies `a == b`, deep comparison **tries identity
-first** and returns `.true` immediately when it holds, before any walk. This is
+first** and returns `:true` immediately when it holds, before any walk. This is
 the fast path for the common case of comparing a value with itself.
 
 One deliberate consequence: a structure containing `NaN` is `==` to itself,
@@ -498,10 +524,10 @@ never equal to itself under either operator.
 
 **[D] Cycles** are handled with a **visited-pair set**. Deep comparison keeps a
 set of `(a, b)` reference pairs currently being compared; re-encountering a pair
-returns `.true` rather than recursing. Two cyclic structures of the same shape
+returns `:true` rather than recursing. Two cyclic structures of the same shape
 therefore compare equal, and comparison always terminates.
 
-Fast paths worth having: identical references short-circuit to `.true` before
+Fast paths worth having: identical references short-circuit to `:true` before
 anything else, and the set is only allocated once recursion passes a small depth.
 
 **[D]** List indexing (`a[i]`) is **0-based**, and a **negative index counts
@@ -513,11 +539,11 @@ after that crashes, consistently with a missing key.
 incrementally, and with no exceptions there is no other way to recover.
 
 **[D] Key writes create.** Reading a missing key crashes; `d.k = v` and
-`d[k] = v` create it. `d.k` is **exactly** sugar for `d[.k]` — one code path in
+`d[k] = v` create it. `d.k` is **exactly** sugar for `d[:k]` — one code path in
 the evaluator, not two.
 
 **[O] Reading a maybe-missing key.** Since reads crash and nothing can be
-caught, the stdlib must provide `has(d, .k)` and probably `get(d, .k, default)`.
+caught, the stdlib must provide `has(d, :k)` and probably `get(d, :k, default)`.
 Any program touching decoded JSON needs them on the first line.
 
 ### 5.2 Calling through a dot
@@ -533,8 +559,8 @@ Any program touching decoded JSON needs them on the first line.
 
 ```hydra
 "hello".len()          // len("hello")   -> 5
-config.get(.port, 80)  // get(config, .port, 80)
-obj.greet("eu")        // the field, when `.greet` holds a closure
+config.get(:port, 80)  // get(config, :port, 80)
+obj.greet("eu")        // the field, when `:greet` holds a closure
 ```
 
 **[D]** *Callable* is the whole test for step 1. A field named `count` holding a
@@ -697,7 +723,7 @@ is the same failure mode as a shadowed name, and it still returns *something*.
 ## 8. Errors
 
 **[D]** There are no exceptions and no catch. Failure is an ordinary value —
-by convention a symbol such as `.failed`.
+by convention a symbol such as `:failed`.
 
 **[D]** A **crash** (missing field, bad operand, `=` to an undeclared name, a
 call no candidate accepts, an argument a `&` parameter needs and did not get,
@@ -715,8 +741,8 @@ it stands in, immediately and per statement — results are never accumulated
 across statements. `if`, `for`, `while` and the blocks are statements, not
 expressions, so the statements in their bodies are statement level too.
 
-**[D]** A call's several values are **one** result: `foo()` answering
-`.reject, "reason"` is handled as `(.reject, "reason")`.
+**[D]** A call's several values are **one** result. A rejection payload uses
+a single list value, `[:reject, "reason"]`; it is not a two-value return.
 
 **[D]** A result is **consumed** by anything that takes it: a binding, an
 argument, an operand, a `return`. `_ = foo()` consumes it explicitly, and
@@ -725,11 +751,15 @@ and drops the rest.
 
 **[D]** What an unconsumed result does:
 
-| Where | Ordinary result | Result starting with `.reject` |
+| Where | Ordinary result | `:reject` or `[:reject, msg]` |
 |---|---|---|
 | Function body | dropped | the function returns it, unchanged |
 | Trail inside a function | dropped | crash — a trail cannot return (§9.6) |
 | File top level, its trails included | printed | crash — unhandled rejection |
+
+Loop controls are handled separately (§9.6): an unconsumed `:break` or
+`:continue` targets a loop in the current function, and crashes if none exists.
+They cross a function boundary only through an explicit return.
 
 So a rejection travels through any number of helpers with nothing written to
 pass it on:
@@ -737,12 +767,12 @@ pass it on:
 ```hydra
 fn reject_if(cond)
 	if cond
-		return .reject, "invalid value"
+		return [:reject, "invalid value"]
 	end
 end
 
 fn foo(x)
-	reject_if(x < 0)    // `.reject, "invalid value"` — foo returns it
+	reject_if(x < 0)    // `[:reject, "invalid value"]` — foo returns it
 	return x
 end
 ```
@@ -751,7 +781,7 @@ At the call boundary it is a rejection like any other (§3).
 
 **[D]** At the top level, a result is printed as `print` would print it, and a
 call's several values are printed on one line, separated by `, `. A single
-`.null` — what `print` answers, and what a function without `return` answers —
+`:null` — what `print` answers, and what a function without `return` answers —
 is not printed.
 
 **[D]** There are no handlers yet: no `try`, no `catch`, nothing to register.
@@ -849,7 +879,7 @@ spawn work that outlives it.
 
 **[D]** `alive()` reports whether the calling trail still matters. It is a
 **dynamic** property of the current trail — no token threading — and returns
-`.true` outside any trail. It also goes false during crash shutdown, so one
+`:true` outside any trail. It also goes false during crash shutdown, so one
 check covers both paths.
 
 **[D]** A crash inside a **dead** trail is **isolated**: that trail ends, the
@@ -857,15 +887,60 @@ program continues. Dead-trail crashes are reported on stderr by default
 (silenceable) and are **fatal under strict mode**, so tests fail on bugs that
 production would swallow.
 
-### 9.6 Control flow inside trails
+### Process termination handlers
 
-**[D]** `return` inside a trail is **forbidden** — `check` rejects it.
-`break` ends the current trail early. Cancelling *siblings* is `race`'s job
-alone and has no other syntax.
+`exit(code = 0)` constructs `[:exit, code]`; `panic(msg)` constructs
+`[:panic, msg]`. Consumed lists remain ordinary data. An unconsumed two-element
+list invokes the standard handler in any function or live trail:
 
-**[D] Labels.** A loop or block may be labelled with `as name`, and
-`break name` / `continue name` target it. `break trail` ends the innermost
-trail from any depth — `trail` is a reserved label, not an identifier.
+- `exit` stops the program silently with an integer status from 0 through 255.
+- `panic` reports the message, location and call trace on stderr and fails with
+  status 1.
+
+Neither effect triggers overload fallback. Explicit termination stops all VM
+work, including in-flight calls in sibling trails; ordinary race cancellation
+keeps its existing call-completion rule. Exit from an already cancelled trail
+is ignored, and panic there follows dead-trail crash isolation. The first live
+termination outcome wins. See the standard library specification for details.
+
+### 9.6 Loop control
+
+**[D]** `:break` and `:continue` are ordinary atoms. Loops implicitly handle
+these atoms when an expression statement leaves them unconsumed: `:break`
+exits the nearest loop, and `:continue` starts its next iteration. Assignment,
+arguments, collections, and other consumers treat them as ordinary values.
+
+The idiomatic spelling is `break()` or `continue()`. These ordinary, shadowable,
+zero-argument builtins simply return `:break` and `:continue`, respectively.
+`::break()` and `::continue()` reach the builtins past a shadow.
+
+Handlers are local to the current function. A helper must **explicitly return**
+the atom for its caller to handle it; `break()` inside a helper cannot affect a
+caller's loop. An unconsumed control atom with no local loop crashes. Explicit
+`return :break` bypasses the function's local loops and returns the value.
+
+```hydra
+fn break_if(condition)
+    if condition
+        return :break
+    end
+end
+for item in items
+    break_if(done(item))
+    process(item)
+end
+```
+
+In `parallel for` / `parallel while` (and their `race` forms), `:continue`
+ends only the current iteration's trail. `:break` stops spawning iterations
+and cancels sibling iteration trails using the usual cancellation boundaries.
+A nested ordinary loop handles its own atoms first. A plain row-form parallel
+or race block does not install a loop handler, and controls do not cross its
+trail boundary to reach an outer loop. `return` directly inside a trail remains
+forbidden; a function called by the trail can return a control atom.
+
+There are no `break` / `continue` statements, labeled breaks, or `break trail`.
+Block labels remain available for channel selection.
 
 ---
 
@@ -898,8 +973,7 @@ maybe-list would be enormous and would be ignored within a week.
 | `=` to a name with no binding in any enclosing scope | scope walk |
 | Read of a name declared only inside a trail, used after the block | trail-local rule §6 |
 | `return` inside a trail | §9.6 |
-| `break` / `continue` with an unresolvable label | label table |
-| `break` / `continue` outside any loop (except `break trail` inside a trail) | §9.6 |
+| a known control atom or builtin left unconsumed without a local loop | §9.6 |
 | Key read on a dict literal that provably lacks the key | local dataflow |
 | Undeclared name used inside a `\(…)` interpolation | token-level resolution |
 | Non-symbol key in a dict literal | grammar |
@@ -912,7 +986,7 @@ maybe-list would be enormous and would be ignored within a week.
 | Rows of a block with differing separator counts | §4 |
 | Compound keyword split across lines or across `\|\|` | §2 |
 | A later function that covers an earlier one's shape and cannot reject | §3 |
-| `reject(…)` or `.reject` left unconsumed at the top level or in a trail | §8.1 |
+| `reject(…)` or `:reject` left unconsumed at the top level or in a trail | §8.1 |
 
 **Warnings:**
 
@@ -938,15 +1012,18 @@ maybe-list would be enormous and would be ignored within a week.
 2. One space around binary operators and after commas; none inside `(`/`[`, and
    none between `&` and its lvalue — `&a`, never `& a`.
 3. Compound keywords normalise to exactly one space and are **never** wrapped.
-3a. Dict literals normalise to `{ .a : 1, .b : 2 }` — spaces inside the braces
+3a. Dict literals normalise to `{ :a : 1, :b : 2 }` — spaces inside the braces
    and around the colon. Interpolations normalise like ordinary expressions:
    `\(a + b)`, never `\( a+b )`. A quoted symbol whose content is a valid
-   symbol name is rewritten bare: `."name"` becomes `.name` and `."x-req-id"`
-   becomes `.x-req-id`. A *key lookup* is not a symbol literal, so
+   symbol name is rewritten bare: `:"name"` becomes `:name` and `:"x-req-id"`
+   becomes `:x-req-id`. A *key lookup* is not a symbol literal, so
    `d."x-req-id"` keeps its quotes — bare, the `-` there would subtract.
-   **[D]**, one line each to change.
-4. Never move a line break, since a newline terminates a statement — the
-   formatter must not join or split statement lines.
+   An atom followed by a lookup dot keeps (or gains) quotes so the dot cannot
+   become part of its name.
+4. Preserve line breaks and continuation boundaries. Insert a blank line after
+   a completed block’s `end` before the next statement or branch, except before
+   another `end`. Keep existing blank lines; do not add trailing blanks at EOF
+   or split closure continuations or parallel rows.
 5. Inside a `parallel` block:
    - split each row on top-level `||`;
    - pad every cell to the widest in its column, then join with ` || `;
@@ -970,9 +1047,10 @@ VS Code Dark+ mapping used in the mock-ups.
 |---|---|---|
 | `keyword.concurrency` | `parallel`, `race`, and every compound built on them — coloured as **one unit** | `#ff8a65` semibold |
 | `punctuation.trail` | `\|\|` | `#ff8a65` @ 55% |
-| `keyword.control` | `if`, `else`, `else if`, `for`, `in`, `while`, `return`, `break`, `continue`, `end` | `#c586c0` |
+| `keyword.control` | `if`, `else`, `else if`, `for`, `in`, `while`, `return`, `end`; `exit` / `panic` / `reject` atom names and builtin calls | `#c586c0` |
 | `keyword.other` | `fn`, `use`, `and`, `or`, `not`, `as` | `#569cd6` |
-| `entity.symbol`, `entity.namespace` | `.null`, `json::` | `#4ec9b0` |
+| `entity.namespace` | `json::` | `#4ec9b0` |
+| `punctuation.delimiter` | the `:` introducing an atom | `#d4d4d4` |
 | `variable`, `variable.property` | | `#9cdcfe` |
 | `entity.function` | | `#dcdcaa` |
 | `constant` | `ALL_CAPS` | `#4fc1ff` |
@@ -999,21 +1077,21 @@ fn warm(name, img)
 	wait_ready(h, 60)
 	if not healthy(h)
 		drain(h)
-		return .failed
+		return :failed
 	end
 	return h
 end
 
 manifest := json::decode(read_file("deploy.json"))
-img := manifest.image        // same as manifest[.image]
+img := manifest.image        // same as manifest[:image]
 
 for name in REGIONS
 	print("target \(name) -> \(img)")
 end
 
-eu := .null
-us := .null
-ap := .null
+eu := :null
+us := :null
+ap := :null
 
 parallel
 	eu = warm("eu", img) || us = warm("us", img) || ap = warm("ap", img)
@@ -1022,7 +1100,7 @@ end
 
 down := 0
 for h in [eu, us, ap]
-	if h == .failed or not live(h)
+	if h == :failed or not live(h)
 		down = down + 1
 	end
 end
@@ -1046,10 +1124,10 @@ proposed stdlib. See the note at the top of this document.
 
 1. Reading a maybe-missing key — `has` / `get`. Blocks any program that parses
    JSON. **Highest priority.** A symbol that isn't a valid identifier is
-   spelled `."like-this"`, and built from data with `."\(x)"`.
+   spelled `:"like-this"`, and built from data with `:"\(x)"`.
 2a. Whether `===` keeps reporting COW storage or gains a real identity stamp.
-5. Whether `break` inside `parallel for` ends that iteration's trail (consistent
-   with `break` in a plain trail) or stays invalid.
+5. Loop control is decided in §9.6: `:continue` ends one iteration and
+   `:break` stops the parallel loop.
 6. Every remaining **[P]**: the preemption points, and whether a `parallel`
    block may be written syntactically inside a cell.
 7. The standard library. `print`, `has`, `get`, `len` and `push` are specified

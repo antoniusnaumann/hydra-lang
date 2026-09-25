@@ -1,7 +1,7 @@
 //! The syntax tree (spec §3).
 //!
 //! Block nodes keep the position of their `end` as well as of their header,
-//! because the formatter may never move a line break (§12 rule 4) and so needs
+//! because the formatter preserves continuation boundaries (§12 rule 4) and needs
 //! to know which source line every construct occupies.
 
 use std::collections::HashMap;
@@ -34,7 +34,7 @@ pub enum StrPart {
     Expr(Expr),
 }
 
-/// `.name`, `."not an identifier"`, or `."\(prefix)-id"` (§2).
+/// `:name`, `:"not an identifier"`, or `:"\(prefix)-id"` (§2).
 ///
 /// `name` is the literal text when the symbol does not interpolate; when it
 /// does, the symbol is built at run time and `name` is empty.
@@ -70,7 +70,7 @@ pub enum Expr {
     /// `mod::name`, and `::name` with an empty module — the language's own
     /// namespace, which is how a builtin is reached past a shadow (§7).
     Namespace { module: String, name: String, pos: Pos },
-    /// `a.b` — sugar for `a[.b]` (§5).
+    /// `a.b` — sugar for `a[:b]` (§5).
     Key { obj: Box<Expr>, key: SymLit, pos: Pos },
     /// The callee of `x.f(…)` and `x.mod::f(…)` — a dot with a *name* and a
     /// call after it, which the parser only ever builds in that position.
@@ -254,15 +254,6 @@ pub struct TrailDef {
 }
 
 #[derive(Clone, Debug)]
-pub enum BreakTarget {
-    /// `break` — innermost loop, or the trail when written directly in one.
-    Innermost,
-    /// `break trail` — the innermost trail, from any depth (§9.6).
-    Trail,
-    Label(String),
-}
-
-#[derive(Clone, Debug)]
 pub enum Stmt {
     /// `use fs` brings the module in **for qualified calling only** — `fs::read`
     /// — and nothing of it is reachable unqualified. `use fs as *` binds its
@@ -351,14 +342,6 @@ pub enum Stmt {
         pos: Pos,
         end_pos: Pos,
     },
-    Break {
-        target: BreakTarget,
-        pos: Pos,
-    },
-    Continue {
-        label: Option<String>,
-        pos: Pos,
-    },
     /// `return`, `return expr`, or `return a, b` — a function may answer with
     /// several values, of which the first is the meaningful one and the rest
     /// are additional information (channels §6.2).
@@ -385,8 +368,6 @@ impl Stmt {
             | Stmt::Parallel { pos, .. }
             | Stmt::ParallelFor { pos, .. }
             | Stmt::ParallelWhile { pos, .. }
-            | Stmt::Break { pos, .. }
-            | Stmt::Continue { pos, .. }
             | Stmt::Return { pos, .. }
             | Stmt::Expr { pos, .. } => *pos,
         }

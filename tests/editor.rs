@@ -63,8 +63,10 @@ fn identifiers_are_classified_by_context() {
 
 #[test]
 fn literals_and_comments() {
-    assert_eq!(class_at("x := .null\n", 1, 6), "entity.symbol");
-    assert_eq!(class_at("x := .\"x-req-id\"\n", 1, 6), "entity.symbol");
+    assert_eq!(class_at("x := :null\n", 1, 7), "constant");
+    assert_eq!(class_at("break()\n", 1, 1), "entity.function");
+    assert_eq!(class_at("x := :null\n", 1, 6), "punctuation.delimiter");
+    assert_eq!(class_at("x := :\"x-req-id\"\n", 1, 6), "punctuation.delimiter");
     assert_eq!(class_at("x := \"text\"\n", 1, 6), "string");
     assert_eq!(class_at("x := 3.0\n", 1, 6), "constant.numeric");
     assert_eq!(class_at("x := 1 // why\n", 1, 8), "comment");
@@ -77,7 +79,7 @@ fn every_class_in_the_spec_table_is_produced() {
     let src = "// note\n\
                use json\n\
                REGIONS := [\"eu\"]\n\
-               status := .null\n\
+               status := :null\n\
                parallel for r in REGIONS\n\
                \tjson::decode(r.body) || wait(60)\n\
                end\n";
@@ -105,4 +107,18 @@ fn the_theme_carries_the_reference_colours() {
     assert!(theme.contains("#c586c0"));
     assert!(theme.contains("#4ec9b0"));
     assert!(theme.contains("\"fontStyle\": \"italic\""));
+}
+
+#[test]
+fn control_handlers_use_returns_colour_but_keep_atom_delimiters() {
+    let expected = class_at("return 1\n", 1, 1);
+    for name in ["exit", "panic", "reject"] {
+        assert_eq!(class_at(&format!("{name}(1)\n"), 1, 1), expected);
+        assert_eq!(class_at(&format!(":{name}\n"), 1, 1), "punctuation.delimiter");
+        assert_eq!(class_at(&format!(":{name}\n"), 1, 2), expected);
+        assert_eq!(class_at(&format!(":\"{name}\"\n"), 1, 2), expected);
+        assert_eq!(class_at(&format!("::{name}(1)\n"), 1, 3), expected);
+        assert_eq!(class_at(&format!(":{name}-later\n"), 1, 2), "constant");
+        assert_eq!(class_at(&format!("module::{name}(1)\n"), 1, 9), "entity.function");
+    }
 }

@@ -4,7 +4,7 @@
 //	hydra run examples/trails.hy
 
 // Value semantics: everything copies, `&` opts out (§5.1).
-original := { .count : 0, .tag : .fresh }
+original := { :count : 0, :tag : :fresh }
 copy := original
 copy.count = 1
 print("the copy split on write: original is \(original.count), the copy is \(copy.count)")
@@ -25,14 +25,14 @@ print("through a reference: \(original.count)")
 print("copy === original: \(copy === original), and original === original: \(original === original)")
 
 // Reading a missing key crashes, so `has` and `get` are how you ask (§15.1).
-config := { .region : "eu" }
-print("region \(get(config, .region, "?")), retries \(get(config, .retries, 3))")
-print("has .retries: \(has(config, .retries))")
+config := { :region : "eu" }
+print("region \(get(config, :region, "?")), retries \(get(config, :retries, 3))")
+print("has .retries: \(has(config, :retries))")
 
 // Trails share the parent scope; `:=` inside one is trail-local (§6, §9.2).
-first := .null
-second := .null
-third := .null
+first := :null
+second := :null
+third := :null
 
 parallel
 	first = "eu" || second = "us"             || third = "ap"
@@ -51,7 +51,7 @@ print("\(len(seen)) trails reported")
 
 // A race is decided by the first trail to finish, and the losers are cancelled
 // before their next statement (§9.4, §9.5).
-winner := .null
+winner := :null
 race
 	winner = "short" || slow := 1
 	                 || slow = slow + 1
@@ -69,9 +69,9 @@ fn describe(region)
 end
 describe := fn(region, detail) "region \(region) (\(detail))"
 
-bello := { .name : "Bello", .age : 21 }
+bello := { :name : "Bello", :age : 21 }
 
-lol := { .dog : bello }
+lol := { :dog : bello }
 lol.dog.name = "Hasso"
 
 print(bello.name)

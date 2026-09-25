@@ -32,17 +32,17 @@ fn sexpr(e: &Expr) -> String {
                 .collect();
             format!("(sym {})", pieces.join(" "))
         }
-        Expr::Sym(s) => format!(".{}", s.name),
+        Expr::Sym(s) => format!(":{}", s.name),
         Expr::List { items, .. } => {
             format!("(list {})", items.iter().map(sexpr).collect::<Vec<_>>().join(" "))
         }
         Expr::Dict { entries, .. } => format!(
             "(dict {})",
-            entries.iter().map(|(k, v)| format!(".{} {}", k.name, sexpr(v))).collect::<Vec<_>>().join(" ")
+            entries.iter().map(|(k, v)| format!(":{} {}", k.name, sexpr(v))).collect::<Vec<_>>().join(" ")
         ),
         Expr::Name { name, .. } => name.clone(),
         Expr::Namespace { module, name, .. } => format!("{module}::{name}"),
-        Expr::Key { obj, key, .. } => format!("(key {} .{})", sexpr(obj), key.name),
+        Expr::Key { obj, key, .. } => format!("(key {} :{})", sexpr(obj), key.name),
         Expr::Method { obj, module: None, name, .. } => format!("(dot {} {name})", sexpr(obj)),
         Expr::Method { obj, module: Some(module), name, .. } => {
             format!("(dot {} {module}::{name})", sexpr(obj))
@@ -111,26 +111,26 @@ fn precedence_is_pythons_not_cs() {
 
 #[test]
 fn postfix_binds_tightest() {
-    assert_eq!(first_expr("-a.b\n"), "(- (key a .b))");
-    assert_eq!(first_expr("f(x).y[0]\n"), "(index (key (call f x) .y) 0)");
+    assert_eq!(first_expr("-a.b\n"), "(- (key a :b))");
+    assert_eq!(first_expr("f(x).y[0]\n"), "(index (key (call f x) :y) 0)");
     assert_eq!(first_expr("json::decode(body)\n"), "(call json::decode body)");
-    assert_eq!(first_expr("m::n.k\n"), "(key m::n .k)");
+    assert_eq!(first_expr("m::n.k\n"), "(key m::n :k)");
 }
 
 #[test]
 fn key_lookup_and_quoted_keys() {
-    // `d.a` is sugar for `d[.a]`, and `headers."content-type"` for
-    // `headers[."content-type"]` (§2, §5).
-    assert_eq!(first_expr("d.a\n"), "(key d .a)");
-    assert_eq!(first_expr("headers.\"content-type\"\n"), "(key headers .content-type)");
+    // `d.a` is sugar for `d[:a]`, and `headers."content-type"` for
+    // `headers[:"content-type"]` (§2, §5).
+    assert_eq!(first_expr("d.a\n"), "(key d :a)");
+    assert_eq!(first_expr("headers.\"content-type\"\n"), "(key headers :content-type)");
     assert_eq!(first_expr("d[k]\n"), "(index d k)");
-    assert_eq!(first_expr("{ .a : 5, .\"x-req-id\" : 17 }\n"), "(dict .a 5 .x-req-id 17)");
+    assert_eq!(first_expr("{ :a : 5, :\"x-req-id\" : 17 }\n"), "(dict :a 5 :x-req-id 17)");
 }
 
 #[test]
 fn references_need_lvalues() {
     assert_eq!(first_expr("f(&a)\n"), "(call f (& a))");
-    assert_eq!(first_expr("x := &d.k\n"), "(& (key d .k))");
+    assert_eq!(first_expr("x := &d.k\n"), "(& (key d :k))");
     assert_eq!(first_expr("x := [&a, &b]\n"), "(list (& a) (& b))");
     // §5.1: `&(a + b)` and `&f()` are errors.
     assert!(parse("x := &(a + b)\n", "t.hy").is_err());
@@ -200,17 +200,15 @@ fn else_then_nested_if_needs_its_own_end() {
 }
 
 #[test]
-fn labels_and_break_targets() {
-    let program = parse("for e in list as scan\n\tcontinue\n\tbreak scan\n\tbreak trail\n\tbreak\nend\n", "t.hy").unwrap();
-    let Stmt::For { label, body, .. } = &program.body[0] else { panic!("expected for") };
-    assert_eq!(label.as_deref(), Some("scan"));
-    assert!(matches!(&body[0], Stmt::Continue { label: None, .. }));
-    assert!(matches!(&body[1], Stmt::Break { target: BreakTarget::Label(l), .. } if l == "scan"));
-    assert!(matches!(&body[2], Stmt::Break { target: BreakTarget::Trail, .. }));
-    assert!(matches!(&body[3], Stmt::Break { target: BreakTarget::Innermost, .. }));
-
-    // `trail` is a reserved label, not an identifier (§9.6).
-    assert!(parse("for e in list as trail\nend\n", "t.hy").is_err());
+fn control_atoms_and_unreserved_builtin_names() {
+    let program = parse("for e in list\n\t:continue\n\t:break\nend\n", "t.hy").unwrap();
+    let Stmt::For { body, .. } = &program.body[0] else { panic!("expected for") };
+    assert!(matches!(&body[0], Stmt::Expr { expr: Expr::Sym(s), .. } if s.name == "continue"));
+    assert!(matches!(&body[1], Stmt::Expr { expr: Expr::Sym(s), .. } if s.name == "break"));
+    assert!(parse("break outer\n", "t.hy").is_err());
+    assert!(parse("break trail\n", "t.hy").is_err());
+    assert!(parse("continue outer\n", "t.hy").is_err());
+    assert!(parse("fn break()\nreturn :break\nend\nbreak()\n", "t.hy").is_ok());
 }
 
 // --- parallel blocks (§4) ---------------------------------------------------
@@ -393,4 +391,113 @@ fn arguments_may_be_named() {
     assert!(err.message.contains("`end` is a keyword"), "{}", err.message);
     let err = parse("f := fn(end) end\n", "t.hy").unwrap_err();
     assert!(err.message.contains("`end` is a keyword"), "{}", err.message);
+}
+
+#[test]
+fn expressions_aggressively_continue_across_single_newlines() {
+    for (source, expected) in [
+        ("foo\n.bar\n.baz", "(key (key foo :bar) :baz)"),
+        ("foo\n.bar.baz", "(key (key foo :bar) :baz)"),
+        ("32\n-a", "(- 32 a)"),
+        ("32\n-a\n* b\n+ c", "(+ (- 32 (* a b)) c)"),
+        ("a +\nb *\nc", "(+ a (* b c))"),
+        ("a\nand\nnot b\nor c", "(or (and a (not b)) c)"),
+        ("a\n| b\n^ c\n& d\n<< e", "(| a (^ b (& c (<< d e))))"),
+        ("a\n<= b\n== c", "(== (<= a b) c)"),
+        ("f\n(1,\n2)\n[0]", "(index (call f 1 2) 0)"),
+        ("obj\n.method\n(1)", "(call (dot obj method) 1)"),
+        ("obj\n.mod\n::call\n(1)", "(call (dot obj mod::call) 1)"),
+        ("json\n::decode\n(body)", "(call json::decode body)"),
+        ("obj\n.total-1", "(- (key obj :total) 1)"),
+        ("obj\n.\"a-b\"", "(key obj :a-b)"),
+        ("x\n:=\n32\n- a", "(- 32 a)"),
+        ("x\n+=\n2", "2"),
+        ("[\n1,\n2\n]", "(list 1 2)"),
+        ("{\n:a+b:\n1,\n:c:\n2\n}", "(dict :a+b 1 :c 2)"),
+        ("f(\nx\n=\n1\n)", "(call f x=1)"),
+    ] {
+        let program = parse(source, "t.hy").unwrap_or_else(|e| panic!("{source:?}: {e}"));
+        assert_eq!(program.body.len(), 1, "{source:?}");
+        assert_eq!(first_expr(source), expected, "{source:?}");
+        let formatted = hydra::format::format_source(source, "t.hy").unwrap();
+        assert_eq!(first_expr(&formatted), expected, "formatted {source:?}");
+    }
+}
+
+#[test]
+fn blank_lines_stop_continuation() {
+    for source in ["32\n\n-a", "32\n \t\n-a", "foo\n\n:bar", "f\n\n(1)", "a\n\n[0]"] {
+        assert_eq!(parse(source, "t.hy").unwrap().body.len(), 2, "{source:?}");
+    }
+    assert_eq!(first_expr("32\n\n-a"), "32");
+    let program = parse("32\n\n-a", "t.hy").unwrap();
+    let Stmt::Expr { expr, .. } = &program.body[1] else { panic!("expression") };
+    assert_eq!(sexpr(expr), "(- a)");
+    for source in ["a +\n\nb", "a\n\n+ b", "f(\n\n1)", "{:a:\n\n1}"] {
+        assert!(parse(source, "t.hy").is_err(), "{source:?}");
+    }
+    assert_eq!(parse("foo\nbar\nreject()", "t.hy").unwrap().body.len(), 3);
+}
+
+#[test]
+fn atom_boundaries_preserve_collections_and_trails() {
+    assert_eq!(first_expr(":some-other-prop+interesting_added_info"), ":some-other-prop+interesting_added_info");
+    assert_eq!(first_expr("[:a+b,:c*d,:e.f]"), "(list :a+b :c*d :e.f)");
+    assert_eq!(first_expr("{:a+b::c*d,:e/f::g=?!}"), "(dict :a+b :c*d :e/f :g=?!)");
+    let program = parse("parallel\n:a+b||:c*d\nend", "t.hy").unwrap();
+    let Stmt::Parallel { trails, .. } = &program.body[0] else { panic!("parallel") };
+    assert_eq!(trails.len(), 2);
+}
+
+#[test]
+fn continuation_is_per_parallel_column_and_preserves_positions() {
+    let program = parse("parallel\nfoo || 32\n.bar || -a\n\n:baz || -b\nend", "t.hy").unwrap();
+    let Stmt::Parallel { trails, .. } = &program.body[0] else { panic!("parallel") };
+    for trail in trails { assert_eq!(trail.body.len(), 2); }
+    let Stmt::Expr { expr, .. } = &trails[0].body[0] else { panic!("expression") };
+    assert_eq!(sexpr(expr), "(key foo :bar)");
+    assert_eq!(expr.pos().line, 3);
+    let Stmt::Expr { expr, .. } = &trails[1].body[0] else { panic!("expression") };
+    assert_eq!(sexpr(expr), "(- 32 a)");
+    let program = parse("parallel\nfoo || 1\n || 2\n:bar || 3\nend", "t.hy").unwrap();
+    let Stmt::Parallel { trails, .. } = &program.body[0] else { panic!("parallel") };
+    assert_eq!(trails[0].body.len(), 2);
+}
+
+#[test]
+fn comments_are_transparent_but_blank_lines_are_not() {
+    assert_eq!(first_expr("foo // receiver\n// explanation\n.bar"), "(key foo :bar)");
+    assert_eq!(first_expr("a +\n// operand\nb"), "(+ a b)");
+    assert_eq!(first_expr("foo\n.\nbar"), "(key foo :bar)");
+    assert_eq!(first_expr("foo.\nbar"), "(key foo :bar)");
+    assert_eq!(parse("foo\n// explanation\n \n:bar", "t.hy").unwrap().body.len(), 2);
+    let program = parse("parallel\nfoo || 32\n// explanation\n.bar || -a\nend", "t.hy").unwrap();
+    let Stmt::Parallel { trails, .. } = &program.body[0] else { panic!("parallel") };
+    for trail in trails { assert_eq!(trail.body.len(), 1); }
+}
+
+#[test]
+fn every_binary_operator_and_assignment_continues() {
+    for op in ["or", "and", "==", "!=", "===", "!==", "<", ">", "<=", ">=", "|", "^", "&", "<<", ">>", ">>>", "+", "-", "*", "/", "%"] {
+        for source in [format!("a\n{op} b"), format!("a {op}\nb")] {
+            assert_eq!(first_expr(&source), format!("({op} a b)"), "{source:?}");
+        }
+    }
+    for op in std::iter::once("=").chain(hydra::lexer::COMPOUND_ASSIGN.iter().map(|(op, _)| *op)) {
+        for source in [format!("a\n{op} b"), format!("a {op}\nb")] {
+            let program = parse(&source, "t.hy").unwrap();
+            assert_eq!(program.body.len(), 1);
+            assert!(matches!(&program.body[0], Stmt::Assign { .. }), "{source:?}");
+        }
+    }
+}
+
+#[test]
+fn colon_atoms_need_no_blank_line_and_dots_require_receivers() {
+    assert_eq!(parse("foo\n:bar\n:baz\n", "t.hy").unwrap().body.len(), 3);
+    assert_eq!(parse("if :true\n:break\nend\n", "t.hy").unwrap().body.len(), 1);
+    for source in [".atom", "foo\n\n.bar", "32\n\n+2"] {
+        assert!(parse(source, "t.hy").is_err(), "{source}");
+    }
+    assert!(parse("{\n:key\n: :value\n}", "t.hy").is_ok());
 }

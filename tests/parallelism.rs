@@ -119,7 +119,7 @@ fn a_shared_dict_survives_concurrent_writes() {
     let src = "
 seen := {}
 parallel for n in [1, 2, 3, 4, 5, 6, 7, 8]
-\tseen[.\"\\(n)\"] = n
+\tseen[:\"\\(n)\"] = n
 end
 count := len(seen)
 ";
@@ -182,7 +182,7 @@ fn a_compound_assignment_is_atomic_inside_a_shared_structure() {
     // The same guarantee one level down: the lock the write takes is the one
     // the read is made under, wherever in the structure the place is.
     let src = "
-totals := { .hits : 0, .rows : [0] }
+totals := { :hits : 0, :rows : [0] }
 parallel for worker in [1, 2, 3, 4, 5, 6, 7, 8]
 \ti := 0
 \twhile i < 200
@@ -207,8 +207,8 @@ fn value_semantics_hold_across_workers() {
     // Each trail works on its own copy (§5.1), so none of them can see another
     // one's writes however they interleave.
     let src = "
-template := { .n : 0 }
-mine := .null
+template := { :n : 0 }
+mine := :null
 parallel
 \ta := template || b := template || c := template
 \ta.n = 1       || b.n = 2       || c.n = 3
@@ -228,7 +228,7 @@ untouched := template.n
 fn a_race_still_cancels_its_losers() {
     let src = format!(
         "{BUSY}
-winner := .null
+winner := :null
 race
 \tr := burn(10)   || s := burn(20000)
 \twinner = \"fast\" || winner = \"slow\"
@@ -241,7 +241,7 @@ end
         // Either trail may win the race, but the block is decided by one of
         // them and the program moves on (§9.4).
         let winner = read(&result, "winner");
-        assert!(winner == "fast" || winner == "slow" || winner == ".null", "{winner}");
+        assert!(winner == "fast" || winner == "slow" || winner == ":null", "{winner}");
     }
 }
 

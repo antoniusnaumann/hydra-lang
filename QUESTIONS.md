@@ -77,9 +77,9 @@ Interpolation is therefore where the text form of a value is defined:
 |---|---|
 | number | shortest round-tripping form; `3.0` prints as `3`, `NaN`/`Infinity`/`-Infinity` spelled out |
 | string | itself, uninterpreted |
-| symbol | `.name`, and `-` is part of a name (`.x-req-id`); quoted (`."not a name"`) when it is not one |
+| symbol | `:name`, and `-` is part of a name (`:x-req-id`); quoted (`:"not a name"`) when it is not one |
 | list | `[1, 2]` |
-| dict | `{ .a : 1 }` |
+| dict | `{ :a : 1 }` |
 | closure | `fn(a, b)` |
 
 **Cost if changed:** `to_text` in `src/value.rs`.
@@ -92,7 +92,7 @@ debugging while there is no standard library.
 
 ## 3a. Building a symbol from a string — **RESOLVED** (§2)
 
-`."\(prefix)-id"` is the spelling, and it works again now that interpolation is
+`:"\(prefix)-id"` is the spelling, and it works again now that interpolation is
 back: the symbol is built and interned at run time. No `sym(str)` is needed.
 
 Symbols minted this way are exactly why §2 requires the intern table to be
@@ -208,25 +208,19 @@ handoff.
 - ~~§9.1 trail count for `parallel for` over a large list.~~ **Decided:** one
   trail per element, unbounded. The thread pool is the bound that matters, and
   it bounds how many run at once rather than how many exist.
-- §9.5/§15.5 whether `break` inside `parallel for` ends that iteration's trail.
-  **Chosen:** yes, it ends that iteration's trail only, consistent with `break`
-  in a plain trail. `check` does not reject it.
+- **Decided by the owner:** `:continue` ends a parallel iteration; `:break`
+  stops the whole parallel loop, cancelling siblings and further spawning.
 - §5.1/§15.2a whether `===` gains a real identity stamp. **Chosen:** COW storage,
   as §5.1 says, including the documented consequence that an untouched copy
   reports identical.
 
 ---
 
-## 13. A label on a `parallel` / `race` block (spec §9.6)
+## 13. Block labels and loop control (spec §9.6)
 
-"A loop or block may be labelled with `as name`, and `break name` /
-`continue name` target it." What `break name` means when `name` labels a
-*block* rather than a loop is not stated, and a trail cannot cancel its
-siblings — "cancelling siblings is `race`'s job alone".
-
-**Chosen:** `break <block label>` from inside a trail ends **that trail**,
-exactly like `break trail`. `continue <block label>` is rejected: there is no
-next iteration of a block.
+**Decided by the owner:** no labeled breaks. The old `break` and `continue`
+statements are replaced by atoms and ordinary `break()` / `continue()` builtins.
+Block labels remain useful for channel selection.
 
 ---
 
@@ -256,15 +250,12 @@ write into a temporary.
 
 ---
 
-## 16. `break trail` is lexical (spec §9.6)
+## 16. Control atoms are local to a function (spec §9.6)
 
-"`break trail` ends the innermost trail from any depth." Block depth and call
-depth are both "depth".
-
-**Chosen:** block depth. `break trail` is valid anywhere lexically inside a
-trail body, including inside loops and `if`s, but not inside a function the
-trail calls — a function does not know it is running in a trail, and making it
-know would need the dynamic trail stack that `alive()` deliberately replaces.
+**Decided by the owner:** an unconsumed `:break` or `:continue` reaches the
+nearest loop in the current function only. To cross a function boundary, a
+helper must explicitly return the atom and its caller must leave it unconsumed.
+Assignments and other consumers keep it as an ordinary value. No `break trail`.
 
 ---
 
@@ -351,7 +342,7 @@ with two differences, both deliberate:
 - **The read and the write are one step**, which is the part that is not sugar
   (below).
 
-Reading is still reading: `d.k += 1` on a dict with no `.k` **crashes**, where
+Reading is still reading: `d.k += 1` on a dict with no `:k` **crashes**, where
 `d.k = 1` would create the key (§5). It is the crash `d.k = d.k + 1` raises on
 its way to the write, and creating the key would mean inventing an identity
 element per operator.

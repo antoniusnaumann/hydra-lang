@@ -13,7 +13,7 @@ Nothing is left open — §7 records what was ruled and what it costs.
 ## 1. The two calls
 
 ```hydra
-fn send(value, to*, mode = .wait)   // -> .true / .false
+fn send(value, to*, mode = :wait)   // -> :true / :false
 fn receive(from*)                   // -> value, ch
 fn channel()                        // -> this trail's own index
 ```
@@ -27,10 +27,10 @@ no way to pass it positionally, and no way to mistake it for an index.
 **[D]** `receive` returns **two** values: what was sent, and which trail sent
 it. The second may be ignored — `msg := receive()` is the ordinary case.
 
-**[D] When no eligible trail can send any more, `receive` returns `.null`.**
-The channel comes back `.null` too, and *that* is the unambiguous signal: a
-trail may legitimately send `.null`, but it always arrives with a real index
-behind it. So `ch == .null` means closed and nothing else can.
+**[D] When no eligible trail can send any more, `receive` returns `:null`.**
+The channel comes back `:null` too, and *that* is the unambiguous signal: a
+trail may legitimately send `:null`, but it always arrives with a real index
+behind it. So `ch == :null` means closed and nothing else can.
 
 ---
 
@@ -70,8 +70,8 @@ trail never names itself: `send(v, 1)` from trail 1 is a crash, and a bare
 parallel
 	for job in JOBS || while alive()
 	send(job)       || work, ch := receive()
-	end             || if ch == .null
-	                || break
+	end             || if ch == :null
+	                || break()
 	                || end
 	                || run(work)
 	                || end
@@ -80,7 +80,7 @@ end
 
 One producer, one worker, no queue and no pool object: `send(job)` with no index
 goes to whichever trail asks first. The worker leaves its loop when the channel
-comes back `.null`, which is the only thing a producer cannot fake.
+comes back `:null`, which is the only thing a producer cannot fake.
 
 The producer can tell too, because `send` says so:
 
@@ -92,7 +92,7 @@ parallel
 end
 ```
 
-`send` returns `.false` once every trail that could have received has ended.
+`send` returns `:false` once every trail that could have received has ended.
 
 ---
 
@@ -100,25 +100,25 @@ end
 
 ```hydra
 parallel
-	send(cfg, mode = .broadcast) || apply(receive()) || apply(receive())
+	send(cfg, mode = :broadcast) || apply(receive()) || apply(receive())
 end
 
 parallel
-	send(metric, mode = .detach) || later := receive()
+	send(metric, mode = :detach) || later := receive()
 	go_on()                      || print(later)
 end
 ```
 
-**[D]** `.wait` (the default) blocks until someone receives, and returns `.true`
-when they did or `.false` when nobody is left to.
-**[D]** `.detach` buffers and returns immediately.
-**[D]** `.broadcast` buffers one copy for every eligible trail — all of them, or
-just the ones named. `.detach` and `.broadcast` return `.false` only when every
+**[D]** `:wait` (the default) blocks until someone receives, and returns `:true`
+when they did or `:false` when nobody is left to.
+**[D]** `:detach` buffers and returns immediately.
+**[D]** `:broadcast` buffers one copy for every eligible trail — all of them, or
+just the ones named. `:detach` and `:broadcast` return `:false` only when every
 eligible trail has already ended.
 **[D]** Buffers are FIFO per (sender, receiver) and unbounded, and a broadcast
-is buffered only for trails that have been spawned. A `.detach` producer can
+is buffered only for trails that have been spawned. A `:detach` producer can
 therefore outrun its consumers without limit; the alternative is a bound, and a
-bound turns `.detach` back into something that blocks.
+bound turns `:detach` back into something that blocks.
 
 ---
 
@@ -196,7 +196,7 @@ changes what the first one means.
 **[D]** A multi-value is **not a value**: it exists only between a call and a
 binding site. It cannot go into a list, a dict, or an argument.
 
-This is what makes §1's `.null` rule work: the value and the channel are
+This is what makes §1's `:null` rule work: the value and the channel are
 separate answers, so "closed" is knowable without stealing a value from the
 program.
 
@@ -228,13 +228,13 @@ This is a deliberate contrast with `alive()`, which is dynamic at any call depth
 
 ```hydra
 race
-	send(.ready) || v := receive()
+	send(:ready) || v := receive()
 	             || print(v)
 end
 ```
 
 Trail 0 finishes, the race is decided, trail 1 is cancelled — while parked in
-`receive`. It returns `.null`, `.null`, and the trail runs no further statement.
+`receive`. It returns `:null`, `:null`, and the trail runs no further statement.
 
 Conceptually `receive` checks `alive()` while it waits; it is a builtin, so it
 does not really, but that is the rule. This is the one place §9.5's "a cancelled

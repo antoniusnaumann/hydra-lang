@@ -137,7 +137,7 @@ impl Signature {
 }
 
 /// The most values a call to this function can answer with. Falling off the
-/// end answers with one — `.null` — so it is never fewer than that, and §11's
+/// end answers with one — `:null` — so it is never fewer than that, and §11's
 /// rule means only a name that is *guaranteed* to have nothing behind it is
 /// reported (channels §6.2).
 fn returns_of(def: &ClosureDef) -> usize {
@@ -184,12 +184,12 @@ struct CheckScope {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LabelKind {
     Loop,
-    /// A trail body. `break` with no label ends it (§9.6).
+    /// A plain trail bounds the loops visible to control atoms.
     Trail,
+    ParallelLoop,
 }
 
 struct Label {
-    name: Option<String>,
     kind: LabelKind,
 }
 
@@ -409,7 +409,7 @@ impl<'a> Checker<'a> {
     }
 
     /// Where a statement hands its function's call back — `reject(…)`, a bare
-    /// `.reject`, or a `return` of one — or can, by calling a function of this
+    /// `:reject`, or a `return` of one — or can, by calling a function of this
     /// file that does (§3, §8.1). `true` for the first kind.
     fn rejects_here(&self, stmt: &Stmt) -> Option<(bool, Pos)> {
         let (expr, pos) = match stmt {
@@ -423,10 +423,11 @@ impl<'a> Checker<'a> {
         self.rejecting.yields(expr, false).then_some((false, pos))
     }
 
-    /// `reject(…)` — the builtin, not a shadow of it — or a literal `.reject`.
+    /// `reject(…)` — the builtin, not a shadow of it — or a literal `:reject`.
     fn explicit_reject(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Sym(symbol) => is_reject_symbol(symbol),
+            Expr::List { items, .. } => matches!(items.as_slice(), [Expr::Sym(tag), _] if is_reject_symbol(tag)),
             Expr::Call { callee, .. } => {
                 matches!(called_name(callee), Some((None, name)) if name == Native::Reject.name())
                     && self.lookup(Native::Reject.name()).is_none()
@@ -766,13 +767,14 @@ impl<'a> Checker<'a> {
                     );
                 }
                 self.unconsumed_reject(expr, *pos);
+                self.unconsumed_control(expr, *pos);
                 self.expr(expr);
             }
             Stmt::Return { values, pos } => {
                 if self.trail_depth > 0 {
                     self.error(
                         "`return` inside a trail is not allowed; \
-                         `break` ends the trail, and a value has nowhere to return to",
+                         a value has nowhere to return to",
                         *pos,
                         "return-in-trail",
                     );
@@ -803,15 +805,15 @@ impl<'a> Checker<'a> {
                     self.scoped(&branch.body);
                 }
             }
-            Stmt::While { cond, body, label, .. } => {
+            Stmt::While { cond, body, .. } => {
                 self.expr(cond);
-                self.labels.push(Label { name: label.clone(), kind: LabelKind::Loop });
+                self.labels.push(Label { kind: LabelKind::Loop });
                 self.scoped(body);
                 self.labels.pop();
             }
-            Stmt::For { var, iterable, body, label, pos, .. } => {
+            Stmt::For { var, iterable, body, pos, .. } => {
                 self.expr(iterable);
-                self.labels.push(Label { name: label.clone(), kind: LabelKind::Loop });
+                self.labels.push(Label { kind: LabelKind::Loop });
                 self.push_scope();
                 self.declare(var, Binding { pos: *pos, ..Binding::default() });
                 self.hoist(body);
@@ -819,14 +821,12 @@ impl<'a> Checker<'a> {
                 self.pop_scope();
                 self.labels.pop();
             }
-            Stmt::Break { target, pos } => self.check_break(target, *pos),
-            Stmt::Continue { label, pos } => self.check_continue(label.as_deref(), *pos),
-            Stmt::Parallel { kind, trails, rows, label, pos, .. } => {
+            Stmt::Parallel { kind, trails, rows, pos, .. } => {
                 self.check_split_header(rows, *pos);
                 let mut declared: Vec<(String, Pos)> = Vec::new();
                 for trail in trails {
                     self.trail_shape = Some((trail.column, trails.len()));
-                    let scope = self.trail_body(*kind, &trail.body, label.clone());
+                    let scope = self.trail_body(*kind, &trail.body, false);
                     self.trail_shape = None;
                     for (name, binding) in scope.names {
                         declared.push((name, binding.pos));
@@ -834,11 +834,11 @@ impl<'a> Checker<'a> {
                 }
                 self.record_trail_locals(declared);
             }
-            Stmt::ParallelFor { kind, var, iterable, body, label, pos, .. } => {
+            Stmt::ParallelFor { kind, var, iterable, body, pos, .. } => {
                 self.expr(iterable);
                 self.push_scope();
                 self.declare(var, Binding { pos: *pos, ..Binding::default() });
-                self.labels.push(Label { name: label.clone(), kind: LabelKind::Trail });
+                self.labels.push(Label { kind: LabelKind::ParallelLoop });
                 self.trail_depth += 1;
                 if *kind == BlockKind::Race {
                     self.race_depth += 1;
@@ -859,9 +859,9 @@ impl<'a> Checker<'a> {
                     .collect();
                 self.record_trail_locals(declared);
             }
-            Stmt::ParallelWhile { kind, cond, body, label, .. } => {
+            Stmt::ParallelWhile { kind, cond, body, .. } => {
                 self.expr(cond);
-                let scope = self.trail_body(*kind, body, label.clone());
+                let scope = self.trail_body(*kind, body, true);
                 let declared: Vec<(String, Pos)> =
                     scope.names.into_iter().map(|(name, b)| (name, b.pos)).collect();
                 self.record_trail_locals(declared);
@@ -869,8 +869,8 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn trail_body(&mut self, kind: BlockKind, body: &[Stmt], label: Option<String>) -> CheckScope {
-        self.labels.push(Label { name: label, kind: LabelKind::Trail });
+    fn trail_body(&mut self, kind: BlockKind, body: &[Stmt], parallel_loop: bool) -> CheckScope {
+        self.labels.push(Label { kind: if parallel_loop { LabelKind::ParallelLoop } else { LabelKind::Trail } });
         self.trail_depth += 1;
         if kind == BlockKind::Race {
             self.race_depth += 1;
@@ -911,61 +911,6 @@ impl<'a> Checker<'a> {
                     pos,
                     "split-compound-keyword",
                 );
-            }
-        }
-    }
-
-    fn check_break(&mut self, target: &BreakTarget, pos: Pos) {
-        match target {
-            BreakTarget::Trail => {
-                if !self.labels.iter().any(|l| l.kind == LabelKind::Trail) {
-                    self.error(
-                        "`break trail` is only meaningful inside a trail",
-                        pos,
-                        "break-outside-trail",
-                    );
-                }
-            }
-            BreakTarget::Innermost => {
-                let has_loop = self.labels.iter().any(|l| l.kind == LabelKind::Loop);
-                let in_trail = self.labels.iter().any(|l| l.kind == LabelKind::Trail);
-                if !has_loop && !in_trail {
-                    self.error("`break` outside any loop", pos, "break-outside-loop");
-                }
-            }
-            BreakTarget::Label(name) => {
-                if !self.labels.iter().any(|l| l.name.as_deref() == Some(name.as_str())) {
-                    self.error(
-                        format!("no loop or block labelled `{name}` is in scope"),
-                        pos,
-                        "unknown-label",
-                    );
-                }
-            }
-        }
-    }
-
-    fn check_continue(&mut self, label: Option<&str>, pos: Pos) {
-        match label {
-            None => {
-                if !self.labels.iter().any(|l| l.kind == LabelKind::Loop) {
-                    self.error("`continue` outside any loop", pos, "continue-outside-loop");
-                }
-            }
-            Some(name) => {
-                match self.labels.iter().find(|l| l.name.as_deref() == Some(name)) {
-                    Some(label) if label.kind == LabelKind::Loop => {}
-                    Some(_) => self.error(
-                        format!("`{name}` labels a block, not a loop, so it has no next iteration"),
-                        pos,
-                        "continue-block-label",
-                    ),
-                    None => self.error(
-                        format!("no loop labelled `{name}` is in scope"),
-                        pos,
-                        "unknown-label",
-                    ),
-                }
             }
         }
     }
@@ -1262,7 +1207,27 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// A statement that surely hands back a `.reject` nothing consumes, where
+    fn unconsumed_control(&mut self, expr: &Expr, pos: Pos) {
+        let name = match expr {
+            Expr::Sym(s) if s.is_static() => Some(s.name.as_str()),
+            Expr::Call { callee, .. } => match called_name(callee) {
+                Some((None, name)) if self.names_are_knowable && self.lookup(name).is_none() => Some(name),
+                Some((Some(""), name)) => Some(name),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(name @ ("break" | "continue")) = name {
+            let has_loop = self.labels.iter().rev()
+                .take_while(|label| label.kind != LabelKind::Trail)
+                .any(|label| matches!(label.kind, LabelKind::Loop | LabelKind::ParallelLoop));
+            if !has_loop {
+                self.error(format!("unconsumed :{name} has no enclosing loop in this function; return it to the caller instead"), pos, "control-outside-loop");
+            }
+        }
+    }
+
+    /// A statement that surely hands back a `:reject` nothing consumes, where
     /// there is no call to hand it to: the top level of a file, or a trail,
     /// which cannot return from its function (§8.1, §9.6). Consumed —
     /// `x := reject()` — it is a value like any other, and says nothing.
@@ -1273,7 +1238,7 @@ impl<'a> Checker<'a> {
         if self.fn_depth == 0 {
             self.error(
                 "this rejects at the top level of a file, where there is no call to hand \
-                 back: a `.reject` nothing consumes belongs in a function",
+                 back: a `:reject` nothing consumes belongs in a function",
                 pos,
                 "reject-outside-function",
             );
@@ -1289,7 +1254,7 @@ impl<'a> Checker<'a> {
 
     fn closure(&mut self, def: &ClosureDef) {
         // A function body is not a trail body: `return` is fine in it, and
-        // `break trail` is not (QUESTIONS.md §16).
+        // loop handlers from the caller are not (QUESTIONS.md §16).
         self.fn_depth += 1;
         self.check_write_before_reject(def);
         let trail_depth = std::mem::take(&mut self.trail_depth);
@@ -1397,10 +1362,10 @@ impl<'a> Checker<'a> {
         let known = if keys.is_empty() {
             "it has no keys".to_string()
         } else {
-            format!("it has {}", keys.iter().map(|k| format!(".{k}")).collect::<Vec<_>>().join(", "))
+            format!("it has {}", keys.iter().map(|k| format!(":{k}")).collect::<Vec<_>>().join(", "))
         };
         self.error(
-            format!("this dict has no key `.{key}` — {known}, and reading a missing key crashes"),
+            format!("this dict has no key `:{key}` — {known}, and reading a missing key crashes"),
             pos,
             "missing-key",
         );
@@ -1700,14 +1665,14 @@ fn mentions_any(expr: &Expr, names: &HashSet<String>) -> bool {
 }
 
 /// Which of a file's functions can hand a call back (§3, §8.1): a `reject(…)`
-/// or a bare `.reject` as a statement, a `return` of one, or a statement or
+/// or a bare `:reject` as a statement, a `return` of one, or a statement or
 /// `return` that calls a function which can. Worked out to a fixpoint, since
 /// the helpers call each other.
 ///
 /// Two answers, because the two diagnostics need opposite mistakes. `known`
 /// counts only what the file can see, which is what a warning may rest on;
 /// `possible` also counts a call it cannot see into — an import, a parameter,
-/// a field — which is what an error must allow for (§11). A `.reject` that
+/// a field — which is what an error must allow for (§11). A `:reject` that
 /// travels through a variable is not followed by either.
 #[derive(Default)]
 struct Rejecting {
@@ -1780,18 +1745,19 @@ impl Rejecting {
         })
     }
 
-    /// Whether this expression's result can start with `.reject`. A variable
+    /// Whether this expression can yield :reject or [:reject, msg]. A variable
     /// is taken to hold an ordinary value; a call is asked about its callee.
     fn yields(&self, expr: &Expr, assume: bool) -> bool {
         match expr {
             Expr::Sym(symbol) => is_reject_symbol(symbol),
+            Expr::List { items, .. } => matches!(items.as_slice(), [Expr::Sym(tag), _] if is_reject_symbol(tag)),
             Expr::Call { callee, .. } => match called_name(callee) {
                 Some((None, name)) if self.functions.contains(name) => {
                     self.set(assume).contains(name)
                 }
                 Some((None, name)) if name == Native::Reject.name() => true,
                 Some((None, name)) if Native::lookup(name).is_some() => false,
-                // A builtin module's functions answer values, never `.reject`.
+                // A builtin module's functions answer values, never `:reject`.
                 Some((Some(module), _)) if BUILTIN_MODULES.contains(&module) => false,
                 _ => assume,
             },

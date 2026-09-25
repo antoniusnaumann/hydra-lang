@@ -45,9 +45,9 @@ fn assignment_to_a_name_with_no_binding() {
     assert_eq!(codes("x = 1\n"), vec!["assign-undeclared"]);
     assert_eq!(codes("x := 1\nx = 2\n"), Vec::<&str>::new());
     // The scope walk goes outward, so an outer binding is enough.
-    assert_eq!(codes("x := 1\nif .true\n\tx = 2\nend\n"), Vec::<&str>::new());
+    assert_eq!(codes("x := 1\nif :true\n\tx = 2\nend\n"), Vec::<&str>::new());
     // But an inner one does not escape.
-    assert_eq!(codes("if .true\n\ty := 1\nend\ny = 2\n"), vec!["assign-undeclared"]);
+    assert_eq!(codes("if :true\n\ty := 1\nend\ny = 2\n"), vec!["assign-undeclared"]);
     // A compound assignment is an assignment and needs the same binding.
     assert_eq!(codes("x += 1\n"), vec!["assign-undeclared"]);
     assert_eq!(codes("x := 1\nx += 2\n"), Vec::<&str>::new());
@@ -85,7 +85,7 @@ eu = 2
 
     // Declared above the block and assigned inside it is the correct shape.
     let src = "
-eu := .null
+eu := :null
 parallel
 \teu = 1 ||
 end
@@ -117,42 +117,35 @@ end
 }
 
 #[test]
-fn break_and_continue_labels() {
-    assert_eq!(codes("for a in [1] as scan\n\tbreak scan\nend\n"), Vec::<&str>::new());
-    assert_eq!(codes("for a in [1]\n\tbreak nope\nend\n"), vec!["unknown-label"]);
-    assert_eq!(codes("for a in [1]\n\tcontinue nope\nend\n"), vec!["unknown-label"]);
-    assert_eq!(codes("break\n"), vec!["break-outside-loop"]);
-    assert_eq!(codes("continue\n"), vec!["continue-outside-loop"]);
-    assert_eq!(codes("break trail\n"), vec!["break-outside-trail"]);
-
-    // `break` with no label inside a trail ends the trail, which is allowed.
-    assert_eq!(codes("parallel\n\tbreak || x := 1\nend\n"), Vec::<&str>::new());
-    assert_eq!(codes("parallel\n\tbreak trail || x := 1\nend\n"), Vec::<&str>::new());
-    // A block label is not a loop, so it cannot be continued.
-    assert_eq!(
-        codes("parallel as job\n\tcontinue job || x := 1\nend\n"),
-        vec!["continue-block-label"]
-    );
+fn control_values_need_a_loop_in_the_current_function() {
+    for atom in [":break", ":continue", "break()", "continue()"] {
+        assert_eq!(codes(&format!("{atom}\n")), vec!["control-outside-loop"]);
+        assert_eq!(codes(&format!("for a in [1]\n{atom}\nend\n")), Vec::<&str>::new());
+        assert_eq!(codes(&format!("parallel for a in [1]\n{atom}\nend\n")), Vec::<&str>::new());
+        assert_eq!(codes(&format!("while :true\nfn helper()\n{atom}\nend\nend\n")), vec!["control-outside-loop"]);
+    }
+    assert_eq!(codes("fn helper()\nreturn :break\nend\nx := helper()\n"), Vec::<&str>::new());
+    assert_eq!(codes("parallel\n:break || x := 1\nend\n"), vec!["control-outside-loop"]);
 }
 
 #[test]
 fn key_read_on_a_dict_literal_that_provably_lacks_the_key() {
-    assert_eq!(codes("d := { .a : 1 }\nx := d.b\n"), vec!["missing-key"]);
-    assert_eq!(codes("x := { .a : 1 }.b\n"), vec!["missing-key"]);
-    assert_eq!(codes("d := { .a : 1 }\nx := d[.b]\n"), vec!["missing-key"]);
-    assert_eq!(codes("d := { .a : 1 }\nx := d.a\n"), Vec::<&str>::new());
+    assert_eq!(codes("d := { :a : 1 }\nx := d.b\n"), vec!["missing-key"]);
+    assert_eq!(codes("x := { :a : 1 }.b\n"), vec!["missing-key"]);
+    assert_eq!(codes("d := { :a : 1 }\nx := d[:b]\n"), vec!["missing-key"]);
+    assert_eq!(codes("d := { :a : 1 }\nx := d.a\n"), Vec::<&str>::new());
 
     // Writing creates, so a later read is fine — and any write to the name at
     // all makes the key set unknowable, which is the safe direction.
-    assert_eq!(codes("d := { .a : 1 }\nd.b = 2\nx := d.b\n"), Vec::<&str>::new());
-    assert_eq!(codes("d := { .a : 1 }\nd = { .b : 2 }\nx := d.b\n"), Vec::<&str>::new());
+    assert_eq!(codes("d := { :a : 1 }\nd.b = 2\nx := d.b\n"), Vec::<&str>::new());
+    assert_eq!(codes("d := { :a : 1 }\nd = { :b : 2 }\nx := d.b\n"), Vec::<&str>::new());
     // A `&` can hand the dict to something that adds keys.
     assert_eq!(
-        codes("fn f(v)\nend\nd := { .a : 1 }\nf(&d)\nx := d.b\n"),
+        codes("fn f(v)\nend\nd := { :a : 1 }\nf(&d)\nx := d.b\n"),
         Vec::<&str>::new()
     );
     // A computed key says nothing.
-    assert_eq!(codes("d := { .a : 1 }\nk := .b\nx := d[k]\n"), Vec::<&str>::new());
+    assert_eq!(codes("d := { :a : 1 }\nk := :b\nx := d[k]\n"), Vec::<&str>::new());
 }
 
 #[test]
@@ -160,16 +153,16 @@ fn passing_a_dict_by_value_cannot_change_it() {
     // Value semantics are what make the key analysis sound: `f(d)` gets a copy
     // (§5.1), so the literal's key set still holds afterwards.
     assert_eq!(
-        codes("fn f(v)\nend\nd := { .a : 1 }\nf(d)\nx := d.b\n"),
+        codes("fn f(v)\nend\nd := { :a : 1 }\nf(d)\nx := d.b\n"),
         vec!["missing-key"]
     );
 }
 
 #[test]
 fn duplicate_key_in_one_dict_literal() {
-    assert_eq!(codes("d := { .a : 1, .a : 2 }\n"), vec!["duplicate-key"]);
-    assert_eq!(codes("d := { .a : 1, .\"a\" : 2 }\n"), vec!["duplicate-key"]);
-    assert_eq!(codes("d := { .a : 1, .b : 2 }\n"), Vec::<&str>::new());
+    assert_eq!(codes("d := { :a : 1, :a : 2 }\n"), vec!["duplicate-key"]);
+    assert_eq!(codes("d := { :a : 1, :\"a\" : 2 }\n"), vec!["duplicate-key"]);
+    assert_eq!(codes("d := { :a : 1, :b : 2 }\n"), Vec::<&str>::new());
 }
 
 #[test]
@@ -303,7 +296,7 @@ fn an_unused_private() {
 #[test]
 fn a_reference_crossing_into_a_trail() {
     // The only way to share mutable data between trails (§9.2).
-    let src = "a := { .x : 1 }\nparallel\n\tf(&a) || g()\nend\n";
+    let src = "a := { :x : 1 }\nparallel\n\tf(&a) || g()\nend\n";
     assert!(warnings(src).contains(&"ref-into-trail"), "{:?}", warnings(src));
 }
 
@@ -343,9 +336,9 @@ fn a_by_reference_parameter_passed_by_value() {
     assert_eq!(codes("rows := []\npush(&rows, 1)\n"), Vec::<&str>::new());
 
     // The same rule for a user function that declares one.
-    let src = "fn bump(&box)\n\tbox.n = 1\nend\nd := { .n : 0 }\nbump(d)\n";
+    let src = "fn bump(&box)\n\tbox.n = 1\nend\nd := { :n : 0 }\nbump(d)\n";
     assert_eq!(codes(src), vec!["missing-reference"]);
-    let src = "fn bump(&box)\n\tbox.n = 1\nend\nd := { .n : 0 }\nbump(&d)\n";
+    let src = "fn bump(&box)\n\tbox.n = 1\nend\nd := { :n : 0 }\nbump(&d)\n";
     assert_eq!(codes(src), Vec::<&str>::new());
 }
 
@@ -357,7 +350,7 @@ fn builtins_are_known_names_with_known_signatures() {
     assert_eq!(codes("print()\n"), vec!["no-matching-call"]);
     assert_eq!(codes("print(\"a\", \"b\", \"c\")\n"), vec!["no-matching-call"]);
     assert_eq!(codes("x := len([1], 2)\n"), vec!["no-matching-call"]);
-    assert_eq!(codes("x := get(d, .k)\n"), vec!["no-matching-call", "undeclared-name"]);
+    assert_eq!(codes("x := get(d, :k)\n"), vec!["no-matching-call", "undeclared-name"]);
 }
 
 #[test]
@@ -432,8 +425,8 @@ fn naming_more_values_than_a_call_answers_with() {
 fn a_missing_field_is_not_a_missing_key_when_it_is_a_call() {
     // `x.f(…)` is a field call *or* a free function with `x` as its first
     // argument, so only a bare read demands the key exists.
-    assert_eq!(codes("d := { .a : 1 }\nx := d.len()\n"), Vec::<&str>::new());
-    assert_eq!(codes("d := { .a : 1 }\nx := d.len\n"), vec!["missing-key"]);
+    assert_eq!(codes("d := { :a : 1 }\nx := d.len()\n"), Vec::<&str>::new());
+    assert_eq!(codes("d := { :a : 1 }\nx := d.len\n"), vec!["missing-key"]);
 }
 
 #[test]

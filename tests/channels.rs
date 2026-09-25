@@ -117,7 +117,7 @@ fn two()
 \treturn 1, 2
 end
 a := 0
-d := { .k : 0 }
+d := { :k : 0 }
 a, d.k = two()
 key := d.k
 ";
@@ -136,8 +136,8 @@ fn naming_more_values_than_arrive_is_a_crash() {
 #[test]
 fn a_value_reaches_a_sibling_and_says_which_one_sent_it() {
     let src = "
-got := .null
-from := .null
+got := :null
+from := :null
 parallel
 \tsend(\"ready\") || got, from = receive()
 end
@@ -149,8 +149,8 @@ end
 #[test]
 fn an_index_addresses_one_sibling() {
     let src = "
-one := .null
-two := .null
+one := :null
+two := :null
 parallel
 \tsend(\"x\", 2) || one = receive(0) || two = receive(0)
 end
@@ -158,7 +158,7 @@ end
     // Trail 0 addressed trail 2, so trail 1 waits for a value that never comes
     // and hears the channel close instead (§1).
     assert_eq!(eval(src, "two"), "x");
-    assert_eq!(eval(src, "one"), ".null");
+    assert_eq!(eval(src, "one"), ":null");
 }
 
 #[test]
@@ -166,29 +166,29 @@ fn receive_answers_null_on_both_when_no_sender_is_left() {
     // The one answer a sender cannot fake: a real send always arrives with a
     // real index behind it (§1).
     let src = "
-value := .true
-channel := .true
+value := :true
+channel := :true
 parallel
-\tsend(.null) || value, channel = receive()
+\tsend(:null) || value, channel = receive()
 \t            || value, channel = receive()
 end
 ";
-    assert_eq!(eval(src, "value"), ".null");
-    assert_eq!(eval(src, "channel"), ".null");
+    assert_eq!(eval(src, "value"), ":null");
+    assert_eq!(eval(src, "channel"), ":null");
 }
 
 #[test]
 fn send_says_when_nobody_is_left_to_receive() {
     let src = "
-first := .null
-second := .null
+first := :null
+second := :null
 parallel
 \tfirst = send(1)   || taken := receive()
 \tsecond = send(2)  ||
 end
 ";
-    assert_eq!(eval(src, "first"), ".true");
-    assert_eq!(eval(src, "second"), ".false");
+    assert_eq!(eval(src, "first"), ":true");
+    assert_eq!(eval(src, "second"), ":false");
 }
 
 #[test]
@@ -199,8 +199,8 @@ ran := 0
 parallel
 \tfor job in [1, 2, 3] || while alive()
 \tsend(job)            || work, ch := receive()
-\tend                  || if ch == .null
-\t                     || break
+\tend                  || if ch == :null
+\t                     || break()
 \t                     || end
 \t                     || ran = ran + work
 \t                     || end
@@ -212,23 +212,23 @@ end
 #[test]
 fn detach_buffers_and_does_not_wait() {
     let src = "
-sent := .null
-later := .null
+sent := :null
+later := :null
 parallel
-\tsent = send(7, mode = .detach) || later = receive()
+\tsent = send(7, mode = :detach) || later = receive()
 end
 ";
-    assert_eq!(eval(src, "sent"), ".true");
+    assert_eq!(eval(src, "sent"), ":true");
     assert_eq!(eval(src, "later"), "7");
 }
 
 #[test]
 fn broadcast_reaches_every_eligible_trail() {
     let src = "
-a := .null
-b := .null
+a := :null
+b := :null
 parallel
-\tsend(9, mode = .broadcast) || a = receive() || b = receive()
+\tsend(9, mode = :broadcast) || a = receive() || b = receive()
 end
 ";
     assert_eq!(eval(src, "a"), "9");
@@ -238,8 +238,8 @@ end
 #[test]
 fn channel_answers_a_trails_own_index() {
     let src = "
-here := .null
-there := .null
+here := :null
+there := :null
 parallel
 \there = channel() || there = channel()
 end
@@ -273,17 +273,17 @@ fn a_cancelled_trail_is_woken_and_then_runs_nothing() {
     // The race is decided while the other trail is parked in `receive`. It
     // wakes with the closed answer, and its next statement never runs (§6.5).
     let src = "
-reached := .false
+reached := :false
 race
 \tx := 1 || v, ch := receive()
-\t       || reached = .true
+\t       || reached = :true
 end
 ";
     let result = run(src);
     assert!(result.crash.is_none(), "{:?}", result.crash);
     assert_eq!(
         to_text(&result.root_scope.lookup("reached").expect("binding").read().unwrap().clone()),
-        ".false"
+        ":false"
     );
 }
 

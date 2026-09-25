@@ -34,7 +34,7 @@ shadow rejects.
 
 ---
 
-## 2. `print(value, terminator = "\n")` → `.null`
+## 2. `print(value, terminator = "\n")` → `:null`
 
 **[D]** Writes the **text form** of `value` — the same rendering `\(value)`
 produces (§1) — followed by `end`, to standard output.
@@ -55,7 +55,7 @@ One *value* argument, not many: interpolation already composes, so
 `print("a \(b) c")` covers what a variadic `print` would, and Hydra has no
 variadic calls.
 
-**[D]** Returns `.null`, so it is a statement, not an expression to build with.
+**[D]** Returns `:null`, so it is a statement, not an expression to build with.
 
 **[P] Ordering under concurrency.** Output is written in the order trails
 actually run, which is the scheduler's order and not the order of the columns.
@@ -66,16 +66,16 @@ should flush. Both matter for a language whose crashes go to stderr.
 
 ---
 
-## 3. `has(container, key)` → `.true` / `.false`
+## 3. `has(container, key)` → `:true` / `:false`
 
 **[P]** For a **dict**, whether `key` — a symbol — is present.
 For a **list**, whether `key` — a number — is an index the list has, with the
-negative-index rule of §5 applied first, so `has(xs, -1)` is `.false` only on an
+negative-index rule of §5 applied first, so `has(xs, -1)` is `:false` only on an
 empty list.
 
 **[D]** Crashes if `container` is neither a dict nor a list, or if the key's kind
 does not match the container's. Asking about the wrong kind of thing is a bug,
-not a `.false`.
+not a `:false`.
 
 This is the function §15.1 says every program touching decoded data needs on its
 first line, because a missing-key *read* crashes and nothing can be caught.
@@ -88,11 +88,11 @@ first line, because a missing-key *read* crashes and nothing can be caught.
 key rules as `has`.
 
 **[D]** `fallback` is **required** — deliberately, even though defaults now
-exist. There is no obvious value to default it to (`.null` is a legitimate
+exist. There is no obvious value to default it to (`:null` is a legitimate
 thing to have stored), and requiring it makes the missing case visible at the
 call site.
 
-**[D]** The result copies, like every other read (§5.1). `get(d, .k, [])` hands
+**[D]** The result copies, like every other read (§5.1). `get(d, :k, [])` hands
 back a fresh empty list, not a shared one.
 
 **[P]** `get` does **not** create. `d.k = v` is how a key comes into existence
@@ -184,3 +184,51 @@ module supplies that one shadows the builtin for unqualified calls, `check`
 warns at the `use`, and `::push` reaches the builtin.
 
 The formatter is unaffected: they are ordinary calls.
+
+## Loop control: `break()` and `continue()`
+
+Both are ordinary zero-argument builtins. They return `:break` and `:continue`.
+When left unconsumed, the result reaches the nearest loop in the current
+function. Consumed results remain ordinary atoms. A helper must explicitly
+return a control atom for its caller to handle it. Use these calls as the
+idiomatic way to control loops; see the language specification §9.6.
+
+## Rejection: `reject(msg = :null)`
+
+Returns the single list `[:reject, msg]`. It only constructs the value;
+consuming it keeps it as data. Left unconsumed inside a function, it returns
+that rejection to overload resolution. Candidates are tried without printing
+any refusal. When none accepts and the rejection goes unhandled, the standard
+handler reports all refusal messages, including nested helper refusals, on
+stderr and fails the call. A successful fallback discards them silently.
+
+## Process control: `exit(code = 0)` and `panic(msg)`
+
+These ordinary, shadowable builtins only construct values:
+
+```hydra
+fn exit(code = 0)
+    return [:exit, code]
+end
+fn panic(msg)
+    return [:panic, msg]
+end
+```
+
+A binding, argument, collection, or explicit return consumes the list without
+invoking its handler. Any unconsumed **two-element** list of either shape
+invokes the standard handler, including a list returned by a helper.
+
+- `[:exit, code]` stops the program without a crash diagnostic and returns the
+  requested process status. The handler requires an integer from 0 through 255.
+- `[:panic, msg]` stops the program, renders the message on stderr with its
+  source location and call trace, and returns status 1.
+
+These handlers do not retry overloads. They stop sibling work, including
+in-flight calls, as part of program termination. An already cancelled trail
+cannot request a global exit; a panic there follows normal dead-trail crash
+isolation (`--strict` still makes dead-trail crashes fatal).
+
+The Rust embedding API returns `RunResult.exit_code` or `RunResult.crash`;
+it never exits or panics the host process. `exit()` defaults to status 0.
+Use `::exit` and `::panic` to reach these builtins past shadows.

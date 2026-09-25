@@ -4,7 +4,7 @@
     { "scope": "punctuation.trail.hydra", "settings": { "foreground": "#ff8a6580" } },
     { "scope": "keyword.control.hydra", "settings": { "foreground": "#c586c0" } },
     { "scope": "keyword.other.hydra", "settings": { "foreground": "#569cd6" } },
-    { "scope": "entity.symbol.hydra", "settings": { "foreground": "#4ec9b0" } },
+    { "scope": "punctuation.delimiter.hydra", "settings": { "foreground": "#d4d4d4" } },
     { "scope": "entity.namespace.hydra", "settings": { "foreground": "#4ec9b0" } },
     { "scope": "variable.hydra", "settings": { "foreground": "#9cdcfe" } },
     { "scope": "variable.property.hydra", "settings": { "foreground": "#9cdcfe" } },

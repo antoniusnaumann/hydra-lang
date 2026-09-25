@@ -37,7 +37,7 @@ cargo run -- run examples/trails.hy --dump-scope
 
 | File | What |
 |---|---|
-| `src/lexer.rs` | §1–§2: longest-match operators, compound keywords, symbol-versus-lookup |
+| `src/lexer.rs` | §1–§2: longest-match operators, compound keywords, colon atoms and dot lookups |
 | `src/parser.rs` | §3–§4: the precedence table, and the column-wise `parallel` transposer |
 | `src/value.rs` | §5: copy-on-write values, `&` references, the two equalities |
 | `src/scope.rs` | §6: scopes as hash maps with parent pointers |
@@ -172,8 +172,8 @@ call, and otherwise it is `f(x, …)` with the receiver as the first argument.
 
 ```hydra
 "hello".len()          // len("hello")
-config.get(.port, 80)  // get(config, .port, 80)
-obj.greet("eu")        // the field, when `.greet` holds a closure
+config.get(:port, 80)  // get(config, :port, 80)
+obj.greet("eu")        // the field, when `:greet` holds a closure
 ```
 
 Callable is the whole test, so adding a data field can never quietly capture a
@@ -193,11 +193,12 @@ because the dot is what passes it:
 So `rows.push(x)` is the same error as `push(rows, x)`, and `&rows.push(x)` is
 how it is written.
 
-**`.reject` hands the call back.** A signature says what a function can be
+**`:reject` hands the call back.** A signature says what a function can be
 given; only the body can say what it can be used for. A candidate that answers
-`.reject` returns the call to resolution, which carries on down the same list —
-so two functions may share a name *and* a shape. `reject()` is
-`return .reject`, and `reject("why")` is `return .reject, "why"`:
+`:reject` returns the call to resolution, which carries on down the same list —
+so two functions may share a name *and* a shape. `reject(msg)` returns one
+list, `[:reject, msg]`; an unconsumed list of this shape rejects the candidate.
+`reject()` uses `:null` for the message:
 
 ```hydra
 fn parse(text)
@@ -215,14 +216,14 @@ parse("abcdef")  // "the careful one" — the quick one handed it back
 ```
 
 **A result nothing consumes goes to where the statement stands.** In a
-function, an ordinary one is dropped and one starting with `.reject` returns
+function, an ordinary one is dropped and `:reject` or `[:reject, msg]` returns
 from the function unchanged — so a rejection passes through any number of
 helpers with nothing written to pass it on:
 
 ```hydra
 fn reject_if(cond)
 	if cond
-		return .reject, "invalid value"
+		return [:reject, "invalid value"]
 	end
 end
 
@@ -232,8 +233,9 @@ fn parse(text)
 end
 ```
 
-At the top level of a file an ordinary result is printed and a `.reject` is an
-unhandled rejection, which crashes listing every refusal of the call. Any
+At the top level of a file an ordinary result is printed and a `:reject` is an
+unhandled rejection, whose standard handler reports every refusal and fails.
+A successful fallback stays silent; nested helper refusals are retained. Any
 binding consumes a result — `_ = f()` says so explicitly — and consuming one
 value of a call consumes them all. A later function that accepts everything an
 earlier one accepts and has no way to reject makes it unreachable, which
@@ -262,16 +264,16 @@ use fs
 
 note, bytes := fs::write(fs::join(fs::temp(), "notes", "first.txt"), "one\n")
 text := fs::read(note)
-missing, why := fs::read("gone.txt", "(nothing)")   // .not_found
+missing, why := fs::read("gone.txt", "(nothing)")   // :not_found
 
-for entry in fs::list("src", match = "*.hy", recursive = .true)
+for entry in fs::list("src", match = "*:hy", recursive = :true)
 	print("\(entry.fs::name()) is \(entry.fs::size()) bytes")
 end
 ```
 
 Three rules and nothing else to remember: **defaults absorb the ordinary
 failures** (writing makes the parents it needs, making a directory that exists
-is fine, removing what is not there answers `.false`), **anything left crashes**,
+is fine, removing what is not there answers `:false`), **anything left crashes**,
 and **a reader opts out with a `fallback`** and then says why it had to.
 
 That last one is two overloads rather than a sentinel — `read(path)` crashes and
@@ -293,10 +295,10 @@ parallel
 end
 ```
 
-`send(value, to*, mode = .wait)` answers `.true` or `.false`; `.wait` parks
-until someone takes the value, `.detach` buffers, `.broadcast` buffers one copy
+`send(value, to*, mode = :wait)` answers `:true` or `:false`; `:wait` parks
+until someone takes the value, `:detach` buffers, `:broadcast` buffers one copy
 per eligible trail. `receive(from*)` answers with the value **and** the trail
-that sent it, and both come back `.null` when no eligible sender is left — the
+that sent it, and both come back `:null` when no eligible sender is left — the
 one answer a sender cannot fake, because a real send always arrives with a real
 index behind it. `channel()` is a trail's own index.
 

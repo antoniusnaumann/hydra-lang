@@ -84,16 +84,16 @@ fn strings_concatenate_with_plus_but_never_convert() {
     // rendered (QUESTIONS.md §3).
     assert!(crash_of("x := \"n = \" + 3\n").contains("interpolate"));
     assert!(crash_of("x := 3 + \" apples\"\n").contains("interpolate"));
-    assert!(crash_of("x := \"tag \" + .ok\n").contains("interpolate"));
+    assert!(crash_of("x := \"tag \" + :ok\n").contains("interpolate"));
 }
 
 #[test]
 fn interpolation_renders_any_expression() {
     assert_eq!(eval("name := \"world\"\nx := \"hi \\(name)\"\n", "x"), "hi world");
     assert_eq!(expr("\"\\(1 + 2) apples\""), "3 apples");
-    assert_eq!(expr("\"tag \\(.ok)\""), "tag .ok");
+    assert_eq!(expr("\"tag \\(:ok)\""), "tag :ok");
     assert_eq!(expr("\"\\([1, 2])\""), "[1, 2]");
-    assert_eq!(expr("\"\\({ .a : 1 })\""), "{ .a : 1 }");
+    assert_eq!(expr("\"\\({ :a : 1 })\""), "{ :a : 1 }");
     // Nested: an interpolation may contain a string with its own.
     assert_eq!(eval("n := 2\nx := \"a \\(\"b \\(n)\")\"\n", "x"), "a b 2");
     // §14's line, now that it works again.
@@ -105,15 +105,15 @@ fn a_symbol_can_be_built_by_interpolation() {
     // §2: dynamic symbol construction without a separate `sym(str)` builtin.
     let src = "
 prefix := \"x\"
-key := .\"\\(prefix)-id\"
-d := { .\"\\(prefix)-id\" : 7 }
+key := :\"\\(prefix)-id\"
+d := { :\"\\(prefix)-id\" : 7 }
 seen := d[key]
-same := key === .\"x-id\"
+same := key === :\"x-id\"
 ";
     assert_eq!(eval(src, "seen"), "7");
-    assert_eq!(eval(src, "same"), ".true");
+    assert_eq!(eval(src, "same"), ":true");
     // A name may contain `-`, so the built symbol renders bare (§2).
-    assert_eq!(eval(src, "key"), ".x-id");
+    assert_eq!(eval(src, "key"), ":x-id");
 }
 
 #[test]
@@ -123,10 +123,10 @@ fn truthiness_is_only_about_null_and_false() {
         ("0", "yes"),
         ("\"\"", "yes"),
         ("[]", "yes"),
-        (".true", "yes"),
-        (".whatever", "yes"),
-        (".null", "no"),
-        (".false", "no"),
+        (":true", "yes"),
+        (":whatever", "yes"),
+        (":null", "no"),
+        (":false", "no"),
     ] {
         let program = format!("x := \"no\"\nif {src}\n\tx = \"yes\"\nend\n");
         assert_eq!(eval(&program, "x"), expected, "for {src}");
@@ -135,17 +135,17 @@ fn truthiness_is_only_about_null_and_false() {
 
 #[test]
 fn dicts_are_symbol_keyed_and_dot_is_sugar() {
-    assert_eq!(expr("{ .a : 5 }.a"), "5");
-    assert_eq!(expr("{ .a : 5 }[.a]"), "5");
-    assert_eq!(expr("{ .\"x-req-id\" : 17 }.\"x-req-id\""), "17");
-    assert_eq!(eval("k := .a\nd := { .a : 5 }\nx := d[k]\n", "x"), "5");
+    assert_eq!(expr("{ :a : 5 }.a"), "5");
+    assert_eq!(expr("{ :a : 5 }[:a]"), "5");
+    assert_eq!(expr("{ :\"x-req-id\" : 17 }.\"x-req-id\""), "17");
+    assert_eq!(eval("k := :a\nd := { :a : 5 }\nx := d[k]\n", "x"), "5");
 }
 
 #[test]
 fn reading_a_missing_key_crashes_but_writing_creates() {
-    assert!(crash_of("d := { .a : 1 }\nx := d.b\n").contains("no key .b"));
-    assert_eq!(eval("d := { .a : 1 }\nd.b = 2\nx := d.b\n", "x"), "2");
-    assert_eq!(eval("d := {}\nd.k = 1\nx := d\n", "x"), "{ .k : 1 }");
+    assert!(crash_of("d := { :a : 1 }\nx := d.b\n").contains("no key .b"));
+    assert_eq!(eval("d := { :a : 1 }\nd.b = 2\nx := d.b\n", "x"), "2");
+    assert_eq!(eval("d := {}\nd.k = 1\nx := d\n", "x"), "{ :k : 1 }");
 }
 
 #[test]
@@ -166,7 +166,7 @@ fn list_indexing() {
 
 #[test]
 fn assignment_copies() {
-    let src = "a := { .x : 1 }\nb := a\nb.x = 2\nsame := a.x\n";
+    let src = "a := { :x : 1 }\nb := a\nb.x = 2\nsame := a.x\n";
     assert_eq!(eval(src, "same"), "1");
     let src = "a := [1, 2]\nb := a\nb[0] = 9\nsame := a[0]\n";
     assert_eq!(eval(src, "same"), "1");
@@ -178,7 +178,7 @@ fn a_callee_cannot_touch_the_callers_value() {
 fn f(d)
 \td.x = 99
 end
-a := { .x : 1 }
+a := { :x : 1 }
 f(a)
 kept := a.x
 ";
@@ -187,7 +187,7 @@ kept := a.x
 
 #[test]
 fn insertion_copies() {
-    let src = "a := { .x : 1 }\nd := { .held : a }\na.x = 2\nheld := d.held.x\n";
+    let src = "a := { :x : 1 }\nd := { :held : a }\na.x = 2\nheld := d.held.x\n";
     assert_eq!(eval(src, "held"), "1");
 }
 
@@ -195,7 +195,7 @@ fn insertion_copies() {
 fn identity_is_the_cow_buffer() {
     // §5.1, exactly the example in the spec.
     let src = "
-a := { .x : 0 }
+a := { :x : 0 }
 b := a
 before := b === a
 b.x = 1
@@ -203,48 +203,48 @@ after := b === a
 c := &a
 aliased := c === a
 ";
-    assert_eq!(eval(src, "before"), ".true");
-    assert_eq!(eval(src, "after"), ".false");
-    assert_eq!(eval(src, "aliased"), ".true");
+    assert_eq!(eval(src, "before"), ":true");
+    assert_eq!(eval(src, "after"), ":false");
+    assert_eq!(eval(src, "aliased"), ":true");
 }
 
 #[test]
 fn identity_on_values_without_identity_is_value_equality() {
-    assert_eq!(expr("\"a\" === \"a\""), ".true");
-    assert_eq!(expr("1 === 1"), ".true");
-    assert_eq!(expr(".ok === .ok"), ".true");
-    assert_eq!(expr("(0 / 0) === (0 / 0)"), ".false"); // NaN is never equal
-    assert_eq!(expr("(0 / 0) == (0 / 0)"), ".false");
-    assert_eq!(expr("[1] === [1]"), ".false");
-    assert_eq!(expr("[1] == [1]"), ".true");
+    assert_eq!(expr("\"a\" === \"a\""), ":true");
+    assert_eq!(expr("1 === 1"), ":true");
+    assert_eq!(expr(":ok === :ok"), ":true");
+    assert_eq!(expr("(0 / 0) === (0 / 0)"), ":false"); // NaN is never equal
+    assert_eq!(expr("(0 / 0) == (0 / 0)"), ":false");
+    assert_eq!(expr("[1] === [1]"), ":false");
+    assert_eq!(expr("[1] == [1]"), ":true");
 }
 
 #[test]
 fn deep_equality_walks_structures() {
-    assert_eq!(expr("{ .a : [1, 2] } == { .a : [1, 2] }"), ".true");
-    assert_eq!(expr("{ .a : [1, 2] } == { .a : [1, 3] }"), ".false");
-    assert_eq!(expr("{ .a : 1, .b : 2 } == { .b : 2, .a : 1 }"), ".true");
-    assert_eq!(expr("[1, 2] != [1, 2, 3]"), ".true");
+    assert_eq!(expr("{ :a : [1, 2] } == { :a : [1, 2] }"), ":true");
+    assert_eq!(expr("{ :a : [1, 2] } == { :a : [1, 3] }"), ":false");
+    assert_eq!(expr("{ :a : 1, :b : 2 } == { :b : 2, :a : 1 }"), ":true");
+    assert_eq!(expr("[1, 2] != [1, 2, 3]"), ":true");
 }
 
 #[test]
 fn a_structure_containing_nan_equals_itself() {
     // The documented consequence of trying identity first (§5).
     let src = "a := [0 / 0]\nself_equal := a == a\ncopy := a\ncopy_equal := copy == a\n";
-    assert_eq!(eval(src, "self_equal"), ".true");
-    assert_eq!(eval(src, "copy_equal"), ".true");
+    assert_eq!(eval(src, "self_equal"), ":true");
+    assert_eq!(eval(src, "copy_equal"), ":true");
 }
 
 #[test]
 fn cyclic_structures_compare_without_looping() {
     let src = "
-a := { .next : .null }
+a := { :next : :null }
 a.next = &a
-b := { .next : .null }
+b := { :next : :null }
 b.next = &b
 same := a == b
 ";
-    assert_eq!(eval(src, "same"), ".true");
+    assert_eq!(eval(src, "same"), ":true");
 }
 
 // --- references (§5.1) ------------------------------------------------------
@@ -255,7 +255,7 @@ fn a_reference_opts_out_of_copying() {
 fn bump(d)
 \td.x = d.x + 1
 end
-a := { .x : 1 }
+a := { :x : 1 }
 bump(&a)
 after := a.x
 ";
@@ -278,10 +278,10 @@ after := a
 
 #[test]
 fn references_into_containers_and_out_of_them() {
-    let src = "d := { .x : 1 }\nr := &d.x\nr = 7\nafter := d.x\n";
+    let src = "d := { :x : 1 }\nr := &d.x\nr = 7\nafter := d.x\n";
     assert_eq!(eval(src, "after"), "7");
 
-    let src = "a := 1\nheld := { .r : &a }\na = 2\nseen := held.r\n";
+    let src = "a := 1\nheld := { :r : &a }\na = 2\nseen := held.r\n";
     assert_eq!(eval(src, "seen"), "2");
 
     let src = "a := 1\nlist := [&a]\na = 3\nseen := list[0]\n";
@@ -291,7 +291,7 @@ fn references_into_containers_and_out_of_them() {
 #[test]
 fn reading_a_reference_derefs_then_copies() {
     // You must write `&` again to keep aliasing (QUESTIONS.md §6).
-    let src = "a := { .x : 1 }\nr := &a\nb := r\nb.x = 9\nkept := a.x\n";
+    let src = "a := { :x : 1 }\nr := &a\nb := r\nb.x = 9\nkept := a.x\n";
     assert_eq!(eval(src, "kept"), "1");
 }
 
@@ -301,7 +301,7 @@ fn reading_a_reference_derefs_then_copies() {
 fn declaration_shadows_and_assignment_searches_outward() {
     let src = "
 x := 1
-if .true
+if :true
 \tx = 2
 end
 outer := x
@@ -310,7 +310,7 @@ outer := x
 
     let src = "
 x := 1
-if .true
+if :true
 \tx := 5
 end
 outer := x
@@ -353,13 +353,13 @@ n %= 5
 
 #[test]
 fn a_compound_assignment_reaches_keys_and_elements() {
-    assert_eq!(eval("d := { .n : 1 }\nd.n += 41\n", "d"), "{ .n : 42 }");
+    assert_eq!(eval("d := { :n : 1 }\nd.n += 41\n", "d"), "{ :n : 42 }");
     assert_eq!(eval("l := [1, 2, 3]\nl[0] += 100\nl[-1] *= 2\n", "l"), "[101, 2, 6]");
-    assert_eq!(eval("d := { .l : [1] }\nd.l[0] -= 1\n", "d"), "{ .l : [0] }");
+    assert_eq!(eval("d := { :l : [1] }\nd.l[0] -= 1\n", "d"), "{ :l : [0] }");
 
     // Writing a missing key creates it (§5), but this one reads it first, and
     // reading a missing key crashes — the same crash `d.b = d.b + 1` raises.
-    assert!(crash_of("d := { .a : 1 }\nd.b += 1\n").contains("no key .b"));
+    assert!(crash_of("d := { :a : 1 }\nd.b += 1\n").contains("no key .b"));
     assert!(crash_of("l := [1]\nl[3] += 1\n").contains("out of range"));
 }
 
@@ -477,21 +477,21 @@ fn a_call_no_candidate_accepts_crashes() {
 
 #[test]
 fn a_function_without_return_yields_null() {
-    assert_eq!(eval("fn f()\nend\nx := f()\n", "x"), ".null");
+    assert_eq!(eval("fn f()\nend\nx := f()\n", "x"), ":null");
 }
 
 // --- control flow -----------------------------------------------------------
 
 #[test]
-fn loops_and_labels() {
+fn loops_handle_control_atoms() {
     let src = "
 total := 0
 for n in [1, 2, 3, 4]
 \tif n == 3
-\t\tcontinue
+\t\tcontinue()
 \tend
 \tif n == 4
-\t\tbreak
+\t\t:break
 \tend
 \ttotal = total + n
 end
@@ -503,11 +503,11 @@ hits := 0
 for a in [1, 2] as outer
 \tfor b in [1, 2]
 \t\thits = hits + 1
-\t\tbreak outer
+\t\tbreak()
 \tend
 end
 ";
-    assert_eq!(eval(src, "hits"), "1");
+    assert_eq!(eval(src, "hits"), "2");
 }
 
 #[test]
@@ -525,9 +525,9 @@ end
 fn else_if_chain_runs_one_branch() {
     let src = "
 x := 0
-if .false
+if :false
 \tx = 1
-else if .true
+else if :true
 \tx = 2
 else
 \tx = 3
@@ -538,17 +538,17 @@ end
 
 #[test]
 fn and_or_short_circuit_and_keep_the_operand() {
-    assert_eq!(expr(".null or \"fallback\""), "fallback");
+    assert_eq!(expr(":null or \"fallback\""), "fallback");
     assert_eq!(expr("\"kept\" or \"other\""), "kept");
-    assert_eq!(expr(".false and \"unreached\""), ".false");
+    assert_eq!(expr(":false and \"unreached\""), ":false");
     assert_eq!(expr("\"a\" and \"b\""), "b");
-    assert_eq!(expr("not .null"), ".true");
-    assert_eq!(expr("not 0"), ".false");
+    assert_eq!(expr("not :null"), ":true");
+    assert_eq!(expr("not 0"), ":false");
 }
 
 #[test]
 fn alive_is_true_outside_any_trail() {
-    assert_eq!(eval("x := alive()\n", "x"), ".true");
+    assert_eq!(eval("x := alive()\n", "x"), ":true");
 }
 
 #[test]
@@ -556,4 +556,14 @@ fn a_crash_stops_the_program() {
     let result = run("a := 1\nb := missing_name\nc := 2\n");
     assert!(result.crash.is_some());
     assert!(result.root_scope.lookup("c").is_none());
+}
+
+#[test]
+fn aggressive_continuation_evaluates_and_survives_formatting() {
+    let source = "a := 2\nfoo := {:bar:{:baz:40}}\nx := foo\n.bar\n.baz\n-a\nkey := :some-other-prop+interesting_added_info\nd := {:some-other-prop+interesting_added_info:x}\ny := d[key]\n";
+    assert_eq!(eval(source, "y"), "38");
+    let formatted = hydra::format::format_source(source, "t.hy").unwrap();
+    assert_eq!(eval(&formatted, "y"), "38");
+    assert_eq!(eval("a := 2\nx := 32\n\n-a\n", "x"), "32");
+    assert_eq!(eval("a := 2\nx := 32\n-a\n", "x"), "30");
 }

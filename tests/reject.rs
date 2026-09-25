@@ -116,7 +116,7 @@ fn take(d)
 	d.n = 99
 	reject()
 end
-answered := take({ .n : 1 })
+answered := take({ :n : 1 })
 ";
     assert_eq!(eval(src, "answered"), "1");
 
@@ -141,7 +141,7 @@ fn take(d)
 	d.n = 99
 	reject()
 end
-box := { .n : 1 }
+box := { :n : 1 }
 answered := take(box)
 kept := box.n
 ";
@@ -175,13 +175,13 @@ pick(1)
 #[test]
 fn a_lone_function_that_rejects_says_so() {
     let crash = crash_of("fn only(n)\n\treject(\"nothing behind me\")\nend\nonly(1)\n");
-    assert!(crash.contains("unhandled rejection: nothing behind me"), "{crash}");
+    assert!(crash.contains("unhandled rejection"), "{crash}");
     assert!(crash.contains("only(n) rejected it: nothing behind me"), "{crash}");
 }
 
 #[test]
 fn a_rejection_nothing_takes_is_the_answer_of_the_call() {
-    // `reject(msg)` is `return .reject, msg`: consumed, it is a value like any
+    // `reject(msg)` is `return [:reject, msg]`: consumed, it is a value like any
     // other, and the last candidate tried is the one whose answer it is.
     let src = "
 fn pick(n)
@@ -190,9 +190,10 @@ end
 fn pick(n)
 \treject()
 end
-x, why := pick(1)
+x := pick(1)
+why := x[1]
 ";
-    assert_eq!(eval(src, "x"), ".reject");
+    assert_eq!(eval(src, "x"), "[:reject, the first wants something else]");
     assert_eq!(eval(src, "why"), "the first wants something else");
 }
 
@@ -285,7 +286,7 @@ fn writing_before_rejecting_is_worth_a_warning() {
 #[test]
 fn reject_outside_a_function_is_an_error() {
     assert_eq!(codes("reject()\n"), vec!["reject-outside-function"]);
-    assert_eq!(codes(".reject\n"), vec!["reject-outside-function"]);
+    assert_eq!(codes(":reject\n"), vec!["reject-outside-function"]);
     assert_eq!(
         codes("parallel\n\treject() || y := 1\nend\n"),
         vec!["reject-outside-function"]
@@ -307,11 +308,11 @@ fn a_trail_cannot_reject_for_its_function() {
 fn a_shadow_can_reject_through_a_helper() {
     let shadowed = |src: &str| codes(src).contains(&"unreachable-overload");
     let earlier = "fn f(a)\n\treturn 1\nend\n";
-    // `return .reject` is `reject()` spelled out.
-    assert!(!shadowed(&format!("{earlier}fn f(a)\n\tif a\n\t\treturn .reject\n\tend\n\treturn 2\nend\n")));
-    // A helper's `.reject`, unconsumed, is the shadow's own (§8.1) — through
+    // `return :reject` is `reject()` spelled out.
+    assert!(!shadowed(&format!("{earlier}fn f(a)\n\tif a\n\t\treturn :reject\n\tend\n\treturn 2\nend\n")));
+    // A helper's `:reject`, unconsumed, is the shadow's own (§8.1) — through
     // any number of helpers.
-    let helpers = "fn deny(c)\n\tif c\n\t\treturn .reject, \"no\"\n\tend\nend\nfn guard(c)\n\tdeny(c)\nend\n";
+    let helpers = "fn deny(c)\n\tif c\n\t\treturn :reject, \"no\"\n\tend\nend\nfn guard(c)\n\tdeny(c)\nend\n";
     assert!(!shadowed(&format!("{helpers}{earlier}fn f(a)\n\tguard(a)\n\treturn 2\nend\n")));
     assert!(!shadowed(&format!("{helpers}{earlier}fn f(a)\n\treturn guard(a)\nend\n")));
     // Consumed, it goes nowhere, and the shadow never rejects.
@@ -326,9 +327,89 @@ fn a_shadow_can_reject_through_a_helper() {
 #[test]
 fn writing_before_a_helper_rejects_is_worth_a_warning_too() {
     let warned = |src: &str| codes(src).contains(&"write-before-reject");
-    let helper = "fn deny(c)\n\tif c\n\t\treturn .reject\n\tend\nend\n";
+    let helper = "fn deny(c)\n\tif c\n\t\treturn :reject\n\tend\nend\n";
     assert!(warned(&format!("{helper}fn f(d)\n\td.n = 1\n\tdeny(d.n > 0)\nend\n")));
-    assert!(warned("fn f(d)\n\td.n = 1\n\treturn .reject\nend\n"));
+    assert!(warned("fn f(d)\n\td.n = 1\n\treturn :reject\nend\n"));
     // A call the file cannot see into is not enough for a warning.
     assert!(!warned("fn f(d, g)\n\td.n = 1\n\tg()\nend\n"));
+}
+
+#[test]
+fn reject_constructs_one_tagged_list() {
+    assert_eq!(eval("x := reject(\"why\")\n", "x"), "[:reject, why]");
+    assert_eq!(eval("x := reject(msg = \"why\")\n", "x"), "[:reject, why]");
+    assert_eq!(eval("x := reject()\n", "x"), "[:reject, :null]");
+    assert_eq!(eval("x := ::reject(42)\n", "x"), "[:reject, 42]");
+    // Defining it in Hydra has the same value semantics as the builtin.
+    assert_eq!(eval("fn reject(msg)\nreturn [:reject, msg]\nend\nx := reject(\"why\")\n", "x"), "[:reject, why]");
+}
+
+#[test]
+fn a_returned_or_unconsumed_tagged_list_retries_the_call() {
+    for rejection in ["return [:reject, \"try the fallback\"]", "[:reject, \"try the fallback\"]", "return reject(\"try the fallback\")"] {
+        let source = format!("fn pick(n)\nreturn 42\nend\nfn pick(n)\n{rejection}\nend\nx := pick(1)\n");
+        assert_eq!(eval(&source, "x"), "42");
+        assert!(!codes(&source).contains(&"unreachable-overload"));
+    }
+}
+
+#[test]
+fn the_tagged_list_shape_is_exact_and_can_be_consumed() {
+    for expression in ["[]", "[:reject]", "[:reject, 1, 2]", "[:other, \"message\"]"] {
+        assert_eq!(eval(&format!("fn f()\nreturn {expression}\nend\nx := f()\n"), "x"), expression.replace('"', ""));
+    }
+    let source = "fn f()\nx := [:reject, \"kept as data\"]\n_ = reject(\"discarded\")\nreturn x\nend\nx := f()\n";
+    assert_eq!(eval(source, "x"), "[:reject, kept as data]");
+}
+
+#[test]
+fn nested_helpers_preserve_all_refusals_without_duplicate_payloads() {
+    let source = r#"
+fn inner(n)
+    return [:reject, "inner-first"]
+end
+fn inner(n)
+    reject("inner-second")
+end
+fn outer(n)
+    reject("outer-fallback")
+end
+fn outer(n)
+    inner(n)
+end
+outer(1)
+"#;
+    let crash = crash_of(source);
+    for message in ["inner-first", "inner-second", "outer-fallback"] {
+        assert_eq!(crash.matches(message).count(), 1, "{crash}");
+    }
+    assert!(crash.find("inner-second").unwrap() < crash.find("inner-first").unwrap());
+    assert!(crash.find("inner-first").unwrap() < crash.find("outer-fallback").unwrap());
+}
+
+#[test]
+fn consumed_refusals_are_not_attached_to_a_new_rejection() {
+    for consume in ["x := old()", "_ = old()", "x := [old()]"] {
+        let source = format!("fn old()\nreject(\"unrelated-message\")\nend\nfn current()\n{consume}\nreturn [:reject, \"current-message\"]\nend\ncurrent()\n");
+        let crash = crash_of(&source);
+        assert!(crash.contains("current-message"), "{crash}");
+        assert!(!crash.contains("unrelated-message"), "{crash}");
+    }
+}
+
+#[test]
+fn standard_handler_renders_tagged_payloads_and_checker_recognizes_them() {
+    let crash = crash_of("[:reject, { :reason : 42 }]\n");
+    assert!(crash.contains("unhandled rejection: { :reason : 42 }"), "{crash}");
+    assert_eq!(codes("[:reject, \"no\"]\n"), vec!["reject-outside-function"]);
+    assert_eq!(codes("x := [:reject, \"data\"]\n"), Vec::<&str>::new());
+    assert!(codes("fn f(d)\nd.x = 1\nreturn [:reject, \"no\"]\nend\n").contains(&"write-before-reject"));
+}
+
+#[test]
+fn a_consumed_boolean_operand_does_not_supply_refusal_messages() {
+    let source = "fn old()\nreject(\"unrelated-message\")\nend\nfn current()\nreturn old() and :reject\nend\ncurrent()\n";
+    let crash = crash_of(source);
+    assert!(crash.contains("unhandled rejection"), "{crash}");
+    assert!(!crash.contains("unrelated-message"), "{crash}");
 }

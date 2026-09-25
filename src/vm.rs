@@ -12,11 +12,12 @@
 //! * **A call is never interrupted** (§9.5). Cancellation is only noticed at a
 //!   statement boundary of the trail's *own* body, so an in-flight call — and
 //!   everything it invokes — runs to the end and no frame is abandoned.
+//!   Explicit exit/panic terminates the whole VM and may abandon those calls.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use crate::ast::BlockKind;
@@ -137,6 +138,10 @@ pub struct Vm {
     root_cancel: Arc<CancelFlag>,
     /// The first crash in a live trail: it ends the program (§8).
     crash: Mutex<Option<Crash>>,
+    /// Explicit process termination is separate from a runtime crash.
+    exit_code: Mutex<Option<u8>>,
+    /// Exit and panic stop every task, including calls still running in siblings.
+    terminated: AtomicBool,
     /// Crashes isolated to a dead trail (§9.5).
     dead_crashes: Mutex<Vec<Crash>>,
     /// The most trails ever stepping at the same moment: what "true
@@ -147,6 +152,8 @@ pub struct Vm {
 #[derive(Debug)]
 pub struct RunResult {
     pub crash: Option<Crash>,
+    /// Requested by an unconsumed [:exit, code]; never exits the embedding host.
+    pub exit_code: Option<u8>,
     pub dead_crashes: Vec<Crash>,
     pub root_scope: ScopeRef,
     /// The most trails that were stepping at once.
@@ -155,7 +162,7 @@ pub struct RunResult {
 
 impl RunResult {
     pub fn ok(&self) -> bool {
-        self.crash.is_none()
+        self.crash.is_none() && self.exit_code.unwrap_or(0) == 0
     }
 }
 
@@ -169,6 +176,8 @@ impl Vm {
             wake: Condvar::new(),
             root_cancel: CancelFlag::root(),
             crash: Mutex::new(None),
+            exit_code: Mutex::new(None),
+            terminated: AtomicBool::new(false),
             dead_crashes: Mutex::new(Vec::new()),
             peak_parallelism: AtomicUsize::new(0),
         }
@@ -274,6 +283,7 @@ impl Vm {
 
         RunResult {
             crash: self.crash.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            exit_code: *self.exit_code.lock().unwrap_or_else(|e| e.into_inner()),
             dead_crashes: self.dead_crashes.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             root_scope: self.module_scope(0),
             peak_parallelism: self.peak_parallelism.load(Ordering::Relaxed),
@@ -365,6 +375,9 @@ impl Vm {
             None => return Ok(Flow::Done),
         };
         loop {
+            if self.terminated.load(Ordering::Acquire) {
+                return Ok(Flow::Stop);
+            }
             if task.frames.is_empty() {
                 return Ok(Flow::Done);
             }
@@ -418,7 +431,17 @@ impl Vm {
             Instr::PushStr(s) => task.push(Value::Str(s.clone())),
             Instr::PushSym(s) => task.push(Value::Sym(s.clone())),
             Instr::Pop => {
+                task.rejection = None;
                 task.pop();
+            }
+            Instr::JumpUnlessSignal { signal, target } => {
+                if matches!(task.stack.last(), Some(Value::Sym(s)) if s.name() == *signal) {
+                    task.pop();
+                    task.extras.clear();
+                    task.rejection = None;
+                } else {
+                    task.frame_mut().ip = *target;
+                }
             }
             Instr::Unconsumed { spread, at } => {
                 let first = task.pop();
@@ -426,6 +449,31 @@ impl Vm {
                 // others are an earlier call's, already passed over.
                 let extras =
                     if *spread { std::mem::take(&mut task.extras) } else { Vec::new() };
+                if matches!(&first, Value::Sym(s) if matches!(s.name(), "break" | "continue")) {
+                    return Err(Crash::new(format!(
+                        "unhandled {}: no enclosing loop in this function; return the atom to let the caller handle it",
+                        to_text(&first)
+                    )));
+                }
+                if let Some(payload) = tagged_payload(&first, "exit") {
+                    if task.cancel.is_cancelled() { return Ok(Flow::Stop); }
+                    let payload = deref(&payload)?;
+                    let Value::Num(code) = payload else {
+                        return Err(Crash::new("exit code must be an integer from 0 through 255"));
+                    };
+                    if !code.is_finite() || code.fract() != 0.0 || !(0.0..=255.0).contains(&code) {
+                        return Err(Crash::new("exit code must be an integer from 0 through 255"));
+                    }
+                    self.terminate(Some(code as u8), None);
+                    return Ok(Flow::Stop);
+                }
+                if let Some(payload) = tagged_payload(&first, "panic") {
+                    let crash = Crash::new(format!("panic: {}", to_text(&deref(&payload)?)));
+                    // A cancelled trail keeps the usual dead-crash isolation rule.
+                    if task.cancel.is_cancelled() { return Err(crash); }
+                    self.terminate(None, Some(self.decorate(task, crash)));
+                    return Ok(Flow::Stop);
+                }
                 if is_reject(&first) {
                     let mut values = Vec::with_capacity(1 + extras.len());
                     values.push(first);
@@ -459,6 +507,8 @@ impl Vm {
                 }
             }
             Instr::MakeList(n) => {
+                // Its elements are consumed; this newly built value has no prior refusals.
+                task.rejection = None;
                 let at = task.stack.len() - *n;
                 let items: Vec<Value> = task.stack.split_off(at);
                 task.push(new_list(items));
@@ -590,6 +640,7 @@ impl Vm {
                 task.push(Value::Ref(RefValue { root: cell, path: Arc::new(path) }));
             }
             Instr::GetMember => {
+                task.rejection = None;
                 let key = task.pop();
                 let obj = task.pop();
                 let value = get_member(&obj, &key)?;
@@ -630,6 +681,7 @@ impl Vm {
                 if keep {
                     task.frame_mut().ip = *target;
                 } else {
+                    task.rejection = None;
                     task.pop();
                 }
             }
@@ -638,6 +690,7 @@ impl Vm {
                 if keep {
                     task.frame_mut().ip = *target;
                 } else {
+                    task.rejection = None;
                     task.pop();
                 }
             }
@@ -797,6 +850,8 @@ impl Vm {
                 }
             }
             Instr::Tick => {
+                // Refusals belong only to the result of the current statement.
+                task.rejection = None;
                 // A statement boundary: where a cancelled trail stops, and the
                 // scheduling point (§9.1, §9.5).
                 if task.should_stop() {
@@ -883,6 +938,22 @@ impl Vm {
             }
 
             Instr::EndTrail => return Ok(Flow::Stop),
+            Instr::BreakParallel => {
+                let mut sched = self.sched.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(block) = task.block.and_then(|id| sched.blocks.get_mut(&id)) {
+                    block.decided = true;
+                    let siblings = block.children.clone();
+                    for (id, flag) in siblings.iter().zip(&block.flags) {
+                        if *id != task.id { flag.cancel(); }
+                    }
+                    let mut woken = Vec::new();
+                    for id in siblings {
+                        if id != task.id { woken.extend(cancel_waiter(block, id)); }
+                    }
+                    deliver_all(&mut sched, woken);
+                }
+                return Ok(Flow::Stop);
+            }
             Instr::Use { module, alias, unqualified } => {
                 return self.use_module(task, module, alias, *unqualified)
             }
@@ -1015,13 +1086,21 @@ impl Vm {
             }
             Value::Native(native) => {
                 let out = match native {
-                    // `fn reject() return .reject end` and
-                    // `fn reject(msg) return .reject, msg end` (§3): an answer
-                    // like any other, which a statement then hands on (§8.1).
+                    // Control builtins construct ordinary values; their consumers
+                    // decide whether to invoke a handler.
+                    Native::Break => NativeOut::Values(vec![Value::Sym(sym("break"))]),
+                    Native::Continue => NativeOut::Values(vec![Value::Sym(sym("continue"))]),
+                    Native::Exit => {
+                        let code = bound.into_iter().next().flatten().unwrap_or(Value::Num(0.0));
+                        NativeOut::Values(vec![new_list(vec![Value::Sym(sym("exit")), code])])
+                    }
+                    Native::Panic => {
+                        let msg = bound.into_iter().next().flatten().expect("required panic message");
+                        NativeOut::Values(vec![new_list(vec![Value::Sym(sym("panic")), msg])])
+                    }
                     Native::Reject => {
-                        let mut values = vec![Value::Sym(sym(REJECT))];
-                        values.extend(bound.into_iter().flatten());
-                        NativeOut::Values(values)
+                        let msg = bound.into_iter().next().flatten().unwrap_or_else(Value::null);
+                        NativeOut::Values(vec![new_list(vec![Value::Sym(sym(REJECT)), msg])])
                     }
                     Native::Send => self.send(task, &bound)?,
                     Native::Receive => self.receive(task, &bound)?,
@@ -1056,7 +1135,7 @@ impl Vm {
     ) -> Result<Vec<Value>, Crash> {
         let arg = |i: usize| args.get(i).cloned().flatten().unwrap_or_else(Value::null);
         match native {
-            // Dynamic, no token threading, `.true` outside any trail — and
+            // Dynamic, no token threading, `:true` outside any trail — and
             // false during crash shutdown too (§9.5).
             Native::Alive => Ok(vec![boolean(!task.cancel.is_cancelled())]),
             Native::Print => {
@@ -1106,11 +1185,11 @@ impl Vm {
 
     // --- auto-channels (spec/hydra_channels.md) ------------------------------
 
-    /// `send(value, to*, mode = .wait)`.
+    /// `send(value, to*, mode = :wait)`.
     ///
-    /// Returns `.true` when the value reached someone or was buffered for
-    /// someone, and `.false` when every trail it could have reached has already
-    /// ended. `.wait` parks until one of those two is true.
+    /// Returns `:true` when the value reached someone or was buffered for
+    /// someone, and `:false` when every trail it could have reached has already
+    /// ended. `:wait` parks until one of those two is true.
     fn send(&self, task: &mut Task, args: &[Option<Value>]) -> Result<NativeOut, Crash> {
         let (block_id, me) = self.in_trail(task, "send")?;
         let value = args.first().cloned().flatten().unwrap_or_else(Value::null);
@@ -1185,7 +1264,7 @@ impl Vm {
     }
 
     /// `receive(from*)` — the value, and the trail that sent it. Both come back
-    /// `.null` when no eligible sender is left, which is the one answer a
+    /// `:null` when no eligible sender is left, which is the one answer a
     /// sender cannot fake (channels §1).
     fn receive(&self, task: &mut Task, args: &[Option<Value>]) -> Result<NativeOut, Crash> {
         let (block_id, me) = self.in_trail(task, "receive")?;
@@ -1202,7 +1281,7 @@ impl Vm {
                 && from.as_ref().is_none_or(|only| only.contains(&msg.from))
         }) {
             let msg = block.mail.remove(at).expect("the message just found");
-            // A `.wait` sender was parked behind its value.
+            // A `:wait` sender was parked behind its value.
             if let Some(sender) = msg.waiter {
                 deliver_all(&mut sched, vec![(sender, vec![boolean(true)])]);
             }
@@ -1233,9 +1312,9 @@ impl Vm {
     /// meaningful one and the rest are additional information, held until the
     /// binding site names them or the next call replaces them (channels §6.2).
     ///
-    /// A call's answer that starts with `.reject` is the candidate handing the
-    /// call back, however it got there — `return .reject`, `reject(…)`, or a
-    /// statement whose `.reject` nothing consumed (§3, §8.1). Resolution then
+    /// A call's rejection value is the candidate handing the
+    /// call back, either as a bare atom or the list `[:reject, msg]` — returned
+    /// explicitly or left unconsumed in the function (§3, §8.1). Resolution then
     /// tries the next candidate that accepts the same arguments. With none
     /// left, the rejection is the call's answer, unchanged, and what every
     /// candidate said is kept for the crash if nothing consumes it.
@@ -1251,14 +1330,9 @@ impl Vm {
         if let (true, Some(mut retry)) =
             (values.first().is_some_and(is_reject), frame.retry.take().map(|r| *r))
         {
-            let message = match values.get(1) {
-                Some(value) => match deref(value)? {
-                    Value::Sym(s) if s == sym("null") => None,
-                    other => Some(to_text(&other)),
-                },
-                None => None,
-            };
-            retry.rejected.push(RejectedBy { signature: frame.chunk.signature(), message });
+            let cause = task.rejection.take();
+            let message = if cause.is_none() { rejection_message(&values)? } else { None };
+            retry.rejected.push(RejectedBy { signature: frame.chunk.signature(), message, cause });
             if let Some((callee, bound, rest)) = Vm::resolve(&retry.rest, &retry.args) {
                 let next = Retry {
                     name: retry.name.clone(),
@@ -1273,6 +1347,9 @@ impl Vm {
             task.rejection = Some(
                 rejected(retry.name.as_deref(), &[], &retry.args, &retry.rejected).message,
             );
+        }
+        if !values.first().is_some_and(is_reject) {
+            task.rejection = None;
         }
         match frame.on_return {
             OnReturn::PushValue => {
@@ -1291,20 +1368,21 @@ impl Vm {
         Ok(if task.frames.is_empty() { Flow::Done } else { Flow::Next })
     }
 
-    /// The crash for a `.reject` that reached a statement with nothing to hand
+    /// The crash for a `:reject` that reached a statement with nothing to hand
     /// it back to (§8.1): what it carried, and — when it came out of a call
     /// that ran out of candidates — what each of them said.
     fn unhandled(&self, task: &mut Task, values: &[Value], why: &str) -> Result<Crash, Crash> {
-        let mut said = Vec::new();
-        for value in &values[1..] {
-            said.push(to_text(&deref(value)?));
-        }
+        let note = task.rejection.take();
         let mut message = String::from("unhandled rejection");
-        if !said.is_empty() {
-            message.push_str(&format!(": {}", said.join(", ")));
+        // An exhausted call already records each message with its signature.
+        // Direct rejection values have only their own payload to report.
+        if note.is_none() {
+            if let Some(said) = rejection_message(values)? {
+                message.push_str(&format!(": {said}"));
+            }
         }
         message.push_str(&format!("\n  {why}"));
-        if let Some(note) = task.rejection.take() {
+        if let Some(note) = note {
             message.push_str(&format!("\n  {}", note.replace('\n', "\n  ")));
         }
         Ok(Crash::new(message))
@@ -1483,9 +1561,12 @@ impl Vm {
             scope.declare(&name, value);
         }
         let mut sched = self.sched.lock().unwrap_or_else(|e| e.into_inner());
+        let block = task.blocks.last().copied();
+        if block.and_then(|id| sched.blocks.get(&id)).is_some_and(|b| b.decided) {
+            return;
+        }
         let id = sched.next_id;
         sched.next_id += 1;
-        let block = task.blocks.last().copied();
         // Trail 0 is the first spawned and the number climbs, which is the
         // index a sibling addresses and `channel()` answers. For the row form
         // that is the column; for the spawning forms it is spawn order, which
@@ -1542,7 +1623,9 @@ impl Vm {
     /// worker can see the block half-decided.
     fn finish_task(&self, sched: &mut Sched, task: Task, result: Result<(), Crash>) {
         if let Err(crash) = result {
-            if task.cancel.is_cancelled() {
+            if self.terminated.load(Ordering::Acquire) {
+                // Explicit exit/panic already selected the program's outcome.
+            } else if task.cancel.is_cancelled() {
                 // A crash inside a dead trail is isolated: that trail ends, the
                 // program continues (§9.5).
                 if self.options.report_dead_crashes {
@@ -1611,11 +1694,24 @@ impl Vm {
         }
     }
 
+    /// Pick the first explicit termination while preserving an earlier crash.
+    /// The VM returns the outcome to its host rather than calling process::exit.
+    fn terminate(&self, code: Option<u8>, panic: Option<Crash>) {
+        let mut crash = self.crash.lock().unwrap_or_else(|e| e.into_inner());
+        let mut exit = self.exit_code.lock().unwrap_or_else(|e| e.into_inner());
+        if crash.is_some() || exit.is_some() { return; }
+        *crash = panic;
+        *exit = code;
+        self.terminated.store(true, Ordering::Release);
+        self.root_cancel.cancel();
+        self.wake.notify_all();
+    }
+
     /// A crash in a live trail: mark every sibling cancelled, keep the first
     /// diagnostic, and let the program drain (§8).
     fn fatal(&self, crash: Crash) {
         let mut first = self.crash.lock().unwrap_or_else(|e| e.into_inner());
-        if first.is_none() {
+        if first.is_none() && self.exit_code.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
             *first = Some(crash);
         }
         self.root_cancel.cancel();
@@ -1957,6 +2053,9 @@ fn rejected(
         if let Some(said) = &refusal.message {
             message.push_str(&format!(": {said}"));
         }
+        if let Some(cause) = &refusal.cause {
+            message.push_str(&format!("\n    {}", cause.replace('\n', "\n    ")));
+        }
     }
     Crash::new(message)
 }
@@ -1976,7 +2075,7 @@ enum NativeOut {
     Blocked,
 }
 
-/// `.null, .null` — no eligible sender is left (channels §1).
+/// `:null, :null` — no eligible sender is left (channels §1).
 fn closed() -> Vec<Value> {
     vec![Value::null(), Value::null()]
 }
@@ -2080,7 +2179,7 @@ fn park_check(block: &BlockCtx) -> Result<(), Crash> {
 }
 
 /// The waiters a change has just made unanswerable: no eligible peer is left,
-/// so a parked `receive` gets `.null, .null` and a parked `send` gets `.false`
+/// so a parked `receive` gets `:null, :null` and a parked `send` gets `:false`
 /// (channels §1, §5).
 fn closed_waiters(block: &mut BlockCtx) -> Vec<(TaskId, Vec<Value>)> {
     let mut woken = Vec::new();
@@ -2172,8 +2271,52 @@ pub fn run_file(path: &Path, options: Options) -> Result<RunResult, HydraError> 
 /// The symbol a candidate answers with to hand its call back (§3).
 const REJECT: &str = "reject";
 
+/// Standard handlers match exactly one two-element tagged list.
+fn tagged_payload(value: &Value, tag: &str) -> Option<Value> {
+    let Value::List(list) = value else { return None };
+    let data = list.read().unwrap_or_else(|e| e.into_inner());
+    match data.items.as_slice() {
+        [Value::Sym(name), payload] if name.name() == tag => Some(payload.clone()),
+        _ => None,
+    }
+}
+
+fn is_reject_atom(value: &Value) -> bool {
+    matches!(value, Value::Sym(s) if s.name() == REJECT)
+}
+
 fn is_reject(value: &Value) -> bool {
-    matches!(value, Value::Sym(s) if *s == sym(REJECT))
+    if is_reject_atom(value) { return true; }
+    match value {
+        Value::List(list) => {
+            let data = list.read().unwrap_or_else(|e| e.into_inner());
+            matches!(data.items.as_slice(), [tag, _] if is_reject_atom(tag))
+        }
+        _ => false,
+    }
+}
+
+/// A tagged list is one value, not a multi-value return. Bare :reject still
+/// works without a message (and keeps the existing multi-return payload rule).
+fn rejection_message(values: &[Value]) -> Result<Option<String>, Crash> {
+    let payload = match values.first() {
+        Some(Value::List(list)) => {
+            let data = list.read().unwrap_or_else(|e| e.into_inner());
+            match data.items.as_slice() {
+                [tag, msg] if is_reject_atom(tag) => Some(msg.clone()),
+                _ => None,
+            }
+        }
+        Some(tag) if is_reject_atom(tag) => values.get(1).cloned(),
+        _ => None,
+    };
+    match payload {
+        Some(value) => {
+            let value = deref(&value)?;
+            Ok((!is_null(&value)).then(|| to_text(&value)))
+        }
+        None => Ok(None),
+    }
 }
 
 fn is_null(value: &Value) -> bool {

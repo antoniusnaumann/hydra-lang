@@ -40,13 +40,13 @@ impl Root {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unconsumed {
     /// File top level, including a trail of a top-level block: an ordinary
-    /// value is printed, and `.reject` has nowhere to go.
+    /// value is printed, and `:reject` has nowhere to go.
     TopLevel,
-    /// A function body: an ordinary value is dropped, and `.reject` returns
+    /// A function body: an ordinary value is dropped, and `:reject` returns
     /// from the function with the whole result.
     Function,
     /// A trail inside a function: dropped as in the function, but a trail
-    /// cannot return from its function (§9.6), so `.reject` has nowhere to go.
+    /// cannot return from its function (§9.6), so `:reject` has nowhere to go.
     TrailInFunction,
 }
 
@@ -57,7 +57,7 @@ pub enum Instr {
     PushSym(Sym),
     MakeList(usize),
     /// Pops `n` key/value pairs. Keys are values rather than a static table
-    /// because a key may be built at run time: `{ ."\(prefix)-id" : 1 }`.
+    /// because a key may be built at run time: `{ :"\(prefix)-id" : 1 }`.
     MakeDict(usize),
     /// Pops `n` values and concatenates their text forms: one `"…\(x)…"` (§1).
     Interpolate(usize),
@@ -101,6 +101,8 @@ pub enum Instr {
 
     Jump(usize),
     JumpIfFalse(usize),
+    /// Test an unconsumed loop-control value; consume it only on a match.
+    JumpUnlessSignal { signal: &'static str, target: usize },
     /// `and`: falsy short-circuits and keeps its value.
     AndJump(usize),
     /// `or`: truthy short-circuits and keeps its value.
@@ -153,12 +155,12 @@ pub enum Instr {
     SpawnTrail { body: Arc<Chunk>, var: Option<Arc<str>>, column: usize },
     /// Wait for the open block: all trails, or the first (§9.3, §9.4).
     JoinBlock,
-    /// Leave a `race`'s spawn loop once the block has been decided: a trail
-    /// started after that would be born cancelled and run nothing (§9.4).
+    /// Stop spawning after race completion or an unconsumed :break.
     JumpIfDecided(usize),
 
-    /// `break trail` (§9.6).
+    /// End the current parallel-loop iteration (`:continue`).
     EndTrail,
+    BreakParallel,
     /// `use fs`, `use fs as *`, `use fs as filesystem` (§7). `alias` is the
     /// name the module answers to when qualified, and `unqualified` is whether
     /// its names are bound bare as well.
@@ -220,12 +222,8 @@ impl std::fmt::Debug for Chunk {
     }
 }
 
-/// What a `break` or `continue` can target.
+/// The nearest local loop handler and its pending control jumps.
 struct LoopCtx {
-    label: Option<String>,
-    /// A trail body: `break` with no label ends the trail rather than a loop
-    /// (§9.6), and a labelled `parallel` block resolves here too.
-    is_trail: bool,
     /// A `for` loop owns an iterator that a `break` has to drop as it leaves.
     owns_iter: bool,
     scope_depth: usize,
@@ -244,8 +242,10 @@ pub struct Compiler {
     /// True while compiling a trail body, so `return` can be rejected (§9.6).
     in_trail: bool,
     /// True inside a function body, trails of its blocks included: that is
-    /// where an unconsumed `.reject` has a call to hand back (§8.1).
+    /// where an unconsumed `:reject` has a call to hand back (§8.1).
     in_fn: bool,
+    /// This chunk is an iteration body with an implicit parallel-loop handler.
+    parallel_loop: bool,
 }
 
 pub fn compile_program(program: &Program) -> Result<Arc<Chunk>> {
@@ -266,6 +266,7 @@ impl Compiler {
             iter_depth: 0,
             in_trail,
             in_fn: false,
+            parallel_loop: false,
         }
     }
 
@@ -286,6 +287,7 @@ impl Compiler {
     fn patch(&mut self, at: usize, target: usize) {
         match &mut self.code[at] {
             Instr::Jump(t)
+            | Instr::JumpUnlessSignal { target: t, .. }
             | Instr::JumpIfFalse(t)
             | Instr::AndJump(t)
             | Instr::OrJump(t)
@@ -404,6 +406,7 @@ impl Compiler {
                     (true, false) => Unconsumed::Function,
                     (true, true) => Unconsumed::TrailInFunction,
                 };
+                self.handle_loop_signals(pos)?;
                 let spread = matches!(expr, Expr::Call { .. });
                 self.emit(Instr::Unconsumed { spread, at }, pos);
             }
@@ -422,14 +425,12 @@ impl Compiler {
                 }
             }
             Stmt::If { branches, pos, end_pos } => self.compile_if(branches, *pos, *end_pos)?,
-            Stmt::While { cond, body, label, pos, .. } => {
-                self.compile_while(cond, body, label.as_deref(), *pos)?
+            Stmt::While { cond, body, pos, .. } => {
+                self.compile_while(cond, body, *pos)?
             }
-            Stmt::For { var, iterable, body, label, pos, .. } => {
-                self.compile_for(var, iterable, body, label.as_deref(), *pos)?
+            Stmt::For { var, iterable, body, pos, .. } => {
+                self.compile_for(var, iterable, body, *pos)?
             }
-            Stmt::Break { target, pos } => self.compile_break(target, *pos)?,
-            Stmt::Continue { label, pos } => self.compile_continue(label.as_deref(), *pos)?,
             Stmt::Parallel { kind, trails, label, pos, .. } => {
                 self.emit(
                     Instr::BeginBlock {
@@ -440,7 +441,7 @@ impl Compiler {
                     *pos,
                 );
                 for trail in trails {
-                    let chunk = self.trail_chunk(&trail.body, trail.column, label.as_deref())?;
+                    let chunk = self.trail_chunk(&trail.body, trail.column, false)?;
                     self.emit(
                         Instr::SpawnTrail { body: chunk, var: None, column: trail.column },
                         trail.pos,
@@ -457,16 +458,12 @@ impl Compiler {
                     },
                     *pos,
                 );
-                let chunk = self.trail_chunk(body, 0, label.as_deref())?;
+                let chunk = self.trail_chunk(body, 0, true)?;
                 self.expr(iterable)?;
                 self.emit(Instr::IterStart, *pos);
                 self.iter_depth += 1;
                 let top = self.here();
-                let decided = if *kind == BlockKind::Race {
-                    Some(self.emit(Instr::JumpIfDecided(0), *pos))
-                } else {
-                    None
-                };
+                let decided = self.emit(Instr::JumpIfDecided(0), *pos);
                 let next = self.emit(Instr::IterNext { exit: 0 }, *pos);
                 self.emit(
                     Instr::SpawnTrail { body: chunk, var: Some(Arc::from(var.as_str())), column: 0 },
@@ -475,9 +472,7 @@ impl Compiler {
                 self.emit(Instr::Jump(top), *pos);
                 let exit = self.here();
                 self.patch(next, exit);
-                if let Some(decided) = decided {
-                    self.patch(decided, exit);
-                }
+                self.patch(decided, exit);
                 self.emit(Instr::IterDrop, *pos);
                 self.iter_depth -= 1;
                 self.emit(Instr::JoinBlock, *pos);
@@ -491,24 +486,17 @@ impl Compiler {
                     },
                     *pos,
                 );
-                let chunk = self.trail_chunk(body, 0, label.as_deref())?;
+                let chunk = self.trail_chunk(body, 0, true)?;
                 let top = self.here();
-                // A `race` stops spawning as soon as it is decided, before
-                // evaluating the condition again (§9.4).
-                let decided = if *kind == BlockKind::Race {
-                    Some(self.emit(Instr::JumpIfDecided(0), *pos))
-                } else {
-                    None
-                };
+                // Race completion or :break stops spawning before the next condition.
+                let decided = self.emit(Instr::JumpIfDecided(0), *pos);
                 self.expr(cond)?;
                 let exit = self.emit(Instr::JumpIfFalse(0), *pos);
                 self.emit(Instr::SpawnTrail { body: chunk, var: None, column: 0 }, *pos);
                 self.emit(Instr::Jump(top), *pos);
                 let after = self.here();
                 self.patch(exit, after);
-                if let Some(decided) = decided {
-                    self.patch(decided, after);
-                }
+                self.patch(decided, after);
                 self.emit(Instr::JoinBlock, *pos);
             }
         }
@@ -544,7 +532,6 @@ impl Compiler {
         &mut self,
         cond: &Expr,
         body: &[Stmt],
-        label: Option<&str>,
         pos: Pos,
     ) -> Result<()> {
         let top = self.here();
@@ -552,8 +539,6 @@ impl Compiler {
         let exit = self.emit(Instr::JumpIfFalse(0), pos);
 
         self.loops.push(LoopCtx {
-            label: label.map(str::to_string),
-            is_trail: false,
             owns_iter: false,
             scope_depth: self.scope_depth,
             iter_depth: self.iter_depth,
@@ -574,7 +559,6 @@ impl Compiler {
         var: &str,
         iterable: &Expr,
         body: &[Stmt],
-        label: Option<&str>,
         pos: Pos,
     ) -> Result<()> {
         self.expr(iterable)?;
@@ -585,8 +569,6 @@ impl Compiler {
         let next = self.emit(Instr::IterNext { exit: 0 }, pos);
 
         self.loops.push(LoopCtx {
-            label: label.map(str::to_string),
-            is_trail: false,
             owns_iter: true,
             scope_depth: self.scope_depth,
             iter_depth: self.iter_depth,
@@ -624,55 +606,21 @@ impl Compiler {
         }
     }
 
-    fn compile_break(&mut self, target: &BreakTarget, pos: Pos) -> Result<()> {
-        match target {
-            BreakTarget::Trail => {
-                if !self.in_trail {
-                    return self.err("`break trail` is only meaningful inside a trail", pos);
-                }
-                self.emit(Instr::EndTrail, pos);
-                Ok(())
-            }
-            BreakTarget::Innermost => match self.loops.iter().rposition(|c| !c.is_trail) {
-                Some(index) => self.jump_out_of(index, pos, true),
-                None if self.in_trail => {
-                    // `break` ends the current trail early (§9.6).
-                    self.emit(Instr::EndTrail, pos);
-                    Ok(())
-                }
-                None => self.err("`break` outside a loop", pos),
-            },
-            BreakTarget::Label(label) => {
-                match self.loops.iter().rposition(|c| c.label.as_deref() == Some(label.as_str())) {
-                    Some(index) if self.loops[index].is_trail => {
-                        // A label on a `parallel` block names the block; from
-                        // inside a trail the only thing breaking it can mean is
-                        // ending this trail (see QUESTIONS.md §13).
-                        self.emit(Instr::EndTrail, pos);
-                        Ok(())
-                    }
-                    Some(index) => self.jump_out_of(index, pos, true),
-                    None => self.err(format!("no loop or block labelled `{label}` is in scope"), pos),
-                }
-            }
+    fn handle_loop_signals(&mut self, pos: Pos) -> Result<()> {
+        let nearest = self.loops.len().checked_sub(1);
+        if nearest.is_none() && !self.parallel_loop {
+            return Ok(());
         }
-    }
-
-    fn compile_continue(&mut self, label: Option<&str>, pos: Pos) -> Result<()> {
-        let index = match label {
-            None => self.loops.iter().rposition(|c| !c.is_trail),
-            Some(l) => self
-                .loops
-                .iter()
-                .rposition(|c| c.label.as_deref() == Some(l) && !c.is_trail),
-        };
-        match index {
-            Some(index) => self.jump_out_of(index, pos, false),
-            None => match label {
-                Some(l) => self.err(format!("no loop labelled `{l}` is in scope"), pos),
-                None => self.err("`continue` outside a loop", pos),
-            },
+        for signal in ["break", "continue"] {
+            let skip = self.emit(Instr::JumpUnlessSignal { signal, target: 0 }, pos);
+            if let Some(index) = nearest {
+                self.jump_out_of(index, pos, signal == "break")?;
+            } else {
+                self.emit(if signal == "break" { Instr::BreakParallel } else { Instr::EndTrail }, pos);
+            }
+            self.patch(skip, self.here());
         }
+        Ok(())
     }
 
     /// Unwind scopes and iterators back to a loop, then jump.
@@ -995,25 +943,13 @@ impl Compiler {
         &mut self,
         body: &[Stmt],
         column: usize,
-        label: Option<&str>,
+        parallel_loop: bool,
     ) -> Result<Arc<Chunk>> {
         let mut sub = Compiler::new(&self.file, true);
         sub.in_fn = self.in_fn;
-        sub.loops.push(LoopCtx {
-            label: label.map(str::to_string),
-            is_trail: true,
-            owns_iter: false,
-            scope_depth: 0,
-            iter_depth: 0,
-            breaks: Vec::new(),
-            continues: Vec::new(),
-        });
+        sub.parallel_loop = parallel_loop;
         sub.block(body)?;
         sub.emit(Instr::ReturnNull, Pos::NONE);
-        let ctx = sub.loops.pop().expect("trail context");
-        // A trail's `break` ends the trail; those are `EndTrail` instructions
-        // already, so nothing should be waiting to be patched.
-        debug_assert!(ctx.breaks.is_empty() && ctx.continues.is_empty());
         Ok(Arc::new(sub.finish(format!("trail {column}"), Vec::new())))
     }
 }
