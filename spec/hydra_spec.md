@@ -33,7 +33,8 @@ lookup dots, calls, indexing, namespace selectors, assignments, commas, and
 unfinished expressions or delimited lists. Precedence is unchanged.
 `foo\n.bar\n.baz` means `foo.bar.baz`; `32\n-a` means `32 - a`.
 If the next token cannot continue the current statement, a new statement begins.
-Block headers and a bare `return` still end at their terminating newline.
+Block headers end after their condition or iterable. Calls, including `return`,
+follow the ordinary continuation rules.
 
 A **blank line** (including a whitespace-only line) always stops continuation.
 Thus `32\n\n-a` is two statements; use the same separation before a standalone
@@ -82,7 +83,7 @@ before `>`.
 ### Keywords
 
 ```
-fn  use  if  else  for  in  while  return  end
+fn  use  if  else  for  in  while  end
 and  or  not  parallel  race  as
 ```
 
@@ -175,7 +176,7 @@ modulo 32.
 program    = { stmt } ;
 
 stmt       = use | fndecl | decl | assign | if | for | while
-           | parallel | race | return | exprstmt ;
+           | parallel | race | exprstmt ;
 
 use        = "use" ident ;
 fndecl     = "fn" ident "(" [ params ] ")" NEWLINE block "end" ;
@@ -184,12 +185,12 @@ param      = [ "&" ] ident [ "=" expr ] ;
 args       = arg { "," arg } ;
 arg        = [ ident "=" ] expr ;
 
-decl       = ident ":=" expr ;
+decl       = ident ":=" outerexpr ;
 dict       = "{" [ dictent { "," dictent } ] "}" ;
 dictent    = symbol ":" expr ;
 symbol     = ":" atomname | ":" string ;  (* atom boundaries: §2 *)
 string     = '"' { char | "\\(" expr ")" } '"' ;
-assign     = lvalue "=" expr ;
+assign     = lvalue "=" outerexpr ;
 lvalue     = ident | postfix "." ident | postfix "[" expr "]" ;
 
 if         = "if" expr NEWLINE block
@@ -207,7 +208,8 @@ rows       = { row NEWLINE } ;
 row        = cell { "||" cell } ;
 cell       = { token } ;                  (* see §4 *)
 
-return     = "return" [ expr ] ;
+exprstmt   = outerexpr ;
+outerexpr  = expr | callee HSPACE args ;
 
 expr       = ... (* precedence table below *) ;
 closure    = "fn" "(" [ params ] ")" ( expr | NEWLINE block "end" ) ;
@@ -219,6 +221,43 @@ Blank lines are never consumed as continuation.
 
 **[D]** Whether a closure is single-expression or multi-line is decided by
 whether anything follows the `)` **on the same line**.
+
+**[D] Calls without parentheses.** An outer call can omit its parentheses in
+an expression statement or on a declaration/assignment RHS: `print "hello"`,
+`x := add 1, 2`, or `x = add 1, 2`. Arguments remain comma-separated ordinary
+expressions; nested calls require parentheses: `print len(items)`, never
+`print len items`. The first argument starts on the callee’s physical line.
+Arguments may continue according to §1 after that.
+
+Whitespace before the first argument is significant: `f -1` means `f(-1)` and
+`f [1]` means `f([1])`; `f - 1` remains subtraction and `f[1]` remains indexing.
+Likewise `f &x` passes a reference and `f & x` is bitwise AND. Newline
+continuations retain their meaning. Qualified calls and receiver calls also
+support this form: `module::f x`, `x.f y`, and `&items.push value`.
+Bare function names remain values. Zero-argument calls require `()`, except
+that a standalone bare `return` is shorthand for `return()`.
+
+**[D] Return is a builtin function, not a keyword.** `return(values*)`
+constructs one list, `[:return, ...values]`. It can be shadowed, passed around,
+or selected unambiguously as `::return`. A function implicitly handles an
+unconsumed `:return` or list beginning with `:return`: it exits immediately
+with the list’s remaining elements as its result values. An empty request
+returns `:null`, as before. A consumed request remains ordinary data.
+
+The handler belongs to the current function. A file top level or a trail has
+no such handler and crashes on an unconsumed request. Functions called inside
+trails have their own handlers. Helpers can forward a request explicitly:
+
+```hydra
+fn return_if(condition, value)
+    if condition
+        return return(value)
+    end
+end
+```
+
+The inner call constructs the caller’s request; the outer call returns it
+from the helper. The caller can consume it or let its own function handle it.
 
 **[D] Parameters.** `&name` requires the *call* to pass a reference; see §5.1.
 `name = expr` gives the parameter a default, evaluated in the **function's own
@@ -745,7 +784,7 @@ expressions, so the statements in their bodies are statement level too.
 a single list value, `[:reject, "reason"]`; it is not a two-value return.
 
 **[D]** A result is **consumed** by anything that takes it: a binding, an
-argument, an operand, a `return`. `_ = foo()` consumes it explicitly, and
+argument, an operand, or the `return(...)` builtin. `_ = foo()` consumes it explicitly, and
 consuming one value of a call consumes them all — `x := foo()` takes the first
 and drops the rest.
 
@@ -756,6 +795,9 @@ and drops the rest.
 | Function body | dropped | the function returns it, unchanged |
 | Trail inside a function | dropped | crash — a trail cannot return (§9.6) |
 | File top level, its trails included | printed | crash — unhandled rejection |
+
+Return requests (`:return` or `[:return, ...values]`) exit the current function
+with their payload (§3); outside a function or inside a trail they crash.
 
 Loop controls are handled separately (§9.6): an unconsumed `:break` or
 `:continue` targets a loop in the current function, and crashes if none exists.
@@ -936,8 +978,7 @@ ends only the current iteration's trail. `:break` stops spawning iterations
 and cancels sibling iteration trails using the usual cancellation boundaries.
 A nested ordinary loop handles its own atoms first. A plain row-form parallel
 or race block does not install a loop handler, and controls do not cross its
-trail boundary to reach an outer loop. `return` directly inside a trail remains
-forbidden; a function called by the trail can return a control atom.
+trail boundary to reach an outer loop. An unconsumed return request inside a trail has no handler and crashes; a function called by the trail can return a control atom.
 
 There are no `break` / `continue` statements, labeled breaks, or `break trail`.
 Block labels remain available for channel selection.
@@ -972,7 +1013,7 @@ maybe-list would be enormous and would be ignored within a week.
 |---|---|
 | `=` to a name with no binding in any enclosing scope | scope walk |
 | Read of a name declared only inside a trail, used after the block | trail-local rule §6 |
-| `return` inside a trail | §9.6 |
+| Unconsumed return request in a trail or outside a function | §3, §9.6 |
 | a known control atom or builtin left unconsumed without a local loop | §9.6 |
 | Key read on a dict literal that provably lacks the key | local dataflow |
 | Undeclared name used inside a `\(…)` interpolation | token-level resolution |
@@ -1047,7 +1088,7 @@ VS Code Dark+ mapping used in the mock-ups.
 |---|---|---|
 | `keyword.concurrency` | `parallel`, `race`, and every compound built on them — coloured as **one unit** | `#ff8a65` semibold |
 | `punctuation.trail` | `\|\|` | `#ff8a65` @ 55% |
-| `keyword.control` | `if`, `else`, `else if`, `for`, `in`, `while`, `return`, `end`; `exit` / `panic` / `reject` atom names and builtin calls | `#c586c0` |
+| `keyword.control` | `if`, `else`, `else if`, `for`, `in`, `while`, `end`; `return` / `exit` / `panic` / `reject` atom names and builtin calls | `#c586c0` |
 | `keyword.other` | `fn`, `use`, `and`, `or`, `not`, `as` | `#569cd6` |
 | `entity.namespace` | `json::` | `#4ec9b0` |
 | `punctuation.delimiter` | the `:` introducing an atom | `#d4d4d4` |

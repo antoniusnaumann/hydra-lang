@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="description" content="Clocks, sleeping, and timestamp conversion. All durations use seconds.">
+<title>time · Hydra</title>
+<link rel="stylesheet" href="style.css">
+<script src="search-index.js" defer></script>
+<script src="search.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header><div class="header-inner">
+<a class="brand" href="index.html">hydra <span>0.1.0</span></a>
+<span class="header-label">Reference</span>
+<div class="search">
+<label class="sr-only" for="search-input">Search the reference</label>
+<input id="search-input" type="search" placeholder="Search reference" autocomplete="off" spellcheck="false" aria-controls="search-results" aria-expanded="false">
+<kbd aria-hidden="true">/</kbd>
+<div id="search-panel" hidden><p id="search-status" role="status" aria-live="polite"></p><ul id="search-results"></ul></div>
+</div>
+</div></header>
+<div class="layout">
+<aside><nav aria-label="Reference navigation"><a href="index.html">Overview</a><a href="language.html">Language</a><a href="builtins.html">Builtins</a><a href="atoms.html">Atoms &amp; handlers</a>
+<p class="nav-label">Standard modules</p><a href="fs.html"><code>fs</code></a><a href="env.html"><code>env</code></a><a href="text.html"><code>text</code></a><a href="json.html"><code>json</code></a><a href="io.html"><code>io</code></a><a href="time.html" aria-current="page"><code>time</code></a><a href="http.html"><code>http</code></a>
+</nav><nav class="on-page" aria-label="On this page"><p class="nav-label">On this page</p><a href="#section-clocks">Clocks</a><a href="#now">now</a><a href="#monotonic">monotonic</a><a href="#sleep">sleep</a><a href="#section-dates">Dates</a><a href="#parse">parse</a><a href="#format">format</a></nav></aside>
+<main id="main"><div class="page-title"><h1>time</h1></div>
+<p class="intro">Clocks, sleeping, and timestamp conversion. All durations use seconds.</p>
+<p class="note">use time, then <code>time::name(...)</code>. Imports support aliases and <code>as *</code>.</p><p>Use <code>now</code> for timestamps and <code>monotonic</code> for elapsed time. Negative timestamps represent dates before 1970.</p><p>Waiting calls run off the scheduler so other trails can progress. Normal trail cancellation lets an in-flight call finish. Each waiting call currently uses an OS helper thread.</p><pre><code><span class="syntax-keyword-other">use</span> <span class="syntax-variable">time</span>
+<span class="syntax-variable">start</span> := <span class="syntax-entity-namespace">time</span>::<span class="syntax-entity-function">monotonic</span>()
+<span class="syntax-entity-namespace">time</span>::<span class="syntax-entity-function">sleep</span> <span class="syntax-constant-numeric">0.01</span>
+<span class="syntax-entity-function">print</span> <span class="syntax-entity-namespace">time</span>::<span class="syntax-entity-function">monotonic</span>() - <span class="syntax-variable">start</span></code></pre><h2 id="section-clocks">Clocks<a class="anchor" href="#section-clocks" aria-label="Link to Clocks">#</a></h2><article class="function" id="now"><h3><code>time::now()</code><a class="anchor" href="#now" aria-label="Link to time::now">#</a></h3><div class="result">→ <code>seconds</code></div><p>Unix timestamp with fractional seconds. The system clock can jump.</p></article><article class="function" id="monotonic"><h3><code>time::monotonic()</code><a class="anchor" href="#monotonic" aria-label="Link to time::monotonic">#</a></h3><div class="result">→ <code>seconds</code></div><p>Elapsed seconds from the host process’s first call. Use differences to measure durations; unrelated to calendar time.</p></article><article class="function" id="sleep"><h3><code>time::sleep(seconds)</code><a class="anchor" href="#sleep" aria-label="Link to time::sleep">#</a></h3><div class="result">→ <code>:null</code></div><p>Wait a finite, nonnegative number of seconds while other trails run. Scheduling can make the actual wait longer.</p></article><h2 id="section-dates">Dates<a class="anchor" href="#section-dates" aria-label="Link to Dates">#</a></h2><article class="function" id="parse"><h3><code>time::parse(text)</code><a class="anchor" href="#parse" aria-label="Link to time::parse">#</a></h3><div class="overload"><code>time::parse(text, fallback)</code></div><div class="result">→ <code>seconds, reason</code></div><p>Parse an RFC 3339 timestamp with an explicit offset or Z. Return Unix seconds; invalid input gives <code>fallback, :invalid</code>, or crashes without a fallback.</p></article><article class="function" id="format"><h3><code>time::format(timestamp, format = &quot;%+&quot;)</code><a class="anchor" href="#format" aria-label="Link to time::format">#</a></h3><div class="result">→ <code>string</code></div><p>Format Unix seconds in UTC using strftime directives such as <code>%Y-%m-%d %H:%M:%S</code>. Default <code>%+</code> produces RFC 3339. Invalid formats or dates crash.</p></article>
+<footer>Hydra 0.1.0 · Reference</footer>
+</main></div>
+</body></html>

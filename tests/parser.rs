@@ -205,9 +205,9 @@ fn control_atoms_and_unreserved_builtin_names() {
     let Stmt::For { body, .. } = &program.body[0] else { panic!("expected for") };
     assert!(matches!(&body[0], Stmt::Expr { expr: Expr::Sym(s), .. } if s.name == "continue"));
     assert!(matches!(&body[1], Stmt::Expr { expr: Expr::Sym(s), .. } if s.name == "break"));
-    assert!(parse("break outer\n", "t.hy").is_err());
-    assert!(parse("break trail\n", "t.hy").is_err());
-    assert!(parse("continue outer\n", "t.hy").is_err());
+    assert_eq!(first_expr("break outer\n"), "(call break outer)");
+    assert_eq!(first_expr("break trail\n"), "(call break trail)");
+    assert_eq!(first_expr("continue outer\n"), "(call continue outer)");
     assert!(parse("fn break()\nreturn :break\nend\nbreak()\n", "t.hy").is_ok());
 }
 
@@ -500,4 +500,45 @@ fn colon_atoms_need_no_blank_line_and_dots_require_receivers() {
         assert!(parse(source, "t.hy").is_err(), "{source}");
     }
     assert!(parse("{\n:key\n: :value\n}", "t.hy").is_ok());
+}
+
+#[test]
+fn calls_without_parentheses_are_outermost_and_comma_separated() {
+    for source in ["add 1, 2", "x := add 1, 2", "x = add 1, 2", "x += add 1, 2"] {
+        assert_eq!(first_expr(source), "(call add 1 2)");
+    }
+    assert_eq!(first_expr("f g(1), width = 2"), "(call f (call g 1) width=2)");
+    assert_eq!(first_expr("f :ready"), "(call f :ready)");
+    assert_eq!(first_expr("f { :name : :value }"), "(call f (dict :name :value))");
+    assert_eq!(first_expr("x.f 1"), "(call (dot x f) 1)");
+    assert_eq!(first_expr("x.mod::f 1"), "(call (dot x mod::f) 1)");
+    assert_eq!(first_expr("&x.push 1"), "(call (dot (& x) push) 1)");
+    assert_eq!(first_expr("f 1,\n2 +\n3"), "(call f 1 (+ 2 3))");
+    for source in ["f g 1", "x := f g 1", "f(g 1)", "[f 1]", "if f 1\nend", "f 1 2"] {
+        assert!(parse(source, "t.hy").is_err(), "{source}");
+    }
+    assert_eq!(first_expr("f"), "f");
+    assert_eq!(first_expr("x := f"), "f");
+    assert_eq!(first_expr("return"), "(call return)");
+    assert_eq!(first_expr("x := return"), "return");
+}
+
+#[test]
+fn whitespace_distinguishes_unary_arguments_and_indexing() {
+    for (source, expected) in [
+        ("f -1", "(call f (- 1))"),
+        ("f - 1", "(- f 1)"),
+        ("f-1", "(- f 1)"),
+        ("f [1]", "(call f (list 1))"),
+        ("f[1]", "(index f 1)"),
+        ("f\n[1]", "(index f 1)"),
+        ("f\n-1", "(- f 1)"),
+        ("f &x", "(call f (& x))"),
+        ("f & x", "(& f x)"),
+        ("f -\n1", "(- f 1)"),
+        ("f ~x", "(call f (~ x))"),
+        ("f not x", "(call f (not x))"),
+    ] {
+        assert_eq!(first_expr(source), expected, "{source}");
+    }
 }

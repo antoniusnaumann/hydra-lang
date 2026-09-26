@@ -109,6 +109,16 @@ is reported against the one that accepted, never resolved around.
 
 ## Process control
 
+Calls can omit parentheses at statement level or on an assignment RHS:
+`print "hello"`, `x := add 1, 2`. Nested calls need them: `print len(items)`.
+`f -1` calls with a negative argument; `f - 1` subtracts. `f [1]` calls with a
+list; `f[1]` indexes. Bare function names are values, so use `f()` for no args.
+
+`return` is an ordinary builtin: `return(1, 2)` constructs `[:return, 1, 2]`.
+Unconsumed, it returns those values from the current function; consumed, it
+stays data. `return` alone means `return()`, and an empty request returns
+`:null`. `return return(value)` forwards a return request through a helper.
+
 `exit(code)` returns `[:exit, code]`; `panic(msg)` returns `[:panic, msg]`.
 Consumed lists stay data. Unconsumed lists stop the program: exit returns the
 requested status (integer 0–255, default 0), while panic reports its message

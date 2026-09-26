@@ -9,6 +9,7 @@
 //! keyword. A regex grammar has to work to get that right; here it is what the
 //! lexer already decided.
 
+use crate::ast::Expr;
 use crate::errors::Result;
 use crate::lexer::{tokenize, Tok, Token};
 
@@ -30,8 +31,8 @@ pub const CLASSES: &[(&str, &str, &str)] = &[
 ];
 
 const CONTROL: &[&str] =
-    &["if", "else", "else if", "for", "in", "while", "return", "end"];
-const CONTROL_HANDLERS: &[&str] = &["exit", "panic", "reject"];
+    &["if", "else", "else if", "for", "in", "while", "end"];
+const CONTROL_HANDLERS: &[&str] = &["exit", "panic", "reject", "return"];
 const OTHER: &[&str] = &["fn", "use", "and", "or", "not", "as"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,6 +102,27 @@ pub fn class_of(tok: &Token, prev: Option<&Token>, next: Option<&Token>) -> Opti
 /// LSP semantic tokens.
 pub fn semantic_tokens(src: &str, file: &str) -> Result<Vec<SemanticToken>> {
     let lexed = tokenize(src, file)?;
+    let mut calls = std::collections::HashMap::new();
+    if let Ok(program) = crate::parser::parse(src, file) {
+        program.visit_expressions(&mut |expr| {
+            if let Expr::Call { callee, .. } = expr {
+                // Locate the name within a qualified or dotted callee too.
+                let (name, qualified, pos) = match callee.as_ref() {
+                    Expr::Name { name, pos } => (name, false, *pos),
+                    Expr::Namespace { module, name, pos } => (name, !module.is_empty(), *pos),
+                    Expr::Method { name, pos, .. } => (name, true, *pos),
+                    _ => return,
+                };
+                if let Some(tok) = lexed.tokens.iter().find(|tok| {
+                    (tok.pos.line, tok.pos.col) >= (pos.line, pos.col) && tok.ident() == Some(name.as_str())
+                }) {
+                    calls.insert((tok.pos.line, tok.pos.col), if !qualified && CONTROL_HANDLERS.contains(&name.as_str()) {
+                        "keyword.control"
+                    } else { "entity.function" });
+                }
+            }
+        });
+    }
     let mut out: Vec<SemanticToken> = Vec::new();
     for (i, tok) in lexed.tokens.iter().enumerate() {
         let prev = i.checked_sub(1).map(|j| &lexed.tokens[j]);
@@ -108,7 +130,7 @@ pub fn semantic_tokens(src: &str, file: &str) -> Result<Vec<SemanticToken>> {
         if let Tok::Sym { .. } = &tok.kind {
             out.push(SemanticToken { line: tok.pos.line, col: tok.pos.col, len: 1, class: "punctuation.delimiter" });
             out.push(SemanticToken { line: tok.pos.line, col: tok.pos.col + 1, len: tok.len - 1, class: class_of(tok, prev, next).expect("atom class") });
-        } else if let Some(mut class) = class_of(tok, prev, next) {
+        } else if let Some(mut class) = calls.get(&(tok.pos.line, tok.pos.col)).copied().or_else(|| class_of(tok, prev, next)) {
             if class == "keyword.control" && prev.is_some_and(|t| t.is_op("::"))
                 && i.checked_sub(2).is_some_and(|j| matches!(lexed.tokens[j].kind, Tok::Ident(_))) {
                 class = "entity.function";
@@ -149,14 +171,19 @@ pub fn tmlanguage_json() -> String {
     patterns.push(rule("keyword.other", &format!("\\b({})\\b", OTHER.join("|"))));
 
     patterns.push(rule("punctuation.trail", r"\|\|"));
-    let qualified_control = r"(?<![\w.:])(::)(exit|panic|reject)(?=[ \t]*\()";
+    // Parenthesis-free control calls still use the same scope as return().
+    let command_control = r#"(?<![\w.:])(?:exit|panic|reject|return)(?=[ \t]+(?!and\b|or\b|as\b)[A-Za-z_0-9:\"\[{~]|[ \t]+[-&](?=\S))"#;
+    patterns.push(rule("keyword.control", command_control));
+    patterns.push(rule("keyword.control", r"(?<=^|\|\|)[ \t]*return(?=[ \t]*(?://|$))"));
+
+    let qualified_control = r#"(?<![\w.:])(::)(exit|panic|reject|return)(?=[ \t]*\(|[ \t]+(?!and\b|or\b|as\b)[A-Za-z_0-9:\"\[{~]|[ \t]+[-&](?=\S))"#;
     patterns.push(format!(
         "    {{ \"match\": \"{}\", \"captures\": {{ \"1\": {{ \"name\": \"punctuation.delimiter.hydra\" }}, \"2\": {{ \"name\": \"keyword.control.hydra\" }} }} }}",
         escape_json(qualified_control)
     ));
     patterns.push(rule("punctuation.delimiter", "::"));
-    patterns.push(rule("keyword.control", r"(?<![\w.:])(?:exit|panic|reject)(?=[ \t]*\()"));
-    let control_atom = r#"(:)(\"exit\"|\"panic\"|\"reject\"|(?:exit|panic|reject)(?=$|[\s()\[\]{},:\"]|//|\|\|))(:)?"#;
+    patterns.push(rule("keyword.control", r"(?<![\w.:])(?:exit|panic|reject|return)(?=[ \t]*\()"));
+    let control_atom = r#"(:)(\"exit\"|\"panic\"|\"reject\"|\"return\"|(?:exit|panic|reject|return)(?=$|[\s()\[\]{},:\"]|//|\|\|))(:)?"#;
     patterns.push(format!(
         "    {{ \"match\": \"{}\", \"captures\": {{ \"1\": {{ \"name\": \"punctuation.delimiter.hydra\" }}, \"2\": {{ \"name\": \"keyword.control.hydra\" }}, \"3\": {{ \"name\": \"punctuation.delimiter.hydra\" }} }} }}",
         escape_json(control_atom)
@@ -169,7 +196,7 @@ pub fn tmlanguage_json() -> String {
     ));
     patterns.push(rule("punctuation.delimiter", ":"));
     patterns.push(rule("entity.namespace", "[A-Za-z_][A-Za-z0-9_]*(?=::)"));
-    patterns.push(rule("entity.function", r"[A-Za-z_][A-Za-z0-9_]*(?=\()"));
+    patterns.push(rule("entity.function", r#"[A-Za-z_][A-Za-z0-9_]*(?=\(|[ \t]+(?!and\b|or\b|as\b|in\b)[A-Za-z_0-9:\"\[{~]|[ \t]+[-&](?=\S))"#));
     patterns.push(rule("constant.numeric", r"\b[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?\b"));
     patterns.push(rule("constant", "\\b[A-Z][A-Z0-9_]*\\b"));
     patterns.push(rule("variable", "[A-Za-z_][A-Za-z0-9_]*"));

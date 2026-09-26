@@ -81,7 +81,7 @@ pub enum Expr {
     /// `mod::f(x, a)`.
     Method { obj: Box<Expr>, module: Option<String>, name: String, pos: Pos },
     Index { obj: Box<Expr>, index: Box<Expr>, pos: Pos },
-    Call { callee: Box<Expr>, args: Vec<Arg>, pos: Pos },
+    Call { callee: Box<Expr>, args: Vec<Arg>, pos: Pos, bare: bool },
     /// `-x`, `~x`, `not x`.
     Unary { op: &'static str, operand: Box<Expr>, pos: Pos },
     /// `&lvalue` (§5.1): the caller marks it, never the callee.
@@ -342,13 +342,6 @@ pub enum Stmt {
         pos: Pos,
         end_pos: Pos,
     },
-    /// `return`, `return expr`, or `return a, b` — a function may answer with
-    /// several values, of which the first is the meaningful one and the rest
-    /// are additional information (channels §6.2).
-    Return {
-        values: Vec<Expr>,
-        pos: Pos,
-    },
     Expr {
         expr: Expr,
         pos: Pos,
@@ -368,7 +361,6 @@ impl Stmt {
             | Stmt::Parallel { pos, .. }
             | Stmt::ParallelFor { pos, .. }
             | Stmt::ParallelWhile { pos, .. }
-            | Stmt::Return { pos, .. }
             | Stmt::Expr { pos, .. } => *pos,
         }
     }
@@ -386,4 +378,56 @@ pub struct Program {
 /// `_`, the name a binding site gives a value it does not keep (§8.1).
 pub fn is_discard_name(name: &str) -> bool {
     name == "_"
+}
+
+/// Visit expressions, including nested function bodies, in source-tree order.
+/// Editor support uses this to identify calls without guessing from whitespace.
+impl Program {
+    pub(crate) fn visit_expressions(&self, visitor: &mut dyn FnMut(&Expr)) {
+        fn expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
+            f(e);
+            match e {
+                Expr::Call { callee, args, .. } => {
+                    expr(callee, f);
+                    for arg in args { expr(&arg.value, f); }
+                }
+                Expr::Closure(def) => closure(def, f),
+                Expr::List { items, .. } => for item in items { expr(item, f); },
+                Expr::Dict { entries, .. } => for (key, value) in entries { parts(&key.parts, f); expr(value, f); },
+                Expr::Str { parts: p, .. } => parts(p, f),
+                Expr::Sym(s) => parts(&s.parts, f),
+                Expr::Key { obj, key, .. } => { expr(obj, f); parts(&key.parts, f); }
+                Expr::Method { obj, .. } => expr(obj, f),
+                Expr::Index { obj, index, .. } => { expr(obj, f); expr(index, f); }
+                Expr::Unary { operand, .. } => expr(operand, f),
+                Expr::Ref { target, .. } => expr(target, f),
+                Expr::Binary { left, right, .. } => { expr(left, f); expr(right, f); }
+                _ => {}
+            }
+        }
+        fn parts(ps: &[StrPart], f: &mut dyn FnMut(&Expr)) {
+            for p in ps { if let StrPart::Expr(e) = p { expr(e, f); } }
+        }
+        fn closure(def: &ClosureDef, f: &mut dyn FnMut(&Expr)) {
+            for param in &def.params { if let Some(e) = &param.default { expr(e, f); } }
+            match &def.body { ClosureBody::Expr(e) => expr(e, f), ClosureBody::Block(b) => body(b, f) }
+        }
+        fn body(stmts: &[Stmt], f: &mut dyn FnMut(&Expr)) {
+            for stmt in stmts {
+                match stmt {
+                    Stmt::FnDecl { def, .. } => closure(def, f),
+                    Stmt::Expr { expr: e, .. } | Stmt::Decl { value: e, .. } => expr(e, f),
+                    Stmt::Assign { targets, value, .. } => { for e in targets { expr(e, f); } expr(value, f); }
+                    Stmt::If { branches, .. } => for b in branches {
+                        if let Some(e) = &b.cond { expr(e, f); } body(&b.body, f);
+                    },
+                    Stmt::For { iterable, body: b, .. } | Stmt::ParallelFor { iterable, body: b, .. } => { expr(iterable, f); body(b, f); }
+                    Stmt::While { cond, body: b, .. } | Stmt::ParallelWhile { cond, body: b, .. } => { expr(cond, f); body(b, f); }
+                    Stmt::Parallel { trails, .. } => for trail in trails { body(&trail.body, f); },
+                    _ => {}
+                }
+            }
+        }
+        body(&self.body, visitor);
+    }
 }

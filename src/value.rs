@@ -291,10 +291,52 @@ pub enum Native {
     Receive,
     Channel,
     Reject,
+    Return,
     Break,
     Continue,
     Exit,
     Panic,
+
+    EnvArgs,
+    EnvGet,
+    EnvGetOr,
+    EnvAll,
+    EnvPlatform,
+    TextSplit,
+    TextJoin,
+    TextTrim,
+    TextReplace,
+    TextFind,
+    TextStartsWith,
+    TextEndsWith,
+    TextLower,
+    TextUpper,
+    JsonParse,
+    JsonParseOr,
+    TimeParse,
+    TimeParseOr,
+    JsonStringify,
+    IoRead,
+    IoReadOr,
+    IoReadLine,
+    IoReadLineOr,
+    IoLines,
+    IoLinesOr,
+    IoWrite,
+    IoFlush,
+    IoIsTerminal,
+    TimeNow,
+    TimeMonotonic,
+    TimeSleep,
+    TimeFormat,
+    HttpRequest,
+    HttpRequestOr,
+    HttpGet,
+    HttpGetOr,
+    HttpPost,
+    HttpPostOr,
+    HttpDownload,
+    HttpDownloadOr,
 
     // --- fs (spec/hydra_fs.md) ---------------------------------------------
     FsJoin,
@@ -329,6 +371,47 @@ pub enum Native {
 use PKind::{Default as Def, Plain, Ref, Star, Variadic};
 
 pub const NATIVES: &[Native] = &[
+    Native::EnvArgs,
+    Native::EnvGet,
+    Native::EnvGetOr,
+    Native::EnvAll,
+    Native::EnvPlatform,
+    Native::TextSplit,
+    Native::TextJoin,
+    Native::TextTrim,
+    Native::TextReplace,
+    Native::TextFind,
+    Native::TextStartsWith,
+    Native::TextEndsWith,
+    Native::TextLower,
+    Native::TextUpper,
+    Native::JsonParse,
+    Native::JsonParseOr,
+    Native::TimeParse,
+    Native::TimeParseOr,
+    Native::JsonStringify,
+    Native::IoRead,
+    Native::IoReadOr,
+    Native::IoReadLine,
+    Native::IoReadLineOr,
+    Native::IoLines,
+    Native::IoLinesOr,
+    Native::IoWrite,
+    Native::IoFlush,
+    Native::IoIsTerminal,
+    Native::TimeNow,
+    Native::TimeMonotonic,
+    Native::TimeSleep,
+    Native::TimeFormat,
+    Native::HttpRequest,
+    Native::HttpRequestOr,
+    Native::HttpGet,
+    Native::HttpGetOr,
+    Native::HttpPost,
+    Native::HttpPostOr,
+    Native::HttpDownload,
+    Native::HttpDownloadOr,
+
     Native::Alive,
     Native::Print,
     Native::Has,
@@ -339,6 +422,7 @@ pub const NATIVES: &[Native] = &[
     Native::Receive,
     Native::Channel,
     Native::Reject,
+    Native::Return,
     Native::Break,
     Native::Continue,
     Native::Exit,
@@ -377,7 +461,7 @@ pub const CHANNEL_NATIVES: &[Native] = &[Native::Send, Native::Receive, Native::
 
 /// Modules the interpreter and `check` know without a file. A file of the same
 /// name shadows one, which is why that is discouraged (§7).
-pub const BUILTIN_MODULES: &[&str] = &["fs"];
+pub const BUILTIN_MODULES: &[&str] = &["fs", "env", "text", "json", "io", "time", "http"];
 
 impl Native {
     pub fn info(self) -> &'static NativeInfo {
@@ -392,7 +476,53 @@ impl Native {
             };
         }
         const FS: Option<&str> = Some("fs");
+        const ENV: Option<&str> = Some("env");
+        const TEXT: Option<&str> = Some("text");
+        const JSON: Option<&str> = Some("json");
+        const IO: Option<&str> = Some("io");
+        const TIME: Option<&str> = Some("time");
+        const HTTP: Option<&str> = Some("http");
         match self {
+            Native::EnvArgs => info!(ENV, "args", "args()", &[]),
+            Native::EnvGet => info!(ENV, "get", "get(name)", &[("name", Plain)]),
+            Native::EnvGetOr => info!(ENV, "get", "get(name, fallback)", &[("name", Plain), ("fallback", Plain)]),
+            Native::EnvAll => info!(ENV, "all", "all()", &[]),
+            Native::EnvPlatform => info!(ENV, "platform", "platform()", &[]),
+            Native::TextSplit => info!(TEXT, "split", "split(text, separator = :null)", &[("text", Plain), ("separator", Def)]),
+            Native::TextJoin => info!(TEXT, "join", "join(parts, separator = \"\")", &[("parts", Plain), ("separator", Def)]),
+            Native::TextTrim => info!(TEXT, "trim", "trim(text)", &[("text", Plain)]),
+            Native::TextReplace => info!(TEXT, "replace", "replace(text, from, to)", &[("text", Plain), ("from", Plain), ("to", Plain)]),
+            Native::TextFind => info!(TEXT, "find", "find(text, needle)", &[("text", Plain), ("needle", Plain)]),
+            Native::TextStartsWith => info!(TEXT, "starts_with", "starts_with(text, prefix)", &[("text", Plain), ("prefix", Plain)]),
+            Native::TextEndsWith => info!(TEXT, "ends_with", "ends_with(text, suffix)", &[("text", Plain), ("suffix", Plain)]),
+            Native::TextLower => info!(TEXT, "lower", "lower(text)", &[("text", Plain)]),
+            Native::TextUpper => info!(TEXT, "upper", "upper(text)", &[("text", Plain)]),
+            Native::JsonParse => info!(JSON, "parse", "parse(text)", &[("text", Plain)]),
+            Native::JsonParseOr => info!(JSON, "parse", "parse(text, fallback)", &[("text", Plain), ("fallback", Plain)]),
+            Native::TimeParse => info!(TIME, "parse", "parse(text)", &[("text", Plain)]),
+            Native::TimeParseOr => info!(TIME, "parse", "parse(text, fallback)", &[("text", Plain), ("fallback", Plain)]),
+            Native::JsonStringify => info!(JSON, "stringify", "stringify(value, *, pretty = :false)", &[("value", Plain), ("", Star), ("pretty", Def)]),
+            Native::IoRead => info!(IO, "read", "read(*, stream = :stdin)", &[("", Star), ("stream", Def)]),
+            Native::IoReadOr => info!(IO, "read", "read(fallback, *, stream = :stdin)", &[("fallback", Plain), ("", Star), ("stream", Def)]),
+            Native::IoReadLine => info!(IO, "read_line", "read_line(*, stream = :stdin)", &[("", Star), ("stream", Def)]),
+            Native::IoReadLineOr => info!(IO, "read_line", "read_line(fallback, *, stream = :stdin)", &[("fallback", Plain), ("", Star), ("stream", Def)]),
+            Native::IoLines => info!(IO, "lines", "lines(*, stream = :stdin)", &[("", Star), ("stream", Def)]),
+            Native::IoLinesOr => info!(IO, "lines", "lines(fallback, *, stream = :stdin)", &[("fallback", Plain), ("", Star), ("stream", Def)]),
+            Native::IoWrite => info!(IO, "write", "write(value, *, stream = :stdout)", &[("value", Plain), ("", Star), ("stream", Def)]),
+            Native::IoFlush => info!(IO, "flush", "flush(stream = :stdout)", &[("stream", Def)]),
+            Native::IoIsTerminal => info!(IO, "is_terminal", "is_terminal(stream = :stdout)", &[("stream", Def)]),
+            Native::TimeNow => info!(TIME, "now", "now()", &[]),
+            Native::TimeMonotonic => info!(TIME, "monotonic", "monotonic()", &[]),
+            Native::TimeSleep => info!(TIME, "sleep", "sleep(seconds)", &[("seconds", Plain)]),
+            Native::TimeFormat => info!(TIME, "format", "format(timestamp, format = \"%+\")", &[("timestamp", Plain), ("format", Def)]),
+            Native::HttpRequest => info!(HTTP, "request", "request(method, url, *, body = :null, headers = {}, timeout = 30, max_bytes = 16777216)", &[("method", Plain), ("url", Plain), ("", Star), ("body", Def), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
+            Native::HttpRequestOr => info!(HTTP, "request", "request(method, url, fallback, *, body = :null, headers = {}, timeout = 30, max_bytes = 16777216)", &[("method", Plain), ("url", Plain), ("fallback", Plain), ("", Star), ("body", Def), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
+            Native::HttpGet => info!(HTTP, "get", "get(url, *, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("", Star), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
+            Native::HttpGetOr => info!(HTTP, "get", "get(url, fallback, *, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("fallback", Plain), ("", Star), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
+            Native::HttpPost => info!(HTTP, "post", "post(url, body, *, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("body", Plain), ("", Star), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
+            Native::HttpPostOr => info!(HTTP, "post", "post(url, body, fallback, *, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("body", Plain), ("fallback", Plain), ("", Star), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
+            Native::HttpDownload => info!(HTTP, "download", "download(url, path, *, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("path", Plain), ("", Star), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
+            Native::HttpDownloadOr => info!(HTTP, "download", "download(url, path, fallback, *, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("path", Plain), ("fallback", Plain), ("", Star), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
             Native::Alive => info!(None, "alive", "alive()", &[]),
             // Not `end`: that keyword closes every block, so it can never be a
             // name. `terminator` follows Swift's print (hydra_stdlib.md §2).
@@ -425,6 +555,7 @@ impl Native {
             Native::Receive => info!(None, "receive", "receive(from*)", &[("from", Variadic)]),
             Native::Channel => info!(None, "channel", "channel()", &[]),
             // `reject(msg)` constructs one tagged list: [:reject, msg].
+            Native::Return => info!(None, "return", "return(values*)", &[("values", Variadic)]),
             Native::Break => info!(None, "break", "break()", &[]),
             Native::Continue => info!(None, "continue", "continue()", &[]),
             Native::Exit => info!(None, "exit", "exit(code = 0)", &[("code", Def)]),
@@ -649,6 +780,26 @@ impl Native {
     /// sent the value (channels §1).
     pub fn returns(self) -> usize {
         match self {
+            Native::EnvGet |
+            Native::EnvGetOr |
+            Native::JsonParse |
+            Native::JsonParseOr |
+            Native::TimeParse |
+            Native::TimeParseOr |
+            Native::IoRead |
+            Native::IoReadOr |
+            Native::IoReadLine |
+            Native::IoReadLineOr |
+            Native::IoLines |
+            Native::IoLinesOr |
+            Native::HttpRequest |
+            Native::HttpRequestOr |
+            Native::HttpGet |
+            Native::HttpGetOr |
+            Native::HttpPost |
+            Native::HttpPostOr |
+            Native::HttpDownload |
+            Native::HttpDownloadOr |
             Native::Receive
             | Native::FsSizeOr
             | Native::FsModifiedOr

@@ -22,7 +22,7 @@ use crate::errors::{HydraError, Pos, Result};
 
 /// Keywords (§2). Loop control uses ordinary atoms.
 pub const KEYWORDS: &[&str] = &[
-    "fn", "use", "if", "else", "for", "in", "while", "return", "end", "and",
+    "fn", "use", "if", "else", "for", "in", "while", "end", "and",
     "or", "not", "parallel", "race", "as",
 ];
 
@@ -546,12 +546,9 @@ impl<'a> Lexer<'a> {
     /// expression-leading position. After an atom it is the dict separator,
     /// so even `{:key::value}` remains an unambiguous compact dict.
     fn colon(&mut self, pos: Pos, prev: Option<&Token>) -> Result<Token> {
-        let after_value = match prev.map(|t| &t.kind) {
-            Some(Tok::Ident(_)) | Some(Tok::Num { .. }) | Some(Tok::Str { .. })
-            | Some(Tok::Sym { .. }) => true,
-            Some(Tok::Op(o)) => matches!(*o, ")" | "]" | "}"),
-            _ => false,
-        };
+        // Dict keys are atoms. A name or indexed callee followed by an atom
+        // may instead be a parenthesis-free call: `print :ready`.
+        let after_value = matches!(prev.map(|t| &t.kind), Some(Tok::Sym { .. }));
         self.bump();
         if after_value {
             return Ok(Token::new(Tok::Op(":"), pos));

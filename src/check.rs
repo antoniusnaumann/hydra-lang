@@ -136,6 +136,18 @@ impl Signature {
     }
 }
 
+/// Statically visible payload of a return request.
+fn returned_values(expr: &Expr) -> Option<Vec<&Expr>> {
+    match expr {
+        Expr::Call { callee, args, .. } if matches!(called_name(callee), Some((None, "return"))) => {
+            Some(args.iter().map(|arg| &arg.value).collect())
+        }
+        Expr::List { items, .. } if matches!(items.first(), Some(Expr::Sym(s)) if s.is_static() && s.name == "return") => Some(items[1..].iter().collect()),
+        Expr::Sym(s) if s.is_static() && s.name == "return" => Some(Vec::new()),
+        _ => None,
+    }
+}
+
 /// The most values a call to this function can answer with. Falling off the
 /// end answers with one — `:null` — so it is never fewer than that, and §11's
 /// rule means only a name that is *guaranteed* to have nothing behind it is
@@ -146,11 +158,21 @@ fn returns_of(def: &ClosureDef) -> usize {
         ClosureBody::Block(body) => body,
     };
     let mut most = 1;
-    walk_stmts(body, &mut |stmt| {
-        if let Stmt::Return { values, .. } = stmt {
-            most = most.max(values.len());
+    fn visit(body: &[Stmt], most: &mut usize) {
+        for stmt in body {
+            if let Stmt::Expr { expr, .. } = stmt {
+                if let Some(values) = returned_values(expr) {
+                    *most = (*most).max(values.len());
+                } else if !matches!(expr, Expr::Num { .. } | Expr::Str { .. } | Expr::Sym(_) | Expr::Dict { .. }) {
+                    // A helper or stored value can supply a return request of
+                    // unknown length. Do not diagnose missing outputs then.
+                    *most = usize::MAX;
+                }
+            }
+            for inner in own_bodies(stmt) { visit(inner, most); }
         }
-    });
+    }
+    visit(body, &mut most);
     most
 }
 
@@ -371,7 +393,7 @@ impl<'a> Checker<'a> {
                         }
                     }
                 }
-                Stmt::Expr { .. } | Stmt::Return { .. } => {
+                Stmt::Expr { .. } => {
                     if let Some((surely, at)) = self.rejects_here(stmt) {
                         if let Some((written, _)) = wrote.clone() {
                             let how = if by_ref.contains(&written) {
@@ -414,9 +436,10 @@ impl<'a> Checker<'a> {
     fn rejects_here(&self, stmt: &Stmt) -> Option<(bool, Pos)> {
         let (expr, pos) = match stmt {
             Stmt::Expr { expr, pos } => (expr, *pos),
-            Stmt::Return { values, pos } => (values.first()?, *pos),
             _ => return None,
         };
+        let returned = returned_values(expr);
+        let expr = returned.as_ref().and_then(|values| values.first().copied()).unwrap_or(expr);
         if self.explicit_reject(expr) {
             return Some((true, pos));
         }
@@ -770,19 +793,6 @@ impl<'a> Checker<'a> {
                 self.unconsumed_control(expr, *pos);
                 self.expr(expr);
             }
-            Stmt::Return { values, pos } => {
-                if self.trail_depth > 0 {
-                    self.error(
-                        "`return` inside a trail is not allowed; \
-                         a value has nowhere to return to",
-                        *pos,
-                        "return-in-trail",
-                    );
-                }
-                for value in values {
-                    self.expr(value);
-                }
-            }
             Stmt::If { branches, .. } => {
                 for branch in branches {
                     if let Some(cond) = &branch.cond {
@@ -1030,7 +1040,7 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            Expr::Call { callee, args, pos } => {
+            Expr::Call { callee, args, pos, .. } => {
                 self.expr(callee);
                 for arg in args {
                     self.expr(&arg.value);
@@ -1217,6 +1227,15 @@ impl<'a> Checker<'a> {
             },
             _ => None,
         };
+        let is_return = name == Some("return") || matches!(expr,
+            Expr::List { items, .. } if matches!(items.first(), Some(Expr::Sym(s)) if s.is_static() && s.name == "return"));
+        if is_return {
+            if self.trail_depth > 0 {
+                self.error("unconsumed :return inside a trail has no current function to return from", pos, "return-in-trail");
+            } else if self.fn_depth == 0 {
+                self.error("unconsumed :return has no current function to return from", pos, "return-outside-function");
+            }
+        }
         if let Some(name @ ("break" | "continue")) = name {
             let has_loop = self.labels.iter().rev()
                 .take_while(|label| label.kind != LabelKind::Trail)
@@ -1735,10 +1754,10 @@ impl Rejecting {
     fn body_can(&self, body: &[Stmt], assume: bool) -> bool {
         body.iter().any(|stmt| {
             let here = match stmt {
-                Stmt::Expr { expr, .. } => self.yields(expr, assume),
-                Stmt::Return { values, .. } => {
-                    values.first().is_some_and(|value| self.yields(value, assume))
-                }
+                Stmt::Expr { expr, .. } => match returned_values(expr) {
+                    Some(values) => values.first().is_some_and(|value| self.yields(value, assume)),
+                    None => self.yields(expr, assume),
+                },
                 _ => false,
             };
             here || own_bodies(stmt).into_iter().any(|inner| self.body_can(inner, assume))
@@ -1845,11 +1864,6 @@ fn walk_stmt_exprs(stmt: &Stmt, f: &mut impl FnMut(&Expr)) {
             f(value);
         }
         Stmt::Expr { expr, .. } => f(expr),
-        Stmt::Return { values, .. } => {
-            for value in values {
-                f(value);
-            }
-        }
         Stmt::If { branches, .. } => {
             for branch in branches {
                 if let Some(cond) = &branch.cond {

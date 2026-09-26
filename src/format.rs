@@ -40,6 +40,7 @@ pub fn format_source(src: &str, file: &str) -> Result<String> {
         indent: vec![0; (line_count + 2) as usize],
         rows: HashMap::new(),
         statement_starts: HashSet::new(),
+        command_arguments: HashSet::new(),
     };
     f.statements(&program.body, 0);
 
@@ -64,7 +65,7 @@ pub fn format_source(src: &str, file: &str) -> Result<String> {
         let text = match f.rows.get(&line) {
             Some(row) => row.clone(),
             None => match lines.get(&line) {
-                Some(tokens) => render(tokens),
+                Some(tokens) => render_with_commands(tokens, &f.command_arguments),
                 None => String::new(),
             },
         };
@@ -107,6 +108,7 @@ struct Formatter {
     rows: HashMap<u32, String>,
     /// Lines starting independent statements or branches, safe to separate.
     statement_starts: HashSet<u32>,
+    command_arguments: HashSet<(u32, u32)>,
 }
 
 impl Formatter {
@@ -180,10 +182,10 @@ impl Formatter {
             Stmt::Parallel { trails, rows, pos, end_pos, .. } => {
                 self.fill(pos.line + 1, end_pos.line.saturating_sub(1), depth + 1);
                 for trail in trails {
-                    // A cell's own statements are rendered as part of its cell
-                    // text, so they get no line of their own.
-                    let _ = trail;
+                    self.statements(&trail.body, depth + 1);
                 }
+                // Rows share physical indentation, even when a cell nests.
+                self.fill(pos.line + 1, end_pos.line.saturating_sub(1), depth + 1);
                 self.set(end_pos.line, depth);
                 self.pad_rows(rows);
             }
@@ -195,11 +197,6 @@ impl Formatter {
                 self.expr(value, depth);
             }
             Stmt::Expr { expr, .. } => self.expr(expr, depth),
-            Stmt::Return { values, .. } => {
-                for value in values {
-                    self.expr(value, depth);
-                }
-            }
             _ => {}
         }
     }
@@ -238,7 +235,12 @@ impl Formatter {
                 self.expr(obj, depth);
                 self.expr(index, depth);
             }
-            Expr::Call { callee, args, .. } => {
+            Expr::Call { callee, args, bare, .. } => {
+                if *bare {
+                    if let Some(arg) = args.first() {
+                        self.command_arguments.insert((arg.pos.line, arg.pos.col));
+                    }
+                }
                 self.expr(callee, depth);
                 for arg in args {
                     self.expr(&arg.value, depth);
@@ -260,7 +262,7 @@ impl Formatter {
         let mut rendered: Vec<(u32, Vec<String>)> = Vec::new();
         let mut widths: Vec<usize> = Vec::new();
         for row in rows {
-            let cells: Vec<String> = row.cells.iter().map(|c| render(&c.tokens)).collect();
+            let cells: Vec<String> = row.cells.iter().map(|c| render_with_commands(&c.tokens, &self.command_arguments)).collect();
             for (i, cell) in cells.iter().enumerate() {
                 let width = cell.chars().count();
                 match widths.get_mut(i) {
@@ -332,11 +334,21 @@ fn mark_prefixes(tokens: &[Token]) -> Vec<bool> {
 }
 
 fn render(tokens: &[Token]) -> String {
-    let prefix = mark_prefixes(tokens);
+    render_with_commands(tokens, &HashSet::new())
+}
+
+fn render_with_commands(tokens: &[Token], commands: &HashSet<(u32, u32)>) -> String {
+    let mut prefix = mark_prefixes(tokens);
+    for (i, tok) in tokens.iter().enumerate() {
+        if commands.contains(&(tok.pos.line, tok.pos.col)) && matches!(tok.kind, Tok::Op("-" | "~" | "&")) {
+            prefix[i] = true;
+        }
+    }
     let variadic = mark_variadic_stars(tokens);
     let mut out = String::new();
     for (i, tok) in tokens.iter().enumerate() {
-        if i > 0 && !variadic[i] && needs_space(&tokens[i - 1], tok, prefix[i - 1]) {
+        if i > 0 && !variadic[i] && (commands.contains(&(tok.pos.line, tok.pos.col))
+            || needs_space(&tokens[i - 1], tok, prefix[i - 1])) {
             out.push(' ');
         }
         out.push_str(&text_of(tok, i.checked_sub(1).map(|j| &tokens[j]), tokens.get(i + 1)));

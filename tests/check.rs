@@ -261,11 +261,12 @@ fn forward_references_between_functions_are_fine() {
 
 #[test]
 fn a_name_two_used_modules_both_export() {
-    // Silent shadowing is the failure mode that reaches production (§11).
-    assert_eq!(warnings("use http as *\nuse json as *\n"), vec!["ambiguous-import"]);
-    assert!(warnings("use json as *\n").is_empty());
+    // Local fixture modules intentionally shadow the standard modules; both
+    // that and their overlapping exports remain visible (§11).
+    assert_eq!(warnings("use http as *\nuse json as *\n"), vec!["shadowed-builtin-module", "shadowed-builtin-module", "ambiguous-import"]);
+    assert_eq!(warnings("use json as *\n"), vec!["shadowed-builtin-module"]);
     // Only `as *` binds names unqualified, so only `as *` can collide (§7).
-    assert!(warnings("use http\nuse json\n").is_empty());
+    assert_eq!(warnings("use http\nuse json\n"), vec!["shadowed-builtin-module", "shadowed-builtin-module"]);
 }
 
 #[test]
@@ -302,7 +303,7 @@ fn a_reference_crossing_into_a_trail() {
 
 #[test]
 fn the_reference_program_reports_no_errors() {
-    // §14's program imports `fmt`, `http` and `json`, which do not exist, so
+    // §14's program still imports the unavailable `fmt` module, so
     // name resolution switches off and the placeholders it calls cannot be
     // called guaranteed-crashes. What is left is warnings.
     let src = std::fs::read_to_string("examples/deploy.hy").expect("example");
@@ -320,11 +321,11 @@ fn externs_stand_in_for_the_missing_standard_library() {
     // `print` is a builtin now, so the placeholder here is one that is not.
     let src = "use json\nbody := read_file(\"x\")\nprint(json::decode(body))\n";
     let program = parse(src, "tests/fixtures/t.hy").expect("parses");
-    assert_eq!(check_program(&program, &options()).codes(), vec!["undeclared-name"]);
+    assert_eq!(check_program(&program, &options()).codes(), vec!["shadowed-builtin-module", "undeclared-name"]);
 
     let with_extern =
         CheckOptions { externs: vec!["read_file".into()], search_path: Vec::new() };
-    assert!(check_program(&program, &with_extern).codes().is_empty());
+    assert_eq!(check_program(&program, &with_extern).codes(), vec!["shadowed-builtin-module"]);
 }
 
 #[test]
@@ -471,4 +472,11 @@ fn a_reader_that_did_not_fall_back_answers_with_one_value() {
         codes("use fs\ntext, why := fs::read(\"a\")\n"),
         vec!["too-many-values-named"]
     );
+}
+
+#[test]
+fn dynamic_return_requests_do_not_claim_a_fixed_result_count() {
+    assert_eq!(codes("fn request()\nreturn [:return, 1, 2]\nend\nfn pair()\nrequest()\nend\na, b := pair()\n"), Vec::<&str>::new());
+    assert_eq!(codes("x := return 1\n_ = x\n"), Vec::<&str>::new());
+    assert_eq!(codes("return 1\n"), vec!["return-outside-function"]);
 }

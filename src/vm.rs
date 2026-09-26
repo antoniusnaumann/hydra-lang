@@ -60,6 +60,8 @@ pub struct Options {
     /// reproducible interleaving, which is what the schedule-asserting tests do.
     pub threads: usize,
     pub search_path: Vec<PathBuf>,
+    /// Arguments after `--` on the command line; excludes the script name.
+    pub script_args: Vec<String>,
 }
 
 impl Default for Options {
@@ -69,7 +71,7 @@ impl Default for Options {
             .unwrap_or_default();
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
         let step_budget = if threads > 1 { 64 } else { 1 };
-        Options { strict: false, report_dead_crashes: true, step_budget, threads, search_path }
+        Options { strict: false, report_dead_crashes: true, step_budget, threads, search_path, script_args: Vec::new() }
     }
 }
 
@@ -125,16 +127,17 @@ struct Sched {
     wakes: HashSet<TaskId>,
     /// What a parked channel call was answered with, waiting for the task to be
     /// stepped again (channels §6.5).
-    deliveries: HashMap<TaskId, Vec<Value>>,
+    deliveries: HashMap<TaskId, Result<Vec<Value>, Crash>>,
+    pending_io: usize,
 }
 
 pub struct Vm {
     pub options: Options,
     modules: RwLock<Vec<Arc<ModuleRt>>>,
     module_by_path: Mutex<HashMap<PathBuf, usize>>,
-    sched: Mutex<Sched>,
+    sched: Arc<Mutex<Sched>>,
     /// Woken when a task becomes ready or the last one finishes.
-    wake: Condvar,
+    wake: Arc<Condvar>,
     root_cancel: Arc<CancelFlag>,
     /// The first crash in a live trail: it ends the program (§8).
     crash: Mutex<Option<Crash>>,
@@ -172,8 +175,8 @@ impl Vm {
             options,
             modules: RwLock::new(Vec::new()),
             module_by_path: Mutex::new(HashMap::new()),
-            sched: Mutex::new(Sched::default()),
-            wake: Condvar::new(),
+            sched: Arc::new(Mutex::new(Sched::default())),
+            wake: Arc::new(Condvar::new()),
             root_cancel: CancelFlag::root(),
             crash: Mutex::new(None),
             exit_code: Mutex::new(None),
@@ -310,7 +313,7 @@ impl Vm {
                         },
                         // Nothing ready and nothing running means nothing can
                         // become ready: the program is over for every worker.
-                        None if sched.running == 0 => {
+                        None if sched.running == 0 && (sched.pending_io == 0 || self.terminated.load(Ordering::Acquire)) => {
                             self.wake.notify_all();
                             return;
                         }
@@ -361,6 +364,7 @@ impl Vm {
         // A parked channel call left its answer here; the instruction that
         // asked for it is already behind us (channels §6.5).
         if let Some(values) = task.delivery.take() {
+            let values = values.map_err(|crash| self.decorate(task, crash))?;
             let mut answered = values.into_iter();
             let value = answered.next().unwrap_or_else(Value::null);
             task.extras = answered.collect();
@@ -473,6 +477,26 @@ impl Vm {
                     if task.cancel.is_cancelled() { return Err(crash); }
                     self.terminate(None, Some(self.decorate(task, crash)));
                     return Ok(Flow::Stop);
+                }
+                let returned = match &first {
+                    Value::Sym(tag) if tag.name() == "return" => Some(Vec::new()),
+                    Value::List(list) => {
+                        let list = list.read().unwrap_or_else(|e| e.into_inner());
+                        if matches!(list.items.first(), Some(Value::Sym(tag)) if tag.name() == "return") {
+                            Some(list.items[1..].to_vec())
+                        } else { None }
+                    }
+                    _ => None,
+                };
+                if let Some(values) = returned {
+                    // Release the request's lock before copying its payload;
+                    // a payload may itself refer back to the request.
+                    let mut values: Vec<_> = values.iter().map(copy_value).collect();
+                    if *at != Unconsumed::Function {
+                        return Err(Crash::new("unhandled :return: no current function to return from; a trail cannot return from its enclosing function"));
+                    }
+                    if values.is_empty() { values.push(Value::null()); }
+                    return self.pop_frame(task, values);
                 }
                 if is_reject(&first) {
                     let mut values = Vec::with_capacity(1 + extras.len());
@@ -1088,6 +1112,13 @@ impl Vm {
                 let out = match native {
                     // Control builtins construct ordinary values; their consumers
                     // decide whether to invoke a handler.
+                    Native::Return => {
+                        let values = bound.into_iter().next().flatten().expect("variadic values");
+                        let Value::List(values) = values else { unreachable!("bound variadic list") };
+                        let mut tagged = vec![Value::Sym(sym("return"))];
+                        tagged.extend(values.read().unwrap_or_else(|e| e.into_inner()).items.iter().map(copy_value));
+                        NativeOut::Values(vec![new_list(tagged)])
+                    }
                     Native::Break => NativeOut::Values(vec![Value::Sym(sym("break"))]),
                     Native::Continue => NativeOut::Values(vec![Value::Sym(sym("continue"))]),
                     Native::Exit => {
@@ -1108,6 +1139,7 @@ impl Vm {
                         let (_, me) = self.in_trail(task, "channel")?;
                         NativeOut::Values(vec![index_of(me)])
                     }
+                    other if crate::stdlib::blocking(other) => self.blocking_native(task.id, other, bound)?,
                     other => NativeOut::Values(self.native(task, other, bound)?),
                 };
                 match out {
@@ -1179,8 +1211,39 @@ impl Vm {
                 Ok(vec![Value::Num(len as f64)])
             }
             // A module's builtins live with the module (spec/hydra_fs.md).
-            other => crate::fs::call(other, &args),
+            other if other.module() == Some("fs") => crate::fs::call(other, &args),
+            other => crate::stdlib::call(other, &args, &self.options.script_args),
         }
+    }
+
+    /// Offload waits without occupying one of the VM's scheduler workers.
+    /// Normal trail cancellation retains the language's finish-the-call rule.
+    fn blocking_native(&self, id: TaskId, native: Native, args: Vec<Option<Value>>) -> Result<NativeOut, Crash> {
+        let args = args.into_iter().map(|v| v.map(|v| deref(&v).map(|v| copy_value(&v))).transpose()).collect::<Result<Vec<_>,_>>()?;
+        let sched = self.sched.clone();
+        let wake = self.wake.clone();
+        self.sched.lock().unwrap_or_else(|e| e.into_inner()).pending_io += 1;
+        let spawn = std::thread::Builder::new().name("hydra-io".into()).spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::stdlib::call(native, &args, &[])))
+                .unwrap_or_else(|_| Err(Crash::new("standard module worker panicked")));
+            let mut sched = sched.lock().unwrap_or_else(|e| e.into_inner());
+            sched.pending_io -= 1;
+            sched.deliveries.insert(id, result);
+            match sched.tasks.get_mut(&id) {
+                Some(task) if task.state == TaskState::Blocked => {
+                    task.state = TaskState::Ready;
+                    sched.ready.push_back(id);
+                }
+                _ => { sched.wakes.insert(id); }
+            }
+            drop(sched);
+            wake.notify_all();
+        });
+        if let Err(error) = spawn {
+            self.sched.lock().unwrap_or_else(|e| e.into_inner()).pending_io -= 1;
+            return Err(Crash::new(format!("cannot start I/O worker: {error}")));
+        }
+        Ok(NativeOut::Blocked)
     }
 
     // --- auto-channels (spec/hydra_channels.md) ------------------------------
@@ -2230,7 +2293,7 @@ fn cancel_waiter(block: &mut BlockCtx, id: TaskId) -> Vec<(TaskId, Vec<Value>)> 
 /// same race the block join has.
 fn deliver_all(sched: &mut Sched, deliveries: Vec<(TaskId, Vec<Value>)>) {
     for (id, values) in deliveries {
-        sched.deliveries.insert(id, values);
+        sched.deliveries.insert(id, Ok(values));
         match sched.tasks.get_mut(&id) {
             Some(task) if task.state == TaskState::Blocked => {
                 task.state = TaskState::Ready;

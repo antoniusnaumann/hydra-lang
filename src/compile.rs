@@ -239,7 +239,7 @@ pub struct Compiler {
     loops: Vec<LoopCtx>,
     scope_depth: usize,
     iter_depth: usize,
-    /// True while compiling a trail body, so `return` can be rejected (§9.6).
+    /// True in a trail body, which has no function return handler (§9.6).
     in_trail: bool,
     /// True inside a function body, trails of its blocks included: that is
     /// where an unconsumed `:reject` has a call to hand back (§8.1).
@@ -409,20 +409,6 @@ impl Compiler {
                 self.handle_loop_signals(pos)?;
                 let spread = matches!(expr, Expr::Call { .. });
                 self.emit(Instr::Unconsumed { spread, at }, pos);
-            }
-            Stmt::Return { values, pos } => {
-                if self.in_trail {
-                    // §9.6: `check` rejects this too, with a better message.
-                    return self.err("`return` inside a trail is not allowed", *pos);
-                }
-                if values.is_empty() {
-                    self.emit(Instr::ReturnNull, *pos);
-                } else {
-                    for value in values {
-                        self.expr(value)?;
-                    }
-                    self.emit(Instr::Return(values.len()), *pos);
-                }
             }
             Stmt::If { branches, pos, end_pos } => self.compile_if(branches, *pos, *end_pos)?,
             Stmt::While { cond, body, pos, .. } => {
@@ -703,7 +689,7 @@ impl Compiler {
                 self.expr(index)?;
                 self.emit(Instr::GetMember, *pos);
             }
-            Expr::Call { callee, args, pos } => {
+            Expr::Call { callee, args, pos, .. } => {
                 let names: Arc<Vec<Arc<str>>> = Arc::new(
                     args.iter().filter_map(|a| a.name.as_deref().map(Arc::from)).collect(),
                 );

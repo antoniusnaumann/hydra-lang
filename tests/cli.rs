@@ -54,6 +54,8 @@ fn print_ends_with_a_newline_unless_told_otherwise() {
 #[test]
 fn commented_continuation_fixtures_run_as_documented() {
     for (file, expected) in [
+        ("tests/fixtures/standard/modules.hy", "hello Hydra\n:true\n:invalid\n1970-01-01\nfriend\n"),
+        ("tests/fixtures/parenthesis_free_calls.hy", "22\n2\n42\n[:return, :ready]\n"),
         ("tests/fixtures/loop_control.hy", "4\n:break\nHydra\n4\ndone\n"),
         ("tests/fixtures/continuations.hy", "42\n30\n4\n20\n30\n7\n"),
         ("tests/fixtures/continuation_boundaries.hy", "32\n-2\n:bar\n1\n:reject\n[:reject, :null]\n"),
@@ -123,8 +125,7 @@ fn check_takes_the_hosts_names() {
 
 #[test]
 fn an_unresolvable_module_downgrades_name_resolution_to_a_warning() {
-    // The spec's reference program imports `fmt`, `http` and `json`, none of
-    // which exist. Guessing at the names they would export would break §11's
+    // The spec's reference program still imports the unavailable `fmt` module. Guessing at the names they would export would break §11's
     // "only what is guaranteed" rule, so check says so and stops guessing.
     let out = hydra(&["check", "examples/deploy.hy"]);
     assert!(out.status.success(), "{}", stderr(&out));

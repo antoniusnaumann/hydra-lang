@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="description" content="The rules you need to read and write Hydra.">
+<title>Language · Hydra</title>
+<link rel="stylesheet" href="style.css">
+<script src="search-index.js" defer></script>
+<script src="search.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header><div class="header-inner">
+<a class="brand" href="index.html">hydra <span>0.1.0</span></a>
+<span class="header-label">Reference</span>
+<div class="search">
+<label class="sr-only" for="search-input">Search the reference</label>
+<input id="search-input" type="search" placeholder="Search reference" autocomplete="off" spellcheck="false" aria-controls="search-results" aria-expanded="false">
+<kbd aria-hidden="true">/</kbd>
+<div id="search-panel" hidden><p id="search-status" role="status" aria-live="polite"></p><ul id="search-results"></ul></div>
+</div>
+</div></header>
+<div class="layout">
+<aside><nav aria-label="Reference navigation"><a href="index.html">Overview</a><a href="language.html" aria-current="page">Language</a><a href="builtins.html">Builtins</a><a href="atoms.html">Atoms &amp; handlers</a>
+<p class="nav-label">Standard modules</p><a href="fs.html"><code>fs</code></a><a href="env.html"><code>env</code></a><a href="text.html"><code>text</code></a><a href="json.html"><code>json</code></a><a href="io.html"><code>io</code></a><a href="time.html"><code>time</code></a><a href="http.html"><code>http</code></a>
+</nav><nav class="on-page" aria-label="On this page"><p class="nav-label">On this page</p><a href="#bindings">Bindings &amp; values</a><a href="#calls">Calls</a><a href="#spacing">Significant spacing</a><a href="#continuation">Continuation</a><a href="#functions">Functions &amp; results</a><a href="#handlers">Control values</a><a href="#overloads">Overloads &amp; rejection</a><a href="#modules">Modules</a><a href="#loops">Branches &amp; loops</a><a href="#trails">Parallel trails</a><a href="#atoms">Atoms &amp; strings</a></nav></aside>
+<main id="main"><div class="page-title"><h1>Language</h1></div>
+<p class="intro">The rules you need to read and write Hydra.</p>
+<h2 id="bindings">Bindings &amp; values<a class="anchor" href="#bindings" aria-label="Link to Bindings &amp; values">#</a></h2><p><code>:=</code> declares; <code>=</code> assigns; <code>_ = expression</code> explicitly discards a result. Lists and dicts copy by value. Use <code>&amp;place</code> to pass a reference; mutations through it reach the caller.</p><pre><code><span class="syntax-variable">name</span> := <span class="syntax-string">&quot;Hydra&quot;</span>
+<span class="syntax-variable">user</span> := { <span class="syntax-punctuation-delimiter">:</span><span class="syntax-constant">name</span> : <span class="syntax-variable">name</span>, <span class="syntax-punctuation-delimiter">:</span><span class="syntax-constant">ready</span> : <span class="syntax-punctuation-delimiter">:</span><span class="syntax-constant">true</span> }
+<span class="syntax-entity-function">print</span> <span class="syntax-variable">user</span>.<span class="syntax-variable-property">name</span>  <span class="syntax-comment">// user[:name]</span>
+<span class="syntax-variable">items</span> := [<span class="syntax-constant-numeric">1</span>, <span class="syntax-constant-numeric">2</span>]
+<span class="syntax-entity-function">push</span> &amp;<span class="syntax-variable">items</span>, <span class="syntax-constant-numeric">3</span></code></pre><h2 id="calls">Calls<a class="anchor" href="#calls" aria-label="Link to Calls">#</a></h2><p>Omit parentheses only for an outer statement or assignment RHS. Arguments use commas; nested calls require parentheses. A first argument starts on the callee’s line. Bare function names are values; zero-argument calls use <code>()</code>.</p><pre><code><span class="syntax-keyword-other">fn</span> <span class="syntax-entity-function">add</span>(<span class="syntax-variable">a</span>, <span class="syntax-variable">b</span>)
+	<span class="syntax-keyword-control">return</span> <span class="syntax-variable">a</span> + <span class="syntax-variable">b</span>
+<span class="syntax-keyword-control">end</span>
+
+<span class="syntax-variable">total</span> := <span class="syntax-entity-function">add</span> <span class="syntax-constant-numeric">20</span>, <span class="syntax-entity-function">len</span>([<span class="syntax-constant-numeric">1</span>, <span class="syntax-constant-numeric">2</span>])
+<span class="syntax-entity-function">print</span> <span class="syntax-variable">total</span></code></pre><h2 id="spacing">Significant spacing<a class="anchor" href="#spacing" aria-label="Link to Significant spacing">#</a></h2><p><code>f -1</code> calls with a negative argument; <code>f - 1</code> subtracts. <code>f [1]</code> calls with a list; <code>f[1]</code> indexes. <code>f &amp;x</code> passes a reference; <code>f &amp; x</code> is bitwise AND. The formatter preserves these distinctions.</p><h2 id="continuation">Continuation<a class="anchor" href="#continuation" aria-label="Link to Continuation">#</a></h2><p>A single newline continues an expression whenever syntax permits. A blank or whitespace-only line stops it. Comment-only lines are transparent. Precedence stays unchanged.</p><pre><code><span class="syntax-variable">foo</span>
+.<span class="syntax-variable-property">bar</span>
+.<span class="syntax-variable-property">baz</span>  <span class="syntax-comment">// foo.bar.baz</span>
+
+<span class="syntax-constant-numeric">32</span>
+-<span class="syntax-variable">a</span>    <span class="syntax-comment">// 32 - a</span>
+
+<span class="syntax-constant-numeric">32</span>
+
+-<span class="syntax-variable">a</span>    <span class="syntax-comment">// two statements</span></code></pre><h2 id="functions">Functions &amp; results<a class="anchor" href="#functions" aria-label="Link to Functions &amp; results">#</a></h2><p>Blocks close with <code>end</code>; indentation is cosmetic. Parameters can have defaults, require a reference (<code>&amp;x</code>), or collect positional arguments (<code>xs*</code>). Parameters after <code>*</code> or <code>xs*</code> are named-only. <code>return</code> is an ordinary builtin; a bare <code>return</code> calls it with no arguments.</p><pre><code><span class="syntax-keyword-other">fn</span> <span class="syntax-entity-function">pair</span>(<span class="syntax-variable">x</span>, <span class="syntax-variable">offset</span> = <span class="syntax-constant-numeric">1</span>)
+	<span class="syntax-keyword-control">return</span> <span class="syntax-variable">x</span>, <span class="syntax-variable">x</span> + <span class="syntax-variable">offset</span>
+<span class="syntax-keyword-control">end</span>
+
+<span class="syntax-variable">a</span>, <span class="syntax-variable">b</span> := <span class="syntax-entity-function">pair</span> <span class="syntax-constant-numeric">4</span>
+<span class="syntax-variable">f</span> := <span class="syntax-variable">pair</span>  <span class="syntax-comment">// keep the function itself</span></code></pre><h2 id="handlers">Control values<a class="anchor" href="#handlers" aria-label="Link to Control values">#</a></h2><p>A control builtin constructs an atom or tagged list. Binding, passing, or returning that value consumes it. An expression statement leaves it to a handler. Loop and return handlers stay within the current function; forward a request explicitly to let the caller handle it.</p><pre><code><span class="syntax-keyword-other">fn</span> <span class="syntax-entity-function">return_if</span>(<span class="syntax-variable">condition</span>, <span class="syntax-variable">value</span>)
+	<span class="syntax-keyword-control">if</span> <span class="syntax-variable">condition</span>
+		<span class="syntax-keyword-control">return</span> <span class="syntax-keyword-control">return</span>(<span class="syntax-variable">value</span>)
+	<span class="syntax-keyword-control">end</span>
+<span class="syntax-keyword-control">end</span></code></pre><h2 id="overloads">Overloads &amp; rejection<a class="anchor" href="#overloads" aria-label="Link to Overloads &amp; rejection">#</a></h2><p>Calls try candidates by signature; <code>:reject</code> or <code>[:reject, msg]</code> tries the next candidate. A successful fallback is silent. If all reject, an unconsumed rejection reports all messages and fails. Builtins can be shadowed; <code>::name</code> explicitly selects a global builtin.</p><h2 id="modules">Modules<a class="anchor" href="#modules" aria-label="Link to Modules">#</a></h2><p><code>use fs</code> imports a module; <code>fs::read(...)</code> selects a function. <code>use fs as files</code> renames it; <code>use fs as *</code> imports its names. Standard modules: <code>fs</code>, <code>env</code>, <code>text</code>, <code>json</code>, <code>io</code>, <code>time</code>, and <code>http</code>.</p><pre><code><span class="syntax-keyword-other">use</span> <span class="syntax-variable">fs</span>
+<span class="syntax-variable">text</span>, <span class="syntax-variable">reason</span> := <span class="syntax-entity-namespace">fs</span>::<span class="syntax-entity-function">read</span> <span class="syntax-string">&quot;optional.txt&quot;</span>, <span class="syntax-string">&quot;&quot;</span>
+<span class="syntax-keyword-control">if</span> <span class="syntax-variable">reason</span> != <span class="syntax-punctuation-delimiter">:</span><span class="syntax-constant">null</span>
+	<span class="syntax-entity-function">print</span> <span class="syntax-string">&quot;Using the default text&quot;</span>
+<span class="syntax-keyword-control">end</span></code></pre><h2 id="loops">Branches &amp; loops<a class="anchor" href="#loops" aria-label="Link to Branches &amp; loops">#</a></h2><p>Use <code>if</code> / <code>else if</code> / <code>else</code>, <code>for item in items</code>, or <code>while condition</code>. <code>break()</code> stops the nearest loop; <code>continue()</code> skips an iteration. Neither crosses a function boundary. There are no labeled breaks.</p><pre><code><span class="syntax-keyword-control">for</span> <span class="syntax-variable">n</span> <span class="syntax-keyword-control">in</span> [<span class="syntax-constant-numeric">1</span>, <span class="syntax-constant-numeric">2</span>, <span class="syntax-constant-numeric">3</span>]
+	<span class="syntax-keyword-control">if</span> <span class="syntax-variable">n</span> == <span class="syntax-constant-numeric">2</span>
+		<span class="syntax-entity-function">continue</span>()
+	<span class="syntax-keyword-control">end</span>
+
+	<span class="syntax-entity-function">print</span> <span class="syntax-variable">n</span>
+<span class="syntax-keyword-control">end</span></code></pre><h2 id="trails">Parallel trails<a class="anchor" href="#trails" aria-label="Link to Parallel trails">#</a></h2><p>Each <code>||</code> column is an independent trail; rows do not synchronize. <code>parallel</code> waits for all trails; <code>race</code> cancels losers after a winner finishes. <code>send</code> and <code>receive</code> communicate within the block. Parallel loops support the same loop-control atoms.</p><pre><code><span class="syntax-keyword-concurrency">parallel</span>
+	<span class="syntax-entity-function">send</span> <span class="syntax-string">&quot;ready&quot;</span> <span class="syntax-punctuation-trail">||</span> <span class="syntax-variable">message</span> := <span class="syntax-entity-function">receive</span>()
+	             <span class="syntax-punctuation-trail">||</span> <span class="syntax-entity-function">print</span> <span class="syntax-variable">message</span>
+<span class="syntax-keyword-control">end</span></code></pre><h2 id="atoms">Atoms &amp; strings<a class="anchor" href="#atoms" aria-label="Link to Atoms &amp; strings">#</a></h2><p>Atoms use <code>:name</code> or <code>:&quot;quoted name&quot;</code>. Bare names consume punctuation until whitespace, a delimiter (<code>()[]{},:&quot;</code>), or <code>//</code> / <code>||</code>. A dict keeps the colon between key and value. Strings are double-quoted; <code>\(expression)</code> interpolates a value.</p><pre><code><span class="syntax-variable">status</span> := <span class="syntax-punctuation-delimiter">:</span><span class="syntax-constant">some-other-prop+info</span>
+<span class="syntax-variable">record</span> := { <span class="syntax-punctuation-delimiter">:</span><span class="syntax-constant">status</span> : <span class="syntax-variable">status</span> }
+<span class="syntax-entity-function">print</span> <span class="syntax-string">&quot;Status: \(record.status)&quot;</span></code></pre>
+<footer>Hydra 0.1.0 · Reference</footer>
+</main></div>
+</body></html>

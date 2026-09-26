@@ -289,7 +289,7 @@ pub struct Task {
     pub channel: Option<usize>,
     /// What a channel call answered while this task was parked, waiting to be
     /// pushed when it runs again.
-    pub delivery: Option<Vec<Value>>,
+    pub delivery: Option<Result<Vec<Value>, crate::errors::Crash>>,
     /// What the last call answered beyond its first value, waiting for the
     /// binding site that names them. Written by every return, read by the one
     /// instruction that spreads them (channels §6.2).

@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="description" content="HTTP and HTTPS requests, text responses, and binary downloads.">
+<title>http · Hydra</title>
+<link rel="stylesheet" href="style.css">
+<script src="search-index.js" defer></script>
+<script src="search.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header><div class="header-inner">
+<a class="brand" href="index.html">hydra <span>0.1.0</span></a>
+<span class="header-label">Reference</span>
+<div class="search">
+<label class="sr-only" for="search-input">Search the reference</label>
+<input id="search-input" type="search" placeholder="Search reference" autocomplete="off" spellcheck="false" aria-controls="search-results" aria-expanded="false">
+<kbd aria-hidden="true">/</kbd>
+<div id="search-panel" hidden><p id="search-status" role="status" aria-live="polite"></p><ul id="search-results"></ul></div>
+</div>
+</div></header>
+<div class="layout">
+<aside><nav aria-label="Reference navigation"><a href="index.html">Overview</a><a href="language.html">Language</a><a href="builtins.html">Builtins</a><a href="atoms.html">Atoms &amp; handlers</a>
+<p class="nav-label">Standard modules</p><a href="fs.html"><code>fs</code></a><a href="env.html"><code>env</code></a><a href="text.html"><code>text</code></a><a href="json.html"><code>json</code></a><a href="io.html"><code>io</code></a><a href="time.html"><code>time</code></a><a href="http.html" aria-current="page"><code>http</code></a>
+</nav><nav class="on-page" aria-label="On this page"><p class="nav-label">On this page</p><a href="#section-requests">Requests</a><a href="#request">request</a><a href="#get">get</a><a href="#post">post</a><a href="#download">download</a></nav></aside>
+<main id="main"><div class="page-title"><h1>http</h1></div>
+<p class="intro">HTTP and HTTPS requests, text responses, and binary downloads.</p>
+<p class="note">use http, then <code>http::name(...)</code>. Imports support aliases and <code>as *</code>.</p><p>Headers are an atom-keyed dict of strings or lists of strings. Response header names are lowercase, with lists preserving repeated values. TLS certificates are verified; redirects are followed up to 10. <code>timeout</code> is a positive total duration in seconds; <code>max_bytes</code> caps the decoded body (16 MiB by default, buffered in memory). Each call has a strict and a fallback overload. Operational failures report a reason or crash; invalid arguments always crash.</p><p>Waiting calls run off the scheduler so other trails can progress. Normal trail cancellation lets an in-flight call finish. Each waiting call currently uses an OS helper thread.</p><pre><code><span class="syntax-keyword-other">use</span> <span class="syntax-variable">http</span>
+<span class="syntax-keyword-other">use</span> <span class="syntax-variable">json</span>
+<span class="syntax-variable">response</span>, <span class="syntax-variable">reason</span> := <span class="syntax-entity-namespace">http</span>::<span class="syntax-entity-function">get</span> <span class="syntax-string">&quot;https://example.com&quot;</span>, <span class="syntax-punctuation-delimiter">:</span><span class="syntax-constant">null</span>
+<span class="syntax-keyword-control">if</span> <span class="syntax-variable">reason</span> == <span class="syntax-punctuation-delimiter">:</span><span class="syntax-constant">null</span>
+	<span class="syntax-entity-function">print</span> <span class="syntax-variable">response</span>.<span class="syntax-variable-property">status</span>
+<span class="syntax-keyword-control">else</span>
+	<span class="syntax-entity-function">print</span> <span class="syntax-variable">reason</span>
+<span class="syntax-keyword-control">end</span></code></pre><h2 id="section-requests">Requests<a class="anchor" href="#section-requests" aria-label="Link to Requests">#</a></h2><article class="function" id="request"><h3><code>http::request(method, url, *, body = :null, headers = {}, timeout = 30, max_bytes = 16777216)</code><a class="anchor" href="#request" aria-label="Link to http::request">#</a></h3><div class="overload"><code>http::request(method, url, fallback, *, body = :null, headers = {}, timeout = 30, max_bytes = 16777216)</code></div><div class="result">→ <code>response, reason</code></div><p>Send a method string or atom, with an optional UTF-8 body. Response fields are <code>.status</code>, <code>.headers</code>, <code>.body</code>, and final <code>.url</code>. HTTP error statuses remain ordinary responses.</p></article><article class="function" id="get"><h3><code>http::get(url, *, headers = {}, timeout = 30, max_bytes = 16777216)</code><a class="anchor" href="#get" aria-label="Link to http::get">#</a></h3><div class="overload"><code>http::get(url, fallback, *, headers = {}, timeout = 30, max_bytes = 16777216)</code></div><div class="result">→ <code>response, reason</code></div><p>GET shorthand for <code>request</code>. Response body must be UTF-8.</p></article><article class="function" id="post"><h3><code>http::post(url, body, *, headers = {}, timeout = 30, max_bytes = 16777216)</code><a class="anchor" href="#post" aria-label="Link to http::post">#</a></h3><div class="overload"><code>http::post(url, body, fallback, *, headers = {}, timeout = 30, max_bytes = 16777216)</code></div><div class="result">→ <code>response, reason</code></div><p>POST a UTF-8 string. Set content-type explicitly; use <code>json::stringify</code> for JSON payloads.</p></article><article class="function" id="download"><h3><code>http::download(url, path, *, headers = {}, timeout = 30, max_bytes = 16777216)</code><a class="anchor" href="#download" aria-label="Link to http::download">#</a></h3><div class="overload"><code>http::download(url, path, fallback, *, headers = {}, timeout = 30, max_bytes = 16777216)</code></div><div class="result">→ <code>path, reason</code></div><p>GET binary data to a file. Require a 2xx status, create parent directories, and replace the target only after the complete bounded download succeeds. Failure leaves an existing target intact.</p></article>
+<footer>Hydra 0.1.0 · Reference</footer>
+</main></div>
+</body></html>

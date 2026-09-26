@@ -185,6 +185,18 @@ warns at the `use`, and `::push` reaches the builtin.
 
 The formatter is unaffected: they are ordinary calls.
 
+## Function return: `return(values*)`
+
+Constructs one list `[:return, ...values]`. Consuming it keeps ordinary data;
+leaving it unconsumed returns its payload from the current function. `return()`
+constructs `[:return]`, which returns `:null` when handled. Bare `:return` does
+the same. No enclosing function, or an unconsumed request in a trail, crashes.
+
+`return 1, 2` is an ordinary call without parentheses. A standalone `return`
+is shorthand for `return()`. The builtin can be shadowed; `::return(...)`
+selects it explicitly. A helper can use `return return(value)` to forward a
+request for its caller to handle.
+
 ## Loop control: `break()` and `continue()`
 
 Both are ordinary zero-argument builtins. They return `:break` and `:continue`.

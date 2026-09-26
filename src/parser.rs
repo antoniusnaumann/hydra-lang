@@ -260,7 +260,6 @@ impl<'a> Parser<'a> {
                 "parallel" | "race" => return self.parse_parallel_rows(kw, pos),
                 "parallel for" | "race for" => return self.parse_parallel_for(kw, pos),
                 "parallel while" | "race while" => return self.parse_parallel_while(kw, pos),
-                "return" => return self.parse_return(pos),
                 "end" => return self.err("`end` without a matching block", pos),
                 _ => {}
             }
@@ -271,7 +270,7 @@ impl<'a> Parser<'a> {
         // means several targets for one call that returns several values
         // (channels §6.2) — the only place a comma appears outside a call, a
         // list or a dict.
-        let expr = self.parse_expr()?;
+        let expr = self.parse_outer_expr()?;
         let mut targets = vec![expr];
         while self.eat_op(",") {
             targets.push(self.parse_expr()?);
@@ -284,7 +283,7 @@ impl<'a> Parser<'a> {
         });
         if self.peek().is_op(":=") {
             self.advance();
-            let value = self.parse_expr()?;
+            let value = self.parse_outer_expr()?;
             self.expect_end_of_statement()?;
             let mut names = Vec::new();
             for target in targets {
@@ -314,7 +313,7 @@ impl<'a> Parser<'a> {
                         op_pos,
                     );
                 }
-                let value = self.parse_expr()?;
+                let value = self.parse_outer_expr()?;
                 self.expect_end_of_statement()?;
                 for target in &targets {
                     if !target.is_lvalue() {
@@ -337,7 +336,13 @@ impl<'a> Parser<'a> {
             );
         }
         self.expect_end_of_statement()?;
-        Ok(Stmt::Expr { expr: targets.pop().expect("one target"), pos })
+        let mut expr = targets.pop().expect("one target");
+        // Keep the familiar empty return, while a bare name elsewhere remains
+        // a first-class value. This sugar still calls a shadowing function.
+        if matches!(&expr, Expr::Name { name, .. } if name == "return") {
+            expr = Expr::Call { callee: Box::new(expr), args: Vec::new(), pos, bare: true };
+        }
+        Ok(Stmt::Expr { expr, pos })
     }
 
     /// `use fs`, `use fs as *`, `use fs as filesystem` (§7).
@@ -542,21 +547,6 @@ impl<'a> Parser<'a> {
         let body = self.parse_block()?;
         let end_pos = self.expect_block_end()?;
         Ok(Stmt::While { cond, body, label, pos, end_pos })
-    }
-
-    fn parse_return(&mut self, pos: Pos) -> Result<Stmt> {
-        self.advance();
-        let mut values = Vec::new();
-        if !(self.peek().is_newline() || self.peek().is_eof()) {
-            values.push(self.parse_expr()?);
-            // `return a, b` — the first value is the meaningful one and the
-            // rest are additional information (channels §6.2).
-            while self.eat_op(",") {
-                values.push(self.parse_expr()?);
-            }
-        }
-        self.expect_end_of_statement()?;
-        Ok(Stmt::Return { values, pos })
     }
 
     // --- parallel blocks (§4) ----------------------------------------------
@@ -940,10 +930,10 @@ impl<'a> Parser<'a> {
     /// call, which is the one that will be handed it.
     fn mark_receiver(&mut self, target: Expr, pos: Pos) -> Result<Expr> {
         match target {
-            Expr::Call { callee, args, pos: call_pos } => {
+            Expr::Call { callee, args, pos: call_pos, bare } => {
                 if spine_has_call(&callee) {
                     let callee = Box::new(self.mark_receiver(*callee, pos)?);
-                    return Ok(Expr::Call { callee, args, pos: call_pos });
+                    return Ok(Expr::Call { callee, args, pos: call_pos, bare });
                 }
                 match *callee {
                     // The dot is what passes the receiver, so the dot is what
@@ -954,6 +944,7 @@ impl<'a> Parser<'a> {
                             callee: Box::new(Expr::Method { obj, module, name, pos: key_pos }),
                             args,
                             pos: call_pos,
+                            bare,
                         })
                     }
                     other => self.err(
@@ -979,7 +970,62 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parenthesis-free calls are only admitted at a statement's outer edge,
+    /// including assignment RHSs. Their arguments use ordinary expressions.
+    fn parse_outer_expr(&mut self) -> Result<Expr> {
+        self.soft_newline();
+        let saved = self.i;
+        let pos = self.pos();
+        let by_ref = self.peek().is_op("&");
+        if by_ref { self.advance(); }
+        if self.peek().ident().is_some() || self.peek().is_op("::") {
+            let callee = self.parse_postfix_head(true)?;
+            let callable = matches!(callee, Expr::Name { .. } | Expr::Namespace { .. }
+                | Expr::Key { .. } | Expr::Index { .. } | Expr::Method { .. });
+            if callable && self.inline_gap() && self.command_argument_start() {
+                let callee = match callee {
+                    Expr::Key { obj, key, pos } if !key.quoted && key.is_static() => {
+                        Expr::Method { obj, module: None, name: key.name, pos }
+                    }
+                    other => other,
+                };
+                let args = self.parse_args()?;
+                let call = Expr::Call { callee: Box::new(callee), args, pos, bare: true };
+                return if by_ref { self.reference(call, pos) } else { Ok(call) };
+            }
+        }
+        self.i = saved;
+        self.parse_expr()
+    }
+
+    fn inline_gap(&self) -> bool {
+        self.i.checked_sub(1).is_some_and(|i| {
+            let prev = &self.toks[i];
+            prev.pos.line == self.pos().line && prev.pos.col + prev.len < self.pos().col
+        })
+    }
+
+    fn command_argument_start(&self) -> bool {
+        match &self.peek().kind {
+            Tok::Ident(_) | Tok::Num { .. } | Tok::Str { .. } | Tok::Sym { .. } => true,
+            Tok::Kw("fn" | "not") => true,
+            Tok::Op("[" | "{" | "~" | "::") => true,
+            // With space before but none after, these start a unary argument.
+            // `f - 1` stays subtraction, while `f -1` means `f(-1)`.
+            Tok::Op("-" | "&") => {
+                let next = self.peek_at(1);
+                !next.is_newline() && !next.is_eof()
+                    && next.pos.line == self.pos().line && self.pos().col + self.peek().len == next.pos.col
+            }
+            _ => false,
+        }
+    }
+
     fn parse_postfix(&mut self) -> Result<Expr> {
+        self.parse_postfix_head(false)
+    }
+
+    fn parse_postfix_head(&mut self, command: bool) -> Result<Expr> {
         let mut expr = self.parse_primary()?;
         loop {
             self.continue_before(|t| [".", "(", "[", "::"].iter().any(|op| t.is_op(op)));
@@ -988,10 +1034,11 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let args = self.parse_args()?;
                 self.expect_op(")")?;
-                expr = Expr::Call { callee: Box::new(expr), args, pos };
+                expr = Expr::Call { callee: Box::new(expr), args, pos, bare: false };
                 continue;
             }
             if self.peek().is_op("[") {
+                if command && self.inline_gap() { break; }
                 self.advance();
                 let index = self.parse_expr()?;
                 self.expect_op("]")?;
@@ -1011,7 +1058,7 @@ impl<'a> Parser<'a> {
                         self.expect_op("::")?;
                         let (call, _) = self.expect_ident("a name after `::`")?;
                         self.continue_before(|t| t.is_op("("));
-                        if !self.peek().is_op("(") {
+                        if !command && !self.peek().is_op("(") {
                             return self.err(
                                 "a qualified name is a function, so it needs a call: \
                                  write `x.mod::f(…)`",

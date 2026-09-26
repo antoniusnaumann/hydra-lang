@@ -112,7 +112,7 @@ fn the_theme_carries_the_reference_colours() {
 #[test]
 fn control_handlers_use_returns_colour_but_keep_atom_delimiters() {
     let expected = class_at("return 1\n", 1, 1);
-    for name in ["exit", "panic", "reject"] {
+    for name in ["exit", "panic", "reject", "return"] {
         assert_eq!(class_at(&format!("{name}(1)\n"), 1, 1), expected);
         assert_eq!(class_at(&format!(":{name}\n"), 1, 1), "punctuation.delimiter");
         assert_eq!(class_at(&format!(":{name}\n"), 1, 2), expected);
@@ -121,4 +121,19 @@ fn control_handlers_use_returns_colour_but_keep_atom_delimiters() {
         assert_eq!(class_at(&format!(":{name}-later\n"), 1, 2), "constant");
         assert_eq!(class_at(&format!("module::{name}(1)\n"), 1, 9), "entity.function");
     }
+}
+
+#[test]
+fn calls_without_parentheses_and_return_atoms_keep_their_classes() {
+    for name in ["return", "reject", "exit", "panic"] {
+        assert_eq!(class_at(&format!("{name} 1\n"), 1, 1), "keyword.control");
+        assert_eq!(class_at(&format!("x := {name} 1\n"), 1, 6), "keyword.control");
+        assert_eq!(class_at(&format!("::{name} 1\n"), 1, 3), "keyword.control");
+        assert_eq!(class_at(&format!("module::{name} 1\n"), 1, 9), "entity.function");
+    }
+    assert_eq!(class_at("return\n", 1, 1), "keyword.control");
+    assert_eq!(class_at("x := return\n", 1, 6), "variable");
+    assert_eq!(class_at("print :ready\n", 1, 1), "entity.function");
+    assert_eq!(class_at("x := add 1, 2\n", 1, 6), "entity.function");
+    assert_eq!(class_at("foo.bar 1\n", 1, 5), "entity.function");
 }

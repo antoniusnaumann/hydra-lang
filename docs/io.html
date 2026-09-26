@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="description" content="UTF-8 standard input, output, and error streams.">
+<title>io · Hydra</title>
+<link rel="stylesheet" href="style.css">
+<script src="search-index.js" defer></script>
+<script src="search.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header><div class="header-inner">
+<a class="brand" href="index.html">hydra <span>0.1.0</span></a>
+<span class="header-label">Reference</span>
+<div class="search">
+<label class="sr-only" for="search-input">Search the reference</label>
+<input id="search-input" type="search" placeholder="Search reference" autocomplete="off" spellcheck="false" aria-controls="search-results" aria-expanded="false">
+<kbd aria-hidden="true">/</kbd>
+<div id="search-panel" hidden><p id="search-status" role="status" aria-live="polite"></p><ul id="search-results"></ul></div>
+</div>
+</div></header>
+<div class="layout">
+<aside><nav aria-label="Reference navigation"><a href="index.html">Overview</a><a href="language.html">Language</a><a href="builtins.html">Builtins</a><a href="atoms.html">Atoms &amp; handlers</a>
+<p class="nav-label">Standard modules</p><a href="fs.html"><code>fs</code></a><a href="env.html"><code>env</code></a><a href="text.html"><code>text</code></a><a href="json.html"><code>json</code></a><a href="io.html" aria-current="page"><code>io</code></a><a href="time.html"><code>time</code></a><a href="http.html"><code>http</code></a>
+</nav><nav class="on-page" aria-label="On this page"><p class="nav-label">On this page</p><a href="#section-input">Input</a><a href="#read">read</a><a href="#read_line">read_line</a><a href="#lines">lines</a><a href="#section-output">Output</a><a href="#write">write</a><a href="#flush">flush</a><a href="#is_terminal">is_terminal</a></nav></aside>
+<main id="main"><div class="page-title"><h1>io</h1></div>
+<p class="intro">UTF-8 standard input, output, and error streams.</p>
+<p class="note">use io, then <code>io::name(...)</code>. Imports support aliases and <code>as *</code>.</p><p>Input supports <code>:stdin</code> only. Readers return value, reason; fallback overloads report <code>:encoding</code> or <code>:io</code>, while strict overloads crash. Read one line at a time for bounded memory. Concurrent readers share and serialize access to stdin.</p><p>Waiting calls run off the scheduler so other trails can progress. Normal trail cancellation lets an in-flight call finish. Each waiting call currently uses an OS helper thread.</p><pre><code><span class="syntax-keyword-other">use</span> <span class="syntax-variable">io</span>
+<span class="syntax-variable">line</span> := <span class="syntax-entity-namespace">io</span>::<span class="syntax-entity-function">read_line</span>()
+<span class="syntax-keyword-control">while</span> <span class="syntax-variable">line</span> != <span class="syntax-punctuation-delimiter">:</span><span class="syntax-constant">null</span>
+	<span class="syntax-entity-function">print</span> <span class="syntax-variable">line</span>
+	<span class="syntax-variable">line</span> = <span class="syntax-entity-namespace">io</span>::<span class="syntax-entity-function">read_line</span>()
+<span class="syntax-keyword-control">end</span></code></pre><h2 id="section-input">Input<a class="anchor" href="#section-input" aria-label="Link to Input">#</a></h2><article class="function" id="read"><h3><code>io::read(*, stream = :stdin)</code><a class="anchor" href="#read" aria-label="Link to io::read">#</a></h3><div class="overload"><code>io::read(fallback, *, stream = :stdin)</code></div><div class="result">→ <code>string, reason</code></div><p>Read stdin to EOF, preserving line endings. Empty input produces an empty string.</p></article><article class="function" id="read_line"><h3><code>io::read_line(*, stream = :stdin)</code><a class="anchor" href="#read_line" aria-label="Link to io::read_line">#</a></h3><div class="overload"><code>io::read_line(fallback, *, stream = :stdin)</code></div><div class="result">→ <code>string or :null, reason</code></div><p>Read one line, removing its LF or CRLF ending. EOF produces <code>:null</code>; an empty line produces an empty string.</p></article><article class="function" id="lines"><h3><code>io::lines(*, stream = :stdin)</code><a class="anchor" href="#lines" aria-label="Link to io::lines">#</a></h3><div class="overload"><code>io::lines(fallback, *, stream = :stdin)</code></div><div class="result">→ <code>list, reason</code></div><p>Read stdin to EOF as a list of lines, without line endings. This collects the entire input.</p></article><h2 id="section-output">Output<a class="anchor" href="#section-output" aria-label="Link to Output">#</a></h2><article class="function" id="write"><h3><code>io::write(value, *, stream = :stdout)</code><a class="anchor" href="#write" aria-label="Link to io::write">#</a></h3><div class="result">→ <code>bytes</code></div><p>Render one value without a newline to <code>:stdout</code> or <code>:stderr</code>, flush, and return its UTF-8 byte count. Failures crash.</p></article><article class="function" id="flush"><h3><code>io::flush(stream = :stdout)</code><a class="anchor" href="#flush" aria-label="Link to io::flush">#</a></h3><div class="result">→ <code>:null</code></div><p>Flush <code>:stdout</code> or <code>:stderr</code>. Failures crash.</p></article><article class="function" id="is_terminal"><h3><code>io::is_terminal(stream = :stdout)</code><a class="anchor" href="#is_terminal" aria-label="Link to io::is_terminal">#</a></h3><div class="result">→ <code>boolean</code></div><p>Whether <code>:stdin</code>, <code>:stdout</code>, or <code>:stderr</code> is connected to a terminal.</p></article>
+<footer>Hydra 0.1.0 · Reference</footer>
+</main></div>
+</body></html>

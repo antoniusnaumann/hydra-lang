@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="description" content="Convert between JSON text and Hydra values.">
+<title>json · Hydra</title>
+<link rel="stylesheet" href="style.css">
+<script src="search-index.js" defer></script>
+<script src="search.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header><div class="header-inner">
+<a class="brand" href="index.html">hydra <span>0.1.0</span></a>
+<span class="header-label">Reference</span>
+<div class="search">
+<label class="sr-only" for="search-input">Search the reference</label>
+<input id="search-input" type="search" placeholder="Search reference" autocomplete="off" spellcheck="false" aria-controls="search-results" aria-expanded="false">
+<kbd aria-hidden="true">/</kbd>
+<div id="search-panel" hidden><p id="search-status" role="status" aria-live="polite"></p><ul id="search-results"></ul></div>
+</div>
+</div></header>
+<div class="layout">
+<aside><nav aria-label="Reference navigation"><a href="index.html">Overview</a><a href="language.html">Language</a><a href="builtins.html">Builtins</a><a href="atoms.html">Atoms &amp; handlers</a>
+<p class="nav-label">Standard modules</p><a href="fs.html"><code>fs</code></a><a href="env.html"><code>env</code></a><a href="text.html"><code>text</code></a><a href="json.html" aria-current="page"><code>json</code></a><a href="io.html"><code>io</code></a><a href="time.html"><code>time</code></a><a href="http.html"><code>http</code></a>
+</nav><nav class="on-page" aria-label="On this page"><p class="nav-label">On this page</p><a href="#section-conversion">Conversion</a><a href="#parse">parse</a><a href="#stringify">stringify</a></nav></aside>
+<main id="main"><div class="page-title"><h1>json</h1></div>
+<p class="intro">Convert between JSON text and Hydra values.</p>
+<p class="note">use json, then <code>json::name(...)</code>. Imports support aliases and <code>as *</code>.</p><p>Numbers use Hydra’s floating-point representation: large JSON integers can lose precision. Object keys become atoms, but ordinary JSON string values stay strings.</p><pre><code><span class="syntax-keyword-other">use</span> <span class="syntax-variable">json</span>
+<span class="syntax-variable">encoded</span> := <span class="syntax-entity-namespace">json</span>::<span class="syntax-entity-function">stringify</span> { <span class="syntax-punctuation-delimiter">:</span><span class="syntax-constant">name</span> : <span class="syntax-string">&quot;Hydra&quot;</span>, <span class="syntax-punctuation-delimiter">:</span><span class="syntax-constant">ready</span> : <span class="syntax-punctuation-delimiter">:</span><span class="syntax-constant">true</span> }
+<span class="syntax-variable">record</span> := <span class="syntax-entity-namespace">json</span>::<span class="syntax-entity-function">parse</span> <span class="syntax-variable">encoded</span>
+<span class="syntax-entity-function">print</span> <span class="syntax-variable">record</span>.<span class="syntax-variable-property">name</span></code></pre><h2 id="section-conversion">Conversion<a class="anchor" href="#section-conversion" aria-label="Link to Conversion">#</a></h2><article class="function" id="parse"><h3><code>json::parse(text)</code><a class="anchor" href="#parse" aria-label="Link to json::parse">#</a></h3><div class="overload"><code>json::parse(text, fallback)</code></div><div class="result">→ <code>value, reason</code></div><p>Objects become dicts with atom keys; arrays become lists; booleans and null become <code>:true</code>, <code>:false</code>, and <code>:null</code>. Invalid input gives <code>fallback, :invalid</code>, or crashes without a fallback.</p></article><article class="function" id="stringify"><h3><code>json::stringify(value, *, pretty = :false)</code><a class="anchor" href="#stringify" aria-label="Link to json::stringify">#</a></h3><div class="result">→ <code>string</code></div><p>Encode values, preserving dict order. Other atoms become JSON strings. <code>pretty = :true</code> indents. Functions, non-finite numbers, cycles, and excessive nesting crash.</p></article>
+<footer>Hydra 0.1.0 · Reference</footer>
+</main></div>
+</body></html>

@@ -262,3 +262,19 @@ fn spacing_after_end_preserves_other_parallel_columns() {
         "parallel\n\tif ok || x := foo\n\tend   || .bar\n\tf()   || .baz\nend\n\ng()\n"
     );
 }
+
+#[test]
+fn formatting_retains_parenthesis_free_call_boundaries() {
+    for (source, expected) in [
+        ("f  -1", "f -1\n"),
+        ("f -  1", "f - 1\n"),
+        ("x:=f [ 1,2 ]", "x := f [1, 2]\n"),
+        ("x:=f[ 1 ]", "x := f[1]\n"),
+        ("return :ready", "return :ready\n"),
+        ("return [ :return,1 ]", "return [:return, 1]\n"),
+        ("f  &x, width=2", "f &x, width = 2\n"),
+        ("parallel\nf -1||g [1]\nend", "parallel\n\tf -1 || g [1]\nend\n"),
+    ] {
+        assert_eq!(fmt_idempotent(source), expected);
+    }
+}

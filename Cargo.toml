@@ -5,8 +5,12 @@ edition = "2021"
 description = "Reference implementation of the Hydra language: interpreter, check and formatter"
 default-run = "hydra"
 
-# No dependencies, deliberately: everything the spec asks for is in std.
+# Protocol and format implementations shared by the standard modules.
 [dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
 
 [lib]
 name = "hydra"

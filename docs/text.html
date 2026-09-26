@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="description" content="Unicode string operations. Positions count characters, not bytes.">
+<title>text · Hydra</title>
+<link rel="stylesheet" href="style.css">
+<script src="search-index.js" defer></script>
+<script src="search.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header><div class="header-inner">
+<a class="brand" href="index.html">hydra <span>0.1.0</span></a>
+<span class="header-label">Reference</span>
+<div class="search">
+<label class="sr-only" for="search-input">Search the reference</label>
+<input id="search-input" type="search" placeholder="Search reference" autocomplete="off" spellcheck="false" aria-controls="search-results" aria-expanded="false">
+<kbd aria-hidden="true">/</kbd>
+<div id="search-panel" hidden><p id="search-status" role="status" aria-live="polite"></p><ul id="search-results"></ul></div>
+</div>
+</div></header>
+<div class="layout">
+<aside><nav aria-label="Reference navigation"><a href="index.html">Overview</a><a href="language.html">Language</a><a href="builtins.html">Builtins</a><a href="atoms.html">Atoms &amp; handlers</a>
+<p class="nav-label">Standard modules</p><a href="fs.html"><code>fs</code></a><a href="env.html"><code>env</code></a><a href="text.html" aria-current="page"><code>text</code></a><a href="json.html"><code>json</code></a><a href="io.html"><code>io</code></a><a href="time.html"><code>time</code></a><a href="http.html"><code>http</code></a>
+</nav><nav class="on-page" aria-label="On this page"><p class="nav-label">On this page</p><a href="#section-strings">Strings</a><a href="#split">split</a><a href="#join">join</a><a href="#trim">trim</a><a href="#replace">replace</a><a href="#find">find</a><a href="#starts_with">starts_with</a><a href="#ends_with">ends_with</a><a href="#lower">lower</a><a href="#upper">upper</a></nav></aside>
+<main id="main"><div class="page-title"><h1>text</h1></div>
+<p class="intro">Unicode string operations. Positions count characters, not bytes.</p>
+<p class="note">use text, then <code>text::name(...)</code>. Imports support aliases and <code>as *</code>.</p><p>These functions require strings; they do not silently render other values.</p><pre><code><span class="syntax-keyword-other">use</span> <span class="syntax-variable">text</span>
+<span class="syntax-variable">words</span> := <span class="syntax-entity-namespace">text</span>::<span class="syntax-entity-function">split</span> <span class="syntax-string">&quot;  hello   Hydra  &quot;</span>
+<span class="syntax-entity-function">print</span> <span class="syntax-entity-namespace">text</span>::<span class="syntax-entity-function">join</span>(<span class="syntax-variable">words</span>, <span class="syntax-string">&quot; &quot;</span>)</code></pre><h2 id="section-strings">Strings<a class="anchor" href="#section-strings" aria-label="Link to Strings">#</a></h2><article class="function" id="split"><h3><code>text::split(text, separator = :null)</code><a class="anchor" href="#split" aria-label="Link to text::split">#</a></h3><div class="result">→ <code>list</code></div><p>With <code>:null</code>, split on Unicode whitespace and discard empty fields. An explicit separator preserves empty fields; an empty separator splits into characters.</p></article><article class="function" id="join"><h3><code>text::join(parts, separator = &quot;&quot;)</code><a class="anchor" href="#join" aria-label="Link to text::join">#</a></h3><div class="result">→ <code>string</code></div><p>Join a list of strings with the separator. An empty list produces an empty string.</p></article><article class="function" id="trim"><h3><code>text::trim(text)</code><a class="anchor" href="#trim" aria-label="Link to text::trim">#</a></h3><div class="result">→ <code>string</code></div><p>Remove leading and trailing Unicode whitespace.</p></article><article class="function" id="replace"><h3><code>text::replace(text, from, to)</code><a class="anchor" href="#replace" aria-label="Link to text::replace">#</a></h3><div class="result">→ <code>string</code></div><p>Replace every non-overlapping literal match. An empty <code>from</code> inserts at character boundaries, including both ends.</p></article><article class="function" id="find"><h3><code>text::find(text, needle)</code><a class="anchor" href="#find" aria-label="Link to text::find">#</a></h3><div class="result">→ <code>number or :null</code></div><p>Zero-based character position of the first literal match; <code>:null</code> if absent. An empty needle matches at zero.</p></article><article class="function" id="starts_with"><h3><code>text::starts_with(text, prefix)</code><a class="anchor" href="#starts_with" aria-label="Link to text::starts_with">#</a></h3><div class="result">→ <code>boolean</code></div><p>Whether text begins with the literal prefix.</p></article><article class="function" id="ends_with"><h3><code>text::ends_with(text, suffix)</code><a class="anchor" href="#ends_with" aria-label="Link to text::ends_with">#</a></h3><div class="result">→ <code>boolean</code></div><p>Whether text ends with the literal suffix.</p></article><article class="function" id="lower"><h3><code>text::lower(text)</code><a class="anchor" href="#lower" aria-label="Link to text::lower">#</a></h3><div class="result">→ <code>string</code></div><p>Unicode lowercase conversion, independent of locale.</p></article><article class="function" id="upper"><h3><code>text::upper(text)</code><a class="anchor" href="#upper" aria-label="Link to text::upper">#</a></h3><div class="result">→ <code>string</code></div><p>Unicode uppercase conversion, independent of locale. May change character count.</p></article>
+<footer>Hydra 0.1.0 · Reference</footer>
+</main></div>
+</body></html>

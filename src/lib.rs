@@ -17,3 +17,6 @@ pub mod scope;
 pub mod sched;
 pub mod value;
 pub mod vm;
+
+mod stdlib;
+mod http;

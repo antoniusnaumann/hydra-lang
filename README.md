@@ -17,9 +17,26 @@ file for semantic highlighting, and `hydra grammar` prints a TextMate grammar
 because classification runs on real tokens, `parallel for` is coloured as one
 unit for free.
 
+Calls may omit parentheses at statement level or on assignment right-hand
+sides: `print "hello"`, `x := add 1, 2`. Nested calls keep parentheses.
+`f -1` and `f [1]` call; `f - 1` subtracts and `f[1]` indexes. Bare names
+remain function values; zero-argument calls use `()`.
+
+`return` is a builtin constructing `[:return, ...values]`. Left unconsumed,
+it returns those values from the current function; otherwise it stays data.
+Bare `return` is shorthand for `return()`.
+
+## Reference
+
+[Compact documentation](docs/index.html) — language, builtins, atoms, and `fs`.
+Open it locally or serve `docs/`; rebuild with `python3 docs/build.py`.
+
+Standard modules: `fs`, `env`, `text`, `json`, `io`, `time`, and `http`.
+Pass script arguments after `--`: `hydra run examples/fetch_url.hy -- https://example.com`.
+
 ## Building it
 
-Rust, no dependencies at all — everything the spec asks for is in `std`.
+Rust/Cargo. JSON, date formatting, and HTTPS use `serde_json`, `chrono`, and `ureq`; Cargo fetches the locked dependencies automatically.
 
 ```bash
 cargo build --release

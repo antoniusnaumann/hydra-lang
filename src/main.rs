@@ -14,7 +14,7 @@ const USAGE: &str = "\
 hydra — the Hydra language (see spec/hydra_spec.md)
 
 usage:
-  hydra run FILE.hy [options]     run a program
+  hydra run FILE.hy [options] [-- args...]     run a program
   hydra check FILE.hy [options]   report what is guaranteed to crash
   hydra fmt FILE.hy [options]     print the canonical form
   hydra fmt -                     format standard input onto standard output,
@@ -110,7 +110,11 @@ fn value(args: &[String], name: &str) -> Option<String> {
 }
 
 fn run(path: &Path, args: &[String]) -> ExitCode {
+    let split = args.iter().position(|s| s == "--").unwrap_or(args.len());
+    let script_args = args.get(split + 1..).unwrap_or_default().to_vec();
+    let args = &args[..split];
     let mut options = Options {
+        script_args,
         strict: flag(args, "--strict"),
         report_dead_crashes: !flag(args, "--quiet"),
         ..Options::default()

@@ -320,14 +320,14 @@ end
 
 #[test]
 fn return_inside_a_trail_is_rejected() {
-    // §9.6: `check` rejects it; the compiler will not emit it either.
+    // §9.6: a trail has no current function handler for this value.
     let src = "
 parallel
 \treturn 1 || x := 2
 end
 ";
-    let err = run_source(src, "t.hy", opts()).unwrap_err();
-    assert!(err.message.contains("`return` inside a trail"), "{}", err.message);
+    let err = run(src).crash.expect("unhandled return");
+    assert!(err.message.contains("unhandled :return"), "{}", err.message);
 }
 
 #[test]
