@@ -20,3 +20,5 @@ pub mod vm;
 
 mod stdlib;
 mod http;
+mod list;
+mod cli;

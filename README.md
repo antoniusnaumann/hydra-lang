@@ -33,7 +33,7 @@ Run `direnv allow` once, then `docs` to regenerate, serve locally, and open the
 reference. Stop it with Ctrl-C. The command is available inside this repository
 when your shell has the direnv hook enabled.
 
-Standard modules: `fs`, `env`, `text`, `json`, `io`, `time`, and `http`.
+Standard modules: `fs`, `env`, `text`, `json`, `io`, `time`, `http`, `list`, and `cli`.
 Pass script arguments after `--`: `hydra run examples/fetch_url.hy -- https://example.com`.
 
 ## Building it

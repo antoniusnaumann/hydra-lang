@@ -1109,6 +1109,30 @@ impl Vm {
                 Ok(Flow::Next)
             }
             Value::Native(native) => {
+                if native.module() == Some("list") {
+                    if let Some(closure) = crate::list::script(native, &bound)? {
+                        return self.enter_with(task, closure, bound, retry);
+                    }
+                }
+                if native.module() == Some("cli") {
+                    let module = self.module(task.frame().module);
+                    let prog = module.path.file_name().and_then(|s| s.to_str()).unwrap_or("script");
+                    match crate::cli::call(native, &bound, &self.options.script_args, prog)? {
+                        crate::cli::Outcome::Values(values) => {
+                            let mut values = values.into_iter();
+                            task.push(values.next().unwrap_or_else(Value::null));
+                            task.extras = values.collect();
+                            return Ok(Flow::Next);
+                        }
+                        crate::cli::Outcome::Exit { code, message } => {
+                            if task.cancel.is_cancelled() { return Ok(Flow::Stop); }
+                            if code == 0 { let _ = std::io::stdout().write_all(message.as_bytes()); }
+                            else { let _ = std::io::stderr().write_all(message.as_bytes()); }
+                            self.terminate(Some(code), None);
+                            return Ok(Flow::Stop);
+                        }
+                    }
+                }
                 let out = match native {
                     // Control builtins construct ordinary values; their consumers
                     // decide whether to invoke a handler.
@@ -1211,6 +1235,7 @@ impl Vm {
                 Ok(vec![Value::Num(len as f64)])
             }
             // A module's builtins live with the module (spec/hydra_fs.md).
+            other if other.module() == Some("list") => crate::list::call(other, &args),
             other if other.module() == Some("fs") => crate::fs::call(other, &args),
             other => crate::stdlib::call(other, &args, &self.options.script_args),
         }
