@@ -28,8 +28,10 @@ Bare `return` is shorthand for `return()`.
 
 ## Reference
 
-[Compact documentation](docs/index.html) — language, builtins, atoms, and `fs`.
-Open it locally or serve `docs/`; rebuild with `python3 docs/build.py`.
+[Compact documentation](docs/index.html) — language, builtins, atoms, and standard modules.
+Run `direnv allow` once, then `docs` to regenerate, serve locally, and open the
+reference. Stop it with Ctrl-C. The command is available inside this repository
+when your shell has the direnv hook enabled.
 
 Standard modules: `fs`, `env`, `text`, `json`, `io`, `time`, and `http`.
 Pass script arguments after `--`: `hydra run examples/fetch_url.hy -- https://example.com`.

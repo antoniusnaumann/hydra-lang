@@ -3,6 +3,13 @@
 Open `index.html` directly, or serve this directory. The site works offline and
 has no browser dependencies. Regeneration requires Python 3.11+ and Rust/Cargo.
 
+From the repository, run `direnv allow` once, then `docs`. It rebuilds the
+reference, serves it on loopback, and opens your browser. Ctrl-C stops it.
+Port 8765 is preferred; an occupied port automatically falls back to a free one.
+Use `docs --port 9000` or `docs --no-open` when needed.
+
+Without direnv, run `./bin/docs`. Build/check commands remain available:
+
 ```sh
 python3 docs/build.py
 python3 docs/build.py --check
