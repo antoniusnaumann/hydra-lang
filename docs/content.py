@@ -143,9 +143,16 @@ MODULES = {
         "request": ("Requests", "response, reason", "Send a method string or atom, with an optional UTF-8 body. Response fields are `.status`, `.headers`, `.body`, and final `.url`. HTTP error statuses remain ordinary responses."),
         "get": ("Requests", "response, reason", "GET shorthand for `request`. Response body must be UTF-8."),
         "post": ("Requests", "response, reason", "POST a UTF-8 string. Set content-type explicitly; use `json::stringify` for JSON payloads."),
+        "head": ("Requests", "response, reason", "HEAD shorthand. Return status and headers with an empty `.body`, even when content-length describes a nonempty resource."),
+        "put": ("Requests", "response, reason", "PUT a UTF-8 string. Set content-type explicitly; use `json::stringify` for JSON payloads."),
+        "patch": ("Requests", "response, reason", "PATCH with a UTF-8 string. Set the content-type required by the server’s patch format."),
+        "delete": ("Requests", "response, reason", "DELETE shorthand, with an optional named `body`."),
+        "options": ("Requests", "response, reason", "OPTIONS shorthand, with an optional named `body`. Inspect response headers for supported operations."),
+        "connect": ("Requests", "response, reason", "Send CONNECT using the URL’s authority as the request target. Return the handshake response and close the connection; tunnel streams are not exposed."),
+        "trace": ("Requests", "response, reason", "TRACE shorthand. Return the server’s diagnostic response."),
         "download": ("Requests", "path, reason", "GET binary data to a file. Require a 2xx status, create parent directories, and replace the target only after the complete bounded download succeeds. Failure leaves an existing target intact."),
-    }, "Headers are an atom-keyed dict of strings or lists of strings. Response header names are lowercase, with lists preserving repeated values. TLS certificates are verified; redirects are followed up to 10. `timeout` is a positive total duration in seconds; `max_bytes` caps the decoded body (16 MiB by default, buffered in memory). Each call has a strict and a fallback overload. Operational failures report a reason or crash; invalid arguments always crash.",
-        'use http\nuse json\nresponse, reason := http::get "https://example.com", :null\nif reason == :null\n\tprint response.status\nelse\n\tprint reason\nend'),
+    }, "Method shorthands share `request` options and fallback behavior. Use `request` for custom methods. Headers are an atom-keyed dict of strings or lists of strings. Response header names are lowercase, with lists preserving repeated values. TLS certificates are verified; redirects are followed up to 10. `timeout` is a positive total duration in seconds; `max_bytes` caps the decoded body (16 MiB by default, buffered in memory). Each call has a strict and a fallback overload. Operational failures report a reason or crash; invalid arguments always crash.",
+        'use http\nuse json\nbody := json::stringify { :ready : :true }\nresponse, reason := http::patch "https://example.com/item", body, :null,\n\theaders = { :content-type : "application/json" }\nif reason == :null\n\tprint response.status\nelse\n\tprint reason\nend'),
 }
 
 ATOM_GROUPS += [

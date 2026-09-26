@@ -37,13 +37,9 @@ pub(crate) fn call(native: Native, args: &[Option<Value>]) -> Result<Vec<Value>,
             v => text(&v).map(|s| s.to_ascii_uppercase()),
         })
         .transpose()?
-        .unwrap_or_else(|| {
-            if native.name() == "post" {
-                "POST"
-            } else {
-                "GET"
-            }
-            .into()
+        .unwrap_or_else(|| match native.name() {
+            "download" => "GET".into(),
+            name => name.to_ascii_uppercase(),
         });
     let body = arg("body")
         .map(|v| match deref(&v)? {

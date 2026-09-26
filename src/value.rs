@@ -335,6 +335,20 @@ pub enum Native {
     HttpGetOr,
     HttpPost,
     HttpPostOr,
+    HttpHead,
+    HttpHeadOr,
+    HttpPut,
+    HttpPutOr,
+    HttpPatch,
+    HttpPatchOr,
+    HttpDelete,
+    HttpDeleteOr,
+    HttpOptions,
+    HttpOptionsOr,
+    HttpConnect,
+    HttpConnectOr,
+    HttpTrace,
+    HttpTraceOr,
     HttpDownload,
     HttpDownloadOr,
 
@@ -409,6 +423,20 @@ pub const NATIVES: &[Native] = &[
     Native::HttpGetOr,
     Native::HttpPost,
     Native::HttpPostOr,
+    Native::HttpHead,
+    Native::HttpHeadOr,
+    Native::HttpPut,
+    Native::HttpPutOr,
+    Native::HttpPatch,
+    Native::HttpPatchOr,
+    Native::HttpDelete,
+    Native::HttpDeleteOr,
+    Native::HttpOptions,
+    Native::HttpOptionsOr,
+    Native::HttpConnect,
+    Native::HttpConnectOr,
+    Native::HttpTrace,
+    Native::HttpTraceOr,
     Native::HttpDownload,
     Native::HttpDownloadOr,
 
@@ -521,6 +549,20 @@ impl Native {
             Native::HttpGetOr => info!(HTTP, "get", "get(url, fallback, *, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("fallback", Plain), ("", Star), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
             Native::HttpPost => info!(HTTP, "post", "post(url, body, *, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("body", Plain), ("", Star), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
             Native::HttpPostOr => info!(HTTP, "post", "post(url, body, fallback, *, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("body", Plain), ("fallback", Plain), ("", Star), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
+            Native::HttpHead => info!(HTTP, "head", "head(url, *, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("", Star), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
+            Native::HttpHeadOr => info!(HTTP, "head", "head(url, fallback, *, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("fallback", Plain), ("", Star), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
+            Native::HttpPut => info!(HTTP, "put", "put(url, body, *, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("body", Plain), ("", Star), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
+            Native::HttpPutOr => info!(HTTP, "put", "put(url, body, fallback, *, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("body", Plain), ("fallback", Plain), ("", Star), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
+            Native::HttpPatch => info!(HTTP, "patch", "patch(url, body, *, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("body", Plain), ("", Star), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
+            Native::HttpPatchOr => info!(HTTP, "patch", "patch(url, body, fallback, *, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("body", Plain), ("fallback", Plain), ("", Star), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
+            Native::HttpDelete => info!(HTTP, "delete", "delete(url, *, body = :null, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("", Star), ("body", Def), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
+            Native::HttpDeleteOr => info!(HTTP, "delete", "delete(url, fallback, *, body = :null, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("fallback", Plain), ("", Star), ("body", Def), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
+            Native::HttpOptions => info!(HTTP, "options", "options(url, *, body = :null, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("", Star), ("body", Def), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
+            Native::HttpOptionsOr => info!(HTTP, "options", "options(url, fallback, *, body = :null, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("fallback", Plain), ("", Star), ("body", Def), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
+            Native::HttpConnect => info!(HTTP, "connect", "connect(url, *, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("", Star), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
+            Native::HttpConnectOr => info!(HTTP, "connect", "connect(url, fallback, *, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("fallback", Plain), ("", Star), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
+            Native::HttpTrace => info!(HTTP, "trace", "trace(url, *, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("", Star), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
+            Native::HttpTraceOr => info!(HTTP, "trace", "trace(url, fallback, *, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("fallback", Plain), ("", Star), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
             Native::HttpDownload => info!(HTTP, "download", "download(url, path, *, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("path", Plain), ("", Star), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
             Native::HttpDownloadOr => info!(HTTP, "download", "download(url, path, fallback, *, headers = {}, timeout = 30, max_bytes = 16777216)", &[("url", Plain), ("path", Plain), ("fallback", Plain), ("", Star), ("headers", Def), ("timeout", Def), ("max_bytes", Def)]),
             Native::Alive => info!(None, "alive", "alive()", &[]),
@@ -798,6 +840,20 @@ impl Native {
             Native::HttpGetOr |
             Native::HttpPost |
             Native::HttpPostOr |
+            Native::HttpHead |
+            Native::HttpHeadOr |
+            Native::HttpPut |
+            Native::HttpPutOr |
+            Native::HttpPatch |
+            Native::HttpPatchOr |
+            Native::HttpDelete |
+            Native::HttpDeleteOr |
+            Native::HttpOptions |
+            Native::HttpOptionsOr |
+            Native::HttpConnect |
+            Native::HttpConnectOr |
+            Native::HttpTrace |
+            Native::HttpTraceOr |
             Native::HttpDownload |
             Native::HttpDownloadOr |
             Native::Receive

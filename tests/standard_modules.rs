@@ -523,3 +523,97 @@ fn https_rejects_untrusted_certificates_as_tls_failure() {
     assert_eq!(value(&r, "reason"), ":tls");
     server.join().unwrap();
 }
+
+#[test]
+fn every_http_shorthand_sends_its_method_body_and_options() {
+    for method in [
+        "get", "head", "post", "put", "patch", "delete", "options", "connect", "trace",
+    ] {
+        for fallback in [false, true] {
+            let no_response_body = matches!(method, "head" | "connect");
+            // HEAD's content-length describes the resource, not a response body.
+            let wire_response = if method == "head" {
+                b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\nConnection: close\r\n\r\n".to_vec()
+            } else {
+                response("200 OK", "", if no_response_body { b"" } else { b"ok" })
+            };
+            let (url, server) = server(wire_response, Duration::ZERO);
+            let positional_body = matches!(method, "post" | "put" | "patch");
+            let named_body = matches!(method, "delete" | "options");
+            let mut args = q(&url);
+            if positional_body {
+                args.push_str(", \"payload\"");
+            }
+            if fallback {
+                args.push_str(", :null");
+            }
+            if named_body {
+                args.push_str(", body = \"payload\"");
+            }
+            args.push_str(", headers = { :x-test : \"shorthand\" }, timeout = 2, max_bytes = 32");
+            let r = run(&format!("use http\nr, reason := http::{method}({args})\nstatus := r.status\nbody := r.body\n"));
+            assert_eq!(value(&r, "status"), "200", "{method}");
+            assert_eq!(value(&r, "reason"), ":null", "{method}");
+            assert_eq!(
+                value(&r, "body"),
+                if no_response_body { "" } else { "ok" },
+                "{method}"
+            );
+            let sent = server.join().unwrap();
+            let target = if method == "connect" {
+                url.strip_prefix("http://").unwrap()
+            } else {
+                "/"
+            };
+            assert!(
+                sent.starts_with(&format!("{} {target} HTTP/1.1\r\n", method.to_uppercase())),
+                "{sent}"
+            );
+            assert!(
+                sent.to_lowercase().contains("x-test: shorthand\r\n"),
+                "{sent}"
+            );
+            let body = sent.split_once("\r\n\r\n").unwrap().1;
+            assert_eq!(
+                body,
+                if positional_body || named_body {
+                    "payload"
+                } else {
+                    ""
+                },
+                "{method}"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_new_http_shorthand_reports_transport_failures() {
+    for method in [
+        "head", "put", "patch", "delete", "options", "connect", "trace",
+    ] {
+        for fallback in [false, true] {
+            let (url, server) = server(b"not an HTTP response\r\n\r\n".to_vec(), Duration::ZERO);
+            let body = if matches!(method, "put" | "patch") {
+                ", \"payload\""
+            } else {
+                ""
+            };
+            let fallback_arg = if fallback { ", 42" } else { "" };
+            let r = run(&format!(
+                "use http\nr, reason := http::{method}({}{body}{fallback_arg}, timeout = 2)",
+                q(&url)
+            ));
+            if fallback {
+                assert_eq!(value(&r, "r"), "42", "{method}");
+                assert_eq!(value(&r, "reason"), ":network", "{method}");
+            } else {
+                assert!(
+                    r.crash.is_some(),
+                    "{method} should crash without a fallback"
+                );
+            }
+            server.join().unwrap();
+        }
+    }
+}
