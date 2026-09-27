@@ -15,3 +15,7 @@ print odd
 print list::chunk_by([1, 3, 2, 4, 5], fn(n) n % 2)
 print list::windows(squares, 2)
 print list::combinations(["red", "green", "blue"], 2)
+
+// Two bounds choose a start; a named step also works from zero.
+print list::range(2, 8)
+print list::range(8, step = 2)

@@ -466,3 +466,32 @@ print "UNREACHABLE"
     }
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn list_range_has_explicit_end_only_and_start_end_overloads() {
+    for (expr, expected) in [
+        ("list::range(5)", "[0, 1, 2, 3, 4]"),
+        ("list::range(5, step = 2)", "[0, 2, 4]"),
+        ("list::range(2, 5)", "[2, 3, 4]"),
+        ("list::range(-5, step = -2)", "[0, -2, -4]"),
+        ("list::range(5, 0, step = -2)", "[5, 3, 1]"),
+        ("list::range(0)", "[]"),
+    ] {
+        assert_eq!(eval(expr), expected, "{expr}");
+    }
+    for expr in [
+        "list::range(5, :null)",
+        "list::range(:null)",
+        "list::range(start = 5)",
+    ] {
+        assert!(
+            run(&format!(
+                "use list
+x := {expr}"
+            ))
+            .crash
+            .is_some(),
+            "{expr}"
+        );
+    }
+}

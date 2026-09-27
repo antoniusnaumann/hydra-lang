@@ -125,16 +125,13 @@ pub(crate) fn call(native: Native, args: &[Option<Value>]) -> Result<Vec<Value>,
     let list = |name| items(&arg(name));
     let one = |v| Ok(vec![v]);
     let out = match native {
-        Native::ListRange => {
-            let mut start = number(&arg("start"))?;
-            let end = match arg("end") {
-                Value::Sym(s) if s.name() == "null" => {
-                    let end = start;
-                    start = 0.0;
-                    end
-                }
-                v => number(&v)?,
+        Native::ListRange | Native::ListRangeTo => {
+            let start = if native == Native::ListRangeTo {
+                0.0
+            } else {
+                number(&arg("start"))?
             };
+            let end = number(&arg("end"))?;
             let step = argument(args, native, "step")
                 .map(|v| number(&v))
                 .transpose()?

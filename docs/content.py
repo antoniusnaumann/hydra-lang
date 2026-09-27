@@ -155,7 +155,7 @@ MODULES = {
         'use http\nuse json\nbody := json::stringify { :ready : :true }\nresponse, reason := http::patch "https://example.com/item", body, :null,\n\theaders = { :content-type : "application/json" }\nif reason == :null\n\tprint response.status\nelse\n\tprint reason\nend'),
 
     "list": ("Eager list operations, with Rust-style callbacks and itertools conveniences.", {
-        "range": ("Create", "list", "Exclusive integer range. One argument means 0 through start-1; negative steps count down. Step must be nonzero; integers must be exactly representable."),
+        "range": ("Create", "list", "Exclusive integer range. One positional argument is end; two are start, end. Use range(end, step = 2) for a zero-based range with a custom step. Negative steps count down. Step must be nonzero; bounds and step must be exactly representable integers."),
         "repeat": ("Create", "list", "Copy value count times."),
         "map": ("Transform", "list", "Apply f(item) to each item."),
         "filter": ("Transform", "list", "Keep items whose f(item) is truthy."),
@@ -216,7 +216,7 @@ MODULES = {
         "combinations": ("Combinatorics", "list", "Size-item selections in input order, without replacement. Equal values at different positions remain distinct."),
         "permutations": ("Combinatorics", "list", "Size-item ordered selections without replacement, in input-index order."),
     }, "All operations are eager; no iter() or collect(). Inputs keep value semantics. Callbacks run in order, may capture variables or suspend, and their results are consumed as data. Predicates use normal truthiness. Ordering rejects mixed types, dicts, functions, and NaN; atoms sort by name. Counts and indices are nonnegative integers. Combinations/permutations of size zero give [[]]; size beyond length gives []. Expanding native operations cap output at one million elements; windows and combinatorial selections also count copied entries.",
-        'use list\nvalues := list::range(10)\n    .list::map(fn(x) x * x)\n    .list::filter(fn(x) x > 20)\nprint values\nyes, no := list::partition(values, fn(x) x % 2 == 0)\nprint list::windows(yes, 2)'),
+        'use list\nvalues := list::range(10, step = 2)\n    .list::map(fn(x) x * x)\n    .list::filter(fn(x) x > 20)\nprint values\nyes, no := list::partition(values, fn(x) x % 2 == 0)\nprint list::windows(yes, 2)'),
     "cli": ("Argument parsers with generated help, typed options, and subcommands.", {
         "parser": ("Build", "parser", "Create a copyable parser. prog defaults to the script filename; add_help registers -h and --help."),
         "add_argument": ("Build", ":null", "Add one positional name or option aliases through &parser. Return fields use atom keys; default dest strips leading dashes and changes hyphens to underscores."),
