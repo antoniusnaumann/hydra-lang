@@ -244,25 +244,9 @@ maybe := a.maybe
 }
 
 #[test]
-fn cli_try_parse_is_non_exiting_and_non_strict_parse_keeps_unknowns() {
-    for argv in [
-        "[\"--mode\",\"wrong\"]",
-        "[\"--number\",\"no\"]",
-        "[\"--wat\"]",
-        "[\"--number\"]",
-    ] {
-        let r = run(&format!(
-            "{CLI_BASE}\na, reason, message := cli::try_parse_args(p, {argv})\nafter := 42\n"
-        ));
-        assert_eq!(read(&r, "reason"), ":invalid");
-        assert!(read(&r, "message").contains("demo: error:"));
-        assert_eq!(read(&r, "after"), "42");
-    }
-    let r = run(&format!(
-        "{CLI_BASE}\na, reason, message := cli::try_parse_args(p, [\"--help\"])\n"
-    ));
-    assert_eq!(read(&r, "reason"), ":help");
-    let help = read(&r, "message");
+fn cli_format_help_and_non_strict_parse_keeps_unknowns() {
+    let r = run(&format!("{CLI_BASE}\nhelp := cli::format_help(p)\n"));
+    let help = read(&r, "help");
     for text in [
         "usage: demo",
         "A useful tool",
@@ -289,7 +273,6 @@ a := cli::parse_args(root, ["build", "--release", "app"])
 command := a.command
 release := a.release
 target := a.target
-b, reason, message := cli::try_parse_args(root, ["build", "--help"])
 copy := root
 cli::add_argument(&copy, "--extra")
 original := cli::format_help(root)
@@ -298,8 +281,6 @@ changed := cli::format_help(copy)
     assert_eq!(read(&r, "command"), "build");
     assert_eq!(read(&r, "release"), ":true");
     assert_eq!(read(&r, "target"), "app");
-    assert_eq!(read(&r, "reason"), ":help");
-    assert!(read(&r, "message").contains("usage: tool build"));
     assert!(!read(&r, "original").contains("--extra"));
     assert!(read(&r, "changed").contains("--extra"));
 }
@@ -349,7 +330,7 @@ fn cli_help_and_errors_exit_from_real_scripts() {
 }
 
 #[test]
-fn cli_constants_versions_and_child_errors() {
+fn cli_constants_and_optional_subcommands() {
     let r = run(r#"use cli
 p := cli::parser(prog = "tool")
 cli::add_argument(&p, "--fast", action = :store_const, const = :fast)
@@ -358,21 +339,15 @@ cli::add_argument(&p, "--version", action = :version, version = "tool 1.0")
 a := cli::parse_args(p, ["--fast", "--tag", "--tag"])
 fast := a.fast
 tags := a.tag
-_, reason, version := cli::try_parse_args(p, ["--version"])
 child := cli::parser()
 cli::add_argument(&child, "target")
 cli::add_subparser(&p, "build", child, required = :false)
 empty := cli::parse_args(p, [])
 command := empty.command
-_, child_reason, message := cli::try_parse_args(p, ["build"])
 "#);
     assert_eq!(read(&r, "fast"), ":fast");
     assert_eq!(read(&r, "tags"), "[:tag, :tag]");
-    assert_eq!(read(&r, "reason"), ":help");
-    assert_eq!(read(&r, "version"), "tool 1.0\n");
     assert_eq!(read(&r, "command"), ":null");
-    assert_eq!(read(&r, "child_reason"), ":invalid");
-    assert!(read(&r, "message").contains("tool build: error:"));
 }
 
 #[test]
@@ -450,4 +425,44 @@ enabled := args.enabled
     let r = run("use cli\np := cli::parser()\ncli::add_argument(&p, \"--name\")\na, extras := cli::parse_args(p, strict = :false)\nname := a.name");
     assert_eq!(read(&r, "name"), "Hydra");
     assert_eq!(read(&r, "extras"), "[]");
+}
+
+#[test]
+fn cli_help_versions_and_child_errors_exit_with_diagnostics() {
+    let path =
+        std::env::temp_dir().join(format!("hydra-cli-diagnostics-{}.hy", std::process::id()));
+    let source = format!(
+        r#"{CLI_BASE}
+cli::add_argument(&p, "--version", action = :version, version = "demo 1.0")
+child := cli::parser(description = "Build things")
+cli::add_argument(&child, "target")
+cli::add_subparser(&p, "build", child, required = :false)
+_ = cli::parse_args(p)
+print "UNREACHABLE"
+"#
+    );
+    std::fs::write(&path, source).unwrap();
+    for (args, code, needle) in [
+        (vec!["--help"], 0, "A useful tool"),
+        (vec!["--version"], 0, "demo 1.0"),
+        (vec!["--mode", "wrong"], 2, "invalid choice"),
+        (vec!["--number"], 2, "expected 1 value"),
+        (vec!["build", "--help"], 0, "usage: demo build"),
+        (vec!["build"], 2, "demo build: error:"),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_hydra"))
+            .arg("run")
+            .arg(&path)
+            .arg("--")
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(code));
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(!stdout.contains("UNREACHABLE"));
+        let diagnostic = if code == 0 { &stdout } else { &stderr };
+        assert!(diagnostic.contains(needle), "{diagnostic}");
+    }
+    std::fs::remove_file(path).unwrap();
 }

@@ -222,7 +222,6 @@ MODULES = {
         "add_argument": ("Build", ":null", "Add one positional name or option aliases through &parser. Return fields use atom keys; default dest strips leading dashes and changes hyphens to underscores."),
         "add_subparser": ("Build", ":null", "Attach a copy of a configured child parser. The chosen command name goes in dest; child fields merge into the result. Commands are required by default."),
         "parse_args": ("Parse", "dict, extras", "Parse explicit string arguments, or script arguments after -- when omitted. With strict = :true, reject unknown arguments and return [] as extras on success; strict = :false returns unknown arguments in extras. Print help/version to stdout and stop with status 0; print input errors to stderr and stop with status 2."),
-        "try_parse_args": ("Parse", "dict or :null, reason, message", "Never print or exit. Success gives dict, :null, \"\"; help/version gives :null, :help, text; bad input gives :null, :invalid, diagnostic. Invalid parser definitions still crash."),
         "format_help": ("Help", "string", "Render usage, description, arguments, choices, commands, and epilog without printing."),
         "format_usage": ("Help", "string", "Render the compact usage line without printing."),
     }, "Types: :string (default), :int (exact integers), :float (finite). Actions: :store, :store_true, :store_false, :store_const, :append, :append_const, :count, :help, :version. Use const for constant actions or an option with nargs=\"?\"; version supplies version text. nargs accepts a positive count, \"?\", \"*\", or \"+\". choices checks converted values. Absent values default to :null; flags to false/true, counts to 0, repeated values to []. String defaults are converted. Supports --name=value, -n3, -vv, negative numbers, and -- to end options. Long options require exact spelling. Parent options precede subcommands. Configure each child before attaching it; later edits do not alter the attached copy.",
@@ -236,7 +235,7 @@ ATOM_GROUPS += [
         (":stderr", "Error output stream for `io::write`, `flush`, and `is_terminal`."),
     ]),
     ("module-reasons", "Additional module reasons", [
-        (":invalid", "Malformed JSON, timestamp, or command-line input."),
+        (":invalid", "Malformed JSON or timestamp."),
         (":timeout", "HTTP operation exceeded its time limit."),
         (":dns", "HTTP hostname could not be resolved."),
         (":tls", "TLS negotiation or certificate verification failed."),
@@ -259,7 +258,7 @@ ATOM_GROUPS += [
         (":store_const", "A present flag stores const."),
         (":append_const", "Each occurrence appends const to a list."),
         (":count", "Count occurrences of an option."),
-        (":help", "Show parser help; also the non-exiting parser’s help/version reason."),
+        (":help", "Show parser help and exit successfully."),
         (":version", "Show the configured version text."),
     ]),
 ]

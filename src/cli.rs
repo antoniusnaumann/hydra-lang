@@ -827,21 +827,16 @@ pub(crate) fn call(
                 Some(v) if null(&v) => script_args.to_vec(),
                 Some(v) => strings(&v)?,
             };
-            let known =
-                native == Native::CliParseArgs && !default("strict", boolean(true)).truthy();
+            let known = !default("strict", boolean(true)).truthy();
             match parse(&p, &specs, &tokens, known, 0) {
-                Ok(parsed) => Ok(Outcome::Values(match native {
-                    Native::CliParseArgs => vec![
-                        parsed.values,
-                        new_list(parsed.unknown.into_iter().map(string).collect()),
-                    ],
-                    Native::CliTryParseArgs => vec![parsed.values, Value::null(), string("")],
-                    _ => vec![parsed.values],
-                })),
+                Ok(parsed) => Ok(Outcome::Values(vec![
+                    parsed.values,
+                    new_list(parsed.unknown.into_iter().map(string).collect()),
+                ])),
                 Err(error) => {
-                    let (code, message, reason) = match error {
-                        ParseError::Display(message) => (0, message, "help"),
-                        ParseError::Formatted(message) => (2, message, "invalid"),
+                    let (code, message) = match error {
+                        ParseError::Display(message) => (0, message),
+                        ParseError::Formatted(message) => (2, message),
                         ParseError::Input(error) => (
                             2,
                             format!(
@@ -849,18 +844,9 @@ pub(crate) fn call(
                                 usage(&p, &specs)?,
                                 text(&field(&p, "prog")?)?
                             ),
-                            "invalid",
                         ),
                     };
-                    if native == Native::CliTryParseArgs {
-                        Ok(Outcome::Values(vec![
-                            Value::null(),
-                            Value::Sym(sym(reason)),
-                            string(message),
-                        ]))
-                    } else {
-                        Ok(Outcome::Exit { code, message })
-                    }
+                    Ok(Outcome::Exit { code, message })
                 }
             }
         }
