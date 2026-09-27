@@ -28,7 +28,7 @@ Bare `return` is shorthand for `return()`.
 
 ## Reference
 
-[Compact documentation](docs/index.html) — language, builtins, atoms, and standard modules.
+[Compact documentation](https://antoniusnaumann.github.io/hydra-lang/) — language, builtins, atoms, and standard modules.
 Run `direnv allow` once, then `docs` to regenerate, serve locally, and open the
 reference. Stop it with Ctrl-C. The command is available inside this repository
 when your shell has the direnv hook enabled.

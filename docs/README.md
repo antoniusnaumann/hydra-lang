@@ -1,5 +1,9 @@
 # Compact reference
 
+Published at https://antoniusnaumann.github.io/hydra-lang/. GitHub Pages serves
+this directory from `main`; pushing updated generated files republishes the site.
+`.nojekyll` keeps the generated HTML unchanged.
+
 Open `index.html` directly, or serve this directory. The site works offline and
 has no browser dependencies. Regeneration requires Python 3.11+ and Rust/Cargo.
 
