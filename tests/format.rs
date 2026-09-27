@@ -278,3 +278,30 @@ fn formatting_retains_parenthesis_free_call_boundaries() {
         assert_eq!(fmt_idempotent(source), expected);
     }
 }
+
+#[test]
+fn import_groups_are_separated_from_following_lines() {
+    for (source, expected) in [
+        ("use fs\nx := 1\n", "use fs\n\nx := 1\n"),
+        ("use fs\nuse text as strings\nuse list as *\nx := 1\n",
+         "use fs\nuse text as strings\nuse list as *\n\nx := 1\n"),
+        ("use fs // paths\n// next section\nx := 1\n",
+         "use fs // paths\n\n// next section\nx := 1\n"),
+        ("use fs\n// strings\nuse text\nx := 1\n",
+         "use fs\n\n// strings\nuse text\n\nx := 1\n"),
+        ("use fs\n\n\nx := 1\n", "use fs\n\n\nx := 1\n"),
+        ("use fs", "use fs\n"),
+        ("use fs\nuse text\n", "use fs\nuse text\n"),
+        ("if ready\nuse fs\nx := 1\nend\n",
+         "if ready\n\tuse fs\n\n\tx := 1\nend\n"),
+    ] {
+        assert_eq!(fmt_idempotent(source), expected);
+    }
+}
+
+#[test]
+fn import_spacing_preserves_continuations_in_other_parallel_columns() {
+    let source = "parallel\nuse fs || x := foo\nf() || .bar\nend\n";
+    let formatted = fmt_idempotent(source);
+    assert!(!formatted.contains("\n\n"), "{formatted}");
+}

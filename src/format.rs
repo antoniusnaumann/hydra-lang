@@ -59,6 +59,19 @@ pub fn format_source(src: &str, file: &str) -> Result<String> {
         }
     }
 
+    // Separate consecutive import groups from the next physical line.
+    // Never insert a shared blank into parallel rows: another column may continue.
+    for (&line, tokens) in &lines {
+        if tokens.first().is_some_and(|token| token.is_kw("use"))
+            && !f.rows.contains_key(&line)
+            && !lines.get(&(line + 1))
+                .and_then(|tokens| tokens.first())
+                .is_some_and(|token| token.is_kw("use"))
+        {
+            separate_after.insert(line);
+        }
+    }
+
     let mut out = String::new();
     for line in 1..=line_count {
         let indent = f.indent.get(line as usize).copied().unwrap_or(0);
