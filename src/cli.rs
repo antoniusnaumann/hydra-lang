@@ -827,9 +827,11 @@ pub(crate) fn call(
                 Some(v) if null(&v) => script_args.to_vec(),
                 Some(v) => strings(&v)?,
             };
-            match parse(&p, &specs, &tokens, native == Native::CliParseKnownArgs, 0) {
+            let known =
+                native == Native::CliParseArgs && !default("strict", boolean(true)).truthy();
+            match parse(&p, &specs, &tokens, known, 0) {
                 Ok(parsed) => Ok(Outcome::Values(match native {
-                    Native::CliParseKnownArgs => vec![
+                    Native::CliParseArgs => vec![
                         parsed.values,
                         new_list(parsed.unknown.into_iter().map(string).collect()),
                     ],

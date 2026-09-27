@@ -416,7 +416,6 @@ pub enum Native {
     CliAddArgument,
     CliAddSubparser,
     CliParseArgs,
-    CliParseKnownArgs,
     CliTryParseArgs,
     CliFormatHelp,
     CliFormatUsage,
@@ -518,7 +517,6 @@ pub const NATIVES: &[Native] = &[
     Native::CliAddArgument,
     Native::CliAddSubparser,
     Native::CliParseArgs,
-    Native::CliParseKnownArgs,
     Native::CliTryParseArgs,
     Native::CliFormatHelp,
     Native::CliFormatUsage,
@@ -768,8 +766,7 @@ impl Native {
             Native::CliParser => info!(CLI, "parser", "parser(*, prog = :null, description = \"\", epilog = \"\", add_help = :true)", &[("", Star), ("prog", Def), ("description", Def), ("epilog", Def), ("add_help", Def)]),
             Native::CliAddArgument => info!(CLI, "add_argument", "add_argument(&parser, names*, help = \"\", dest = :null, type = :string, default = :null, required = :false, action = :store, nargs = :null, choices = :null, metavar = :null, const = :null, version = \"\")", &[("parser", Ref), ("names", Variadic), ("help", Def), ("dest", Def), ("type", Def), ("default", Def), ("required", Def), ("action", Def), ("nargs", Def), ("choices", Def), ("metavar", Def), ("const", Def), ("version", Def)]),
             Native::CliAddSubparser => info!(CLI, "add_subparser", "add_subparser(&parser, name, child, *, help = \"\", dest = \"command\", required = :true)", &[("parser", Ref), ("name", Plain), ("child", Plain), ("", Star), ("help", Def), ("dest", Def), ("required", Def)]),
-            Native::CliParseArgs => info!(CLI, "parse_args", "parse_args(parser, args = :null)", &[("parser", Plain), ("args", Def)]),
-            Native::CliParseKnownArgs => info!(CLI, "parse_known_args", "parse_known_args(parser, args = :null)", &[("parser", Plain), ("args", Def)]),
+            Native::CliParseArgs => info!(CLI, "parse_args", "parse_args(parser, args = :null, *, strict = :true)", &[("parser", Plain), ("args", Def), ("", Star), ("strict", Def)]),
             Native::CliTryParseArgs => info!(CLI, "try_parse_args", "try_parse_args(parser, args = :null)", &[("parser", Plain), ("args", Def)]),
             Native::CliFormatHelp => info!(CLI, "format_help", "format_help(parser)", &[("parser", Plain)]),
             Native::CliFormatUsage => info!(CLI, "format_usage", "format_usage(parser)", &[("parser", Plain)]),
@@ -1033,7 +1030,7 @@ impl Native {
             Native::CliTryParseArgs => 3,
             Native::ListPartition |
             Native::ListUnzip |
-            Native::CliParseKnownArgs |
+            Native::CliParseArgs |
             Native::EnvGet |
             Native::EnvGetOr |
             Native::JsonParse |

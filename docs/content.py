@@ -221,13 +221,12 @@ MODULES = {
         "parser": ("Build", "parser", "Create a copyable parser. prog defaults to the script filename; add_help registers -h and --help."),
         "add_argument": ("Build", ":null", "Add one positional name or option aliases through &parser. Return fields use atom keys; default dest strips leading dashes and changes hyphens to underscores."),
         "add_subparser": ("Build", ":null", "Attach a copy of a configured child parser. The chosen command name goes in dest; child fields merge into the result. Commands are required by default."),
-        "parse_args": ("Parse", "dict", "Parse explicit string arguments, or script arguments after -- when omitted. Print help/version to stdout and stop with status 0; print input errors to stderr and stop with status 2."),
-        "parse_known_args": ("Parse", "dict, extras", "Like parse_args, but return unrecognized arguments as a second list instead of rejecting them."),
+        "parse_args": ("Parse", "dict, extras", "Parse explicit string arguments, or script arguments after -- when omitted. With strict = :true, reject unknown arguments and return [] as extras on success; strict = :false returns unknown arguments in extras. Print help/version to stdout and stop with status 0; print input errors to stderr and stop with status 2."),
         "try_parse_args": ("Parse", "dict or :null, reason, message", "Never print or exit. Success gives dict, :null, \"\"; help/version gives :null, :help, text; bad input gives :null, :invalid, diagnostic. Invalid parser definitions still crash."),
         "format_help": ("Help", "string", "Render usage, description, arguments, choices, commands, and epilog without printing."),
         "format_usage": ("Help", "string", "Render the compact usage line without printing."),
     }, "Types: :string (default), :int (exact integers), :float (finite). Actions: :store, :store_true, :store_false, :store_const, :append, :append_const, :count, :help, :version. Use const for constant actions or an option with nargs=\"?\"; version supplies version text. nargs accepts a positive count, \"?\", \"*\", or \"+\". choices checks converted values. Absent values default to :null; flags to false/true, counts to 0, repeated values to []. String defaults are converted. Supports --name=value, -n3, -vv, negative numbers, and -- to end options. Long options require exact spelling. Parent options precede subcommands. Configure each child before attaching it; later edits do not alter the attached copy.",
-        'use cli\np := cli::parser(description = "Greet someone")\ncli::add_argument(&p, "name", help = "Who to greet")\ncli::add_argument(&p, "-n", "--count", type = :int, default = 1)\nargs := cli::parse_args(p)\nprint "Hello, \\(args.name)!"'),
+        'use cli\np := cli::parser(description = "Greet someone")\ncli::add_argument(&p, "name", help = "Who to greet")\ncli::add_argument(&p, "-n", "--count", type = :int, default = 1)\nargs, extras := cli::parse_args(p, strict = :false)\nprint "Hello, \\(args.name)!"'),
 }
 
 ATOM_GROUPS += [

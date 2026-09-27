@@ -244,7 +244,7 @@ maybe := a.maybe
 }
 
 #[test]
-fn cli_try_parse_is_non_exiting_and_parse_known_keeps_unknowns() {
+fn cli_try_parse_is_non_exiting_and_non_strict_parse_keeps_unknowns() {
     for argv in [
         "[\"--mode\",\"wrong\"]",
         "[\"--number\",\"no\"]",
@@ -272,7 +272,7 @@ fn cli_try_parse_is_non_exiting_and_parse_known_keeps_unknowns() {
     ] {
         assert!(help.contains(text), "{help}");
     }
-    let r=run(&format!("{CLI_BASE}\na, extra := cli::parse_known_args(p, [\"--unknown=1\",\"--enabled\"])\nx := a.enabled\n"));
+    let r=run(&format!("{CLI_BASE}\na, extra := cli::parse_args(p, [\"--unknown=1\",\"--enabled\"], strict = :false)\nx := a.enabled\n"));
     assert_eq!(read(&r, "extra"), "[--unknown=1]");
     assert_eq!(read(&r, "x"), ":true");
 }
@@ -330,6 +330,7 @@ fn cli_help_and_errors_exit_from_real_scripts() {
     for (args, code, needle, stderr) in [
         (vec!["--help"], 0, "usage: demo", false),
         (vec![], 2, "required", true),
+        (vec!["--number", "7", "--unknown"], 2, "unrecognized", true),
         (vec!["--number", "bad"], 2, "invalid int", true),
         (vec!["--number", "7"], 0, "7\n", false),
     ] {
@@ -425,4 +426,28 @@ value := a.s
 "#);
     assert_eq!(read(&r, "level"), "3");
     assert_eq!(read(&r, "value"), "=value");
+}
+
+#[test]
+fn cli_parse_args_always_returns_extras_and_forwards_strict_to_subcommands() {
+    for strict in ["", ", strict = :true", ", strict = :false"] {
+        let r = run(&format!(
+            "{CLI_BASE}\na, extras := cli::parse_args(p, []{strict})\n"
+        ));
+        assert_eq!(read(&r, "extras"), "[]");
+    }
+    let r = run(r#"use cli
+p := cli::parser()
+cli::add_argument(&p, "--name")
+child := cli::parser()
+cli::add_argument(&child, "--enabled", action = :store_true)
+cli::add_subparser(&p, "build", child)
+args, extras := cli::parse_args(p, ["--before", "build", "--enabled", "--after", "value"], strict = :false)
+enabled := args.enabled
+"#);
+    assert_eq!(read(&r, "extras"), "[--before, --after, value]");
+    assert_eq!(read(&r, "enabled"), ":true");
+    let r = run("use cli\np := cli::parser()\ncli::add_argument(&p, \"--name\")\na, extras := cli::parse_args(p, strict = :false)\nname := a.name");
+    assert_eq!(read(&r, "name"), "Hydra");
+    assert_eq!(read(&r, "extras"), "[]");
 }
