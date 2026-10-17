@@ -285,7 +285,7 @@ note, bytes := fs::write(fs::join(fs::temp(), "notes", "first.txt"), "one\n")
 text := fs::read(note)
 missing, why := fs::read("gone.txt", "(nothing)")   // :not_found
 
-for entry in fs::list("src", match = "*:hy", recursive = :true)
+for entry in fs::list("src", match = "*:hy", recursive = :true, absolute = :true)
 	print("\(entry.fs::name()) is \(entry.fs::size()) bytes")
 end
 ```

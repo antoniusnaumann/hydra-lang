@@ -26,19 +26,19 @@ print("\(missing) — because \(why)")
 // reaches through the dot (§5.2, §7).
 print("\(note.fs::name()) is \(note.fs::size()) bytes, and a \(note.fs::extension()) file")
 
-// `list` answers with full paths, sorted, so a program over a directory is
-// reproducible (§4).
+// `list` answers paths relative to the directory, sorted, so a program over a
+// directory is reproducible; `absolute = :true` answers paths to read (§4).
 _ = fs::write(fs::join(where, "notes", "second.txt"), "three\n")
 _ = fs::write(fs::join(where, "notes", "ignore.md"), "not this one\n")
 
-for entry in fs::list(fs::join(where, "notes"), match = "*.txt")
+for entry in fs::list(fs::join(where, "notes"), match = "*.txt", absolute = :true)
 	print("  \(entry.fs::name()): \(entry.fs::size()) bytes")
 end
 
 // I/O is a scheduling point, so a trail that reads a file lets its siblings
 // run: this is real overlap, not a loop with extra steps (§7.8).
 total := 0
-parallel for entry in fs::list(fs::join(where, "notes"), match = "*.txt")
+parallel for entry in fs::list(fs::join(where, "notes"), match = "*.txt", absolute = :true)
 	total += entry.fs::read().len()
 end
 print("\(total) characters across the notes")

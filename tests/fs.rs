@@ -208,7 +208,7 @@ fn a_move_refuses_to_clobber_and_a_copy_does_not() {
 // --- reading a directory (§4) ---------------------------------------------------
 
 #[test]
-fn list_answers_full_paths_sorted_and_filtered() {
+fn list_answers_paths_relative_to_dir_sorted_and_filtered() {
     let fs = Sandbox::new("list");
     let src = "
 use fs as *
@@ -220,9 +220,41 @@ all := list(\"src\")
 only := list(\"src\", match = \"*.hy\")
 deep := list(\"src\", match = \"*.hy\", recursive = :true)
 ";
-    assert_eq!(fs.eval(src, "all"), "[src/a.hy, src/b.hy, src/deep, src/notes.txt]");
-    assert_eq!(fs.eval(src, "only"), "[src/a.hy, src/b.hy]");
-    assert_eq!(fs.eval(src, "deep"), "[src/a.hy, src/b.hy, src/deep/c.hy]");
+    assert_eq!(fs.eval(src, "all"), "[a.hy, b.hy, deep, notes.txt]");
+    assert_eq!(fs.eval(src, "only"), "[a.hy, b.hy]");
+    assert_eq!(fs.eval(src, "deep"), "[a.hy, b.hy, deep/c.hy]");
+}
+
+#[test]
+fn list_defaults_to_the_working_directory_and_can_answer_absolute_paths() {
+    let fs = Sandbox::new("list-cwd");
+    let root = std::fs::canonicalize(&fs.root).expect("root");
+    let root = root.to_string_lossy();
+    let src = "
+use fs as *
+write(\"src/a.hy\", \"a\")
+here := list()
+whole := list(\"src\", absolute = :true)
+missing := list(\"nope\", [], absolute = :true)
+";
+    assert_eq!(fs.eval(src, "here"), "[src]");
+    assert_eq!(fs.eval(src, "whole"), format!("[{root}/src/a.hy]"));
+    assert_eq!(fs.eval(src, "missing"), "[]");
+}
+
+#[test]
+fn absolute_and_relative_resolve_against_a_dir_or_the_working_directory() {
+    let fs = Sandbox::new("relative");
+    let root = std::fs::canonicalize(&fs.root).expect("root");
+    let root = root.to_string_lossy();
+    assert_eq!(fs.eval("use fs\nx := fs::absolute(\"a/b\")\n", "x"), format!("{root}/a/b"));
+    assert_eq!(fs.eval("use fs\nx := fs::absolute(\"b\", \"/x/y\")\n", "x"), "/x/y/b");
+    assert_eq!(fs.eval("use fs\nx := fs::absolute(\"/b\", \"/x\")\n", "x"), "/b");
+    let src = format!("use fs\nx := fs::relative(\"{root}/a/b.txt\")\n");
+    assert_eq!(fs.eval(&src, "x"), "a/b.txt");
+    assert_eq!(fs.eval("use fs\nx := fs::relative(\"/x/y/z\", \"/x/q\")\n", "x"), "../y/z");
+    assert_eq!(fs.eval("use fs\nx := fs::relative(\"/x\", \"/x/\")\n", "x"), ".");
+    assert_eq!(fs.eval("use fs\nx := fs::relative(\"/x\", \"/x/y/z\")\n", "x"), "../..");
 }
 
 #[test]
@@ -244,7 +276,7 @@ use fs as *
 write(\"src/a.hy\", \"aa\")
 write(\"src/b.hy\", \"bbb\")
 total := 0
-for entry in list(\"src\", match = \"*.hy\")
+for entry in list(\"src\", match = \"*.hy\", absolute = :true)
 	total += entry.read().len()
 end
 names := []
@@ -266,7 +298,7 @@ use fs as *
 write(\"src/a.hy\", \"aa\")
 write(\"src/b.hy\", \"bbb\")
 seen := []
-parallel for entry in list(\"src\", match = \"*.hy\")
+parallel for entry in list(\"src\", match = \"*.hy\", absolute = :true)
 	push(&seen, entry.read().len())
 end
 total := seen.len()

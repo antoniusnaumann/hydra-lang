@@ -94,6 +94,39 @@ fn normalise(path: &Path) -> PathBuf {
     out
 }
 
+/// The working directory, or `.` where it cannot be read.
+fn cwd() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Resolve `path` against `dir`, and `dir` against the working directory,
+/// without asking the filesystem.
+fn absolutise(path: &Path, dir: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return normalise(path);
+    }
+    let dir = if dir.is_absolute() { dir.to_path_buf() } else { cwd().join(dir) };
+    normalise(&dir.join(path))
+}
+
+/// `path` as seen from `dir`, both made absolute first. Lexical, like
+/// `absolute`: a `..` is a component like any other.
+fn relative(path: &Path, dir: &Path) -> PathBuf {
+    let path = absolutise(path, &cwd());
+    let dir = absolutise(dir, &cwd());
+    let path: Vec<Component> = path.components().collect();
+    let dir: Vec<Component> = dir.components().collect();
+    let shared = path.iter().zip(&dir).take_while(|(a, b)| a == b).count();
+    let mut out = PathBuf::new();
+    for _ in shared..dir.len() {
+        out.push("..");
+    }
+    for part in &path[shared..] {
+        out.push(part.as_os_str());
+    }
+    normalise(&out)
+}
+
 fn show(path: &Path) -> Value {
     string(path.to_string_lossy().to_string())
 }
@@ -170,6 +203,14 @@ pub fn call(native: Native, args: &[Option<Value>]) -> Result<Vec<Value>, Crash>
     let need = |i: usize| -> Result<String, Crash> {
         text_of(&arg(i).unwrap_or_else(Value::null))
     };
+    // A `dir = cwd()` left out is read when the call runs, not when the
+    // builtin was declared.
+    let dir_or_cwd = |i: usize| -> Result<PathBuf, Crash> {
+        Ok(match arg(i) {
+            Some(value) => PathBuf::from(text_of(&value)?),
+            None => cwd(),
+        })
+    };
 
     match native {
         // --- paths: no I/O, so nothing here can fail ------------------------
@@ -204,14 +245,8 @@ pub fn call(native: Native, args: &[Option<Value>]) -> Result<Vec<Value>, Crash>
             let path = PathBuf::from(need(0)?);
             ok(string(path.extension().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()))
         }
-        Native::FsAbsolute => {
-            let path = PathBuf::from(need(0)?);
-            if path.is_absolute() {
-                return ok(show(&normalise(&path)));
-            }
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            ok(show(&normalise(&cwd.join(path))))
-        }
+        Native::FsAbsolute => ok(show(&absolutise(Path::new(&need(0)?), &dir_or_cwd(1)?))),
+        Native::FsRelative => ok(show(&relative(Path::new(&need(0)?), &dir_or_cwd(1)?))),
 
         // --- asking: a path that cannot be looked at is not there -----------
         Native::FsExists => ok(boolean(Path::new(&need(0)?).exists())),
@@ -259,7 +294,7 @@ pub fn call(native: Native, args: &[Option<Value>]) -> Result<Vec<Value>, Crash>
             }
         }
         Native::FsList | Native::FsListOr => {
-            let dir = need(0)?;
+            let dir = dir_or_cwd(0)?;
             let (fallback, flags) = match native {
                 Native::FsListOr => (arg(1), 3),
                 _ => (None, 2),
@@ -269,12 +304,20 @@ pub fn call(native: Native, args: &[Option<Value>]) -> Result<Vec<Value>, Crash>
                 None => "*".to_string(),
             };
             let recursive = truthy(arg(flags + 1), false)?;
+            let absolute = truthy(arg(flags + 2), false)?;
             let mut found: Vec<PathBuf> = Vec::new();
-            match entries(Path::new(&dir), &pattern, recursive, &mut found) {
-                // Full paths, joined onto `dir`, because the next thing anyone
-                // does with an entry is read it (fs §4).
-                Ok(()) => ok_with_reason(new_list(found.iter().map(|p| show(p)).collect())),
-                Err(e) => Failed::at("list", &dir, &e).answer(fallback),
+            match entries(&dir, &pattern, recursive, &mut found) {
+                // Relative to `dir` by default; `absolute = :true` answers
+                // paths that read from anywhere (fs §4).
+                Ok(()) => {
+                    let base = if absolute { absolutise(&dir, &cwd()) } else { PathBuf::new() };
+                    let paths = found
+                        .iter()
+                        .map(|p| show(&base.join(p.strip_prefix(&dir).unwrap_or(p))))
+                        .collect();
+                    ok_with_reason(new_list(paths))
+                }
+                Err(e) => Failed::at("list", &dir.to_string_lossy(), &e).answer(fallback),
             }
         }
 

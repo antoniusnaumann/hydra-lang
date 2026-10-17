@@ -427,6 +427,7 @@ pub enum Native {
     FsStem,
     FsExtension,
     FsAbsolute,
+    FsRelative,
     FsExists,
     FsIsFile,
     FsIsDir,
@@ -598,6 +599,7 @@ pub const NATIVES: &[Native] = &[
     Native::FsStem,
     Native::FsExtension,
     Native::FsAbsolute,
+    Native::FsRelative,
     Native::FsExists,
     Native::FsIsFile,
     Native::FsIsDir,
@@ -825,7 +827,18 @@ impl Native {
             Native::FsExtension => {
                 info!(FS, "extension", "extension(path)", &[("path", Plain)])
             }
-            Native::FsAbsolute => info!(FS, "absolute", "absolute(path)", &[("path", Plain)]),
+            Native::FsAbsolute => info!(
+                FS,
+                "absolute",
+                "absolute(path, dir = cwd())",
+                &[("path", Plain), ("dir", Def)]
+            ),
+            Native::FsRelative => info!(
+                FS,
+                "relative",
+                "relative(path, dir = cwd())",
+                &[("path", Plain), ("dir", Def)]
+            ),
 
             // --- fs: asking -----------------------------------------------
             Native::FsExists => info!(FS, "exists", "exists(path)", &[("path", Plain)]),
@@ -866,19 +879,20 @@ impl Native {
             Native::FsList => info!(
                 FS,
                 "list",
-                "list(dir, *, match = \"*\", recursive = :false)",
-                &[("dir", Plain), ("", Star), ("match", Def), ("recursive", Def)]
+                "list(dir = cwd(), *, match = \"*\", recursive = :false, absolute = :false)",
+                &[("dir", Def), ("", Star), ("match", Def), ("recursive", Def), ("absolute", Def)]
             ),
             Native::FsListOr => info!(
                 FS,
                 "list",
-                "list(dir, fallback, *, match = \"*\", recursive = :false)",
+                "list(dir, fallback, *, match = \"*\", recursive = :false, absolute = :false)",
                 &[
                     ("dir", Plain),
                     ("fallback", Plain),
                     ("", Star),
                     ("match", Def),
-                    ("recursive", Def)
+                    ("recursive", Def),
+                    ("absolute", Def)
                 ]
             ),
 

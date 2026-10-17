@@ -63,8 +63,13 @@ parent(path)            // "src/vm/mod.hy" -> "src/vm"
 name(path)              // -> "mod.hy"
 stem(path)              // -> "mod"
 extension(path)         // -> "hy", with no dot
-absolute(path)          // -> "/home/a/src/vm/mod.hy"
+absolute(path, dir = cwd())  // -> "/home/a/src/vm/mod.hy"
+relative(path, dir = cwd())  // "/home/a/src/vm/mod.hy" -> "src/vm/mod.hy"
 ```
+
+`absolute` and `relative` resolve a relative `dir` against the working
+directory first. Both are lexical: they do not resolve symlinks, and `..` is a
+component like any other.
 
 `join` is variadic (channels §6.1), which is what makes it read like the
 sentence it is. It also normalises: `join("a/", "/b")` is `"a/b"`.
@@ -100,20 +105,21 @@ read(path, fallback)      // -> text, why
 lines(path)               // -> list of lines
 lines(path, fallback)     // -> list of lines, why
 
-list(dir, *, match = "*", recursive = :false)            // -> paths
-list(dir, fallback, *, match = "*", recursive = :false)  // -> paths, why
+list(dir = cwd(), *, match = "*", recursive = :false, absolute = :false)    // -> paths
+list(dir, fallback, *, match = "*", recursive = :false, absolute = :false)  // -> paths, why
 ```
 
-**[P]** `list` answers with **full paths**, joined onto `dir`, because the next
-thing anyone does with an entry is read it. They come back **sorted**, so a
-program over a directory is reproducible.
+**[P]** `list` answers paths **relative to `dir`** by default, so `list()` in
+the working directory answers paths that read from there. `absolute = :true`
+answers absolute paths instead, which read from anywhere. They come back
+**sorted**, so a program over a directory is reproducible.
 
 **[P]** `match` is a glob with `*` and `?` and nothing else. `recursive` is what
 `**` would have been, and having it as a flag keeps one pattern language rather
 than two.
 
 ```hydra
-for entry in list("src", match = "*:hy", recursive = :true)
+for entry in list("src", match = "*:hy", recursive = :true, absolute = :true)
 	print("\(entry.name()) is \(entry.size()) bytes")
 end
 ```
@@ -178,7 +184,7 @@ if "config.json".exists() and not "build".is_dir()
 end
 
 total := 0
-parallel for file in list("src", match = "*:hy")
+parallel for file in list("src", match = "*:hy", absolute = :true)
 	total += file.read().len()
 end
 ```
@@ -198,7 +204,7 @@ The qualifier reaching through the dot is what keeps that from being verbose:
 ```hydra
 use fs
 
-for entry in cwd().fs::list(match = "*:hy")
+for entry in fs::list(match = "*:hy")
 	print("\(entry.fs::name()) is \(entry.fs::size()) bytes")
 end
 ```
@@ -208,7 +214,7 @@ is the qualified form, and
 ```hydra
 use fs as *
 
-for entry in list(cwd(), match = "*:hy")
+for entry in list(match = "*:hy")
 	print("\(entry.name()) is \(entry.size()) bytes")
 end
 ```
