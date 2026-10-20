@@ -22,11 +22,22 @@ read-modify-write, `list` pipelines, sorting, string building, dict counting,
 and nested-list matrix multiply.
 
 **Practical:** inputs are generated deterministically into `bench/.data/`
-(ignored by git) and reused while their size is unchanged: a Zipf-distributed
-text file (`read_lines`, `grep`, `word_count`), a CSV file (`csv_aggregate`),
-and a JSON array of records (`json_records`). `write_lines` formats, writes, and
-rereads a file. Python reads files line by line, as it idiomatically would;
-Hydra uses `fs::lines`.
+(ignored by git) and reused while their size is unchanged:
+
+| Input | Cases |
+|---|---|
+| Zipf-distributed text | `read_lines`, `grep`, `word_count`, `top_words` (frequencies, then sorting) |
+| CSV rows | `csv_aggregate` |
+| JSON array of records | `json_records`, `json_groups` (grouping by a nested field), `report` (a padded text table) |
+| access log with timestamps | `log_stats` (per-status and per-path statistics), `sessions` (sort by client and time, split on gaps) |
+| INI file | `ini_parse` (sections, comments, `key = value` with `=` in values) |
+| edge list | `graph_bfs` (adjacency lists, breadth-first search) |
+| inventory events | `inventory` (per-item records updated through a `&` helper function) |
+
+`write_lines` formats, writes, and rereads a file. Python reads files line by
+line, as it idiomatically would; Hydra uses `fs::lines`. The cases after the
+first six were written after the interpreter was tuned against those, to check
+that the gains are not specific to them.
 
 Sizes are chosen so the full suite finishes in a few minutes. `--scale`
 multiplies the work in every case; `fib_recursive` and `matmul` adjust their

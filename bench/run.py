@@ -78,8 +78,20 @@ FIXTURE_LINES = {
     "text.txt": count(200_000),
     "data.csv": count(200_000),
     "records.json": count(40_000),
+    "logs.txt": count(200_000),
+    "edges.txt": count(200_000),
+    "config.ini": count(20_000),
+    "events.csv": count(300_000),
 }
-FIXTURE_UNITS = {"text.txt": "lines", "data.csv": "rows", "records.json": "records"}
+FIXTURE_UNITS = {
+    "text.txt": "lines",
+    "data.csv": "rows",
+    "records.json": "records",
+    "logs.txt": "requests",
+    "edges.txt": "edges",
+    "config.ini": "sections",
+    "events.csv": "events",
+}
 
 CASES_LIST: list[Case] = [
     Case("startup", "baseline", "Start the interpreter and print one number", lambda s, d: []),
@@ -112,6 +124,22 @@ CASES_LIST: list[Case] = [
     Case("write_lines", "practical", "Format lines, write a file, read it back",
          lambda s, d: [str(count(300_000)(s)), str(d / "out.txt")],
          lambda s: f"{count(300_000)(s):,} lines"),
+    Case("log_stats", "practical", "Access log: requests per status, bytes per path, slowest path",
+         fixture("logs.txt"), fixture_size("logs.txt")),
+    Case("sessions", "practical", "Sort requests by client and time, then split into sessions",
+         fixture("logs.txt"), fixture_size("logs.txt")),
+    Case("top_words", "practical", "Word frequencies, then the ten most common by sorting",
+         fixture("text.txt"), fixture_size("text.txt")),
+    Case("json_groups", "practical", "Group JSON records by a nested field and aggregate",
+         fixture("records.json"), fixture_size("records.json")),
+    Case("report", "practical", "Render matching JSON records as a text table",
+         fixture("records.json"), fixture_size("records.json")),
+    Case("ini_parse", "practical", "Parse an INI file into sections and typed values",
+         fixture("config.ini"), fixture_size("config.ini")),
+    Case("graph_bfs", "practical", "Read an edge list, build adjacency lists, breadth-first search",
+         fixture("edges.txt"), fixture_size("edges.txt")),
+    Case("inventory", "practical", "Apply order events to per-item records through helper functions",
+         fixture("events.csv"), fixture_size("events.csv")),
 ]
 
 
@@ -166,7 +194,66 @@ def write_json(path: Path, records: int) -> None:
     path.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
 
 
-WRITERS = {"text.txt": write_text, "data.csv": write_csv, "records.json": write_json}
+METHODS = ["GET"] * 7 + ["POST"] * 2 + ["PUT", "DELETE"]
+STATUSES = [200] * 14 + [201, 204, 301, 304, 304, 400, 403, 404, 404, 500]
+
+
+def write_logs(path: Path, requests: int) -> None:
+    rng = random.Random(4)
+    clients = [f"10.{rng.randint(0, 255)}.{rng.randint(0, 255)}.{rng.randint(1, 254)}" for _ in range(3_000)]
+    paths = [f"/api/{rng.choice(CATEGORIES)}/{i}" for i in range(400)]
+    t = 1_700_000_000
+    with path.open("w", encoding="utf-8") as f:
+        for _ in range(requests):
+            t += rng.randint(0, 3)
+            f.write(f"{t} {rng.choice(clients)} {rng.choice(METHODS)} {rng.choice(paths)} "
+                    f"{rng.choice(STATUSES)} {rng.randint(0, 50_000)} {rng.randint(1, 2_000)}\n")
+
+
+def write_edges(path: Path, edges: int) -> None:
+    rng = random.Random(5)
+    nodes = max(2, edges // 4)
+    with path.open("w", encoding="utf-8") as f:
+        f.write(f"{nodes} {edges}\n")
+        for _ in range(edges):
+            f.write(f"{rng.randrange(nodes)} {rng.randrange(nodes)}\n")
+
+
+def write_ini(path: Path, sections: int) -> None:
+    rng = random.Random(6)
+    with path.open("w", encoding="utf-8") as f:
+        f.write("; generated configuration\n")
+        for i in range(sections):
+            f.write(f"\n[service-{i}]\n")
+            if rng.random() < 0.3:
+                f.write("# owned by the platform team\n")
+            f.write(f"name = {''.join(rng.choice(SYLLABLES) for _ in range(3))}\n")
+            f.write(f"port = {rng.randint(1024, 65535)}\n")
+            f.write(f"enabled = {rng.choice(['true', 'false'])}\n")
+            f.write(f"  timeout   =   {rng.randint(1, 120)}  \n")
+            f.write(f"url = http://{rng.choice(CATEGORIES)}.local/path?a=b\n")
+            for k in range(rng.randint(0, 4)):
+                f.write(f"extra{k} = {rng.choice(SYLLABLES)}\n")
+
+
+def write_events(path: Path, events: int) -> None:
+    rng = random.Random(7)
+    kinds = ["order"] * 6 + ["restock"] * 3 + ["cancel"]
+    with path.open("w", encoding="utf-8") as f:
+        f.write("kind,sku,qty\n")
+        for _ in range(events):
+            f.write(f"{rng.choice(kinds)},sku-{rng.randrange(2_000)},{rng.randint(1, 20)}\n")
+
+
+WRITERS = {
+    "text.txt": write_text,
+    "data.csv": write_csv,
+    "records.json": write_json,
+    "logs.txt": write_logs,
+    "edges.txt": write_edges,
+    "config.ini": write_ini,
+    "events.csv": write_events,
+}
 
 
 def prepare_fixtures(data: Path, scale: float, needed: set[str]) -> None:
