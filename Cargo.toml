@@ -13,6 +13,9 @@ indexmap = "2"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+# An interpreter allocates and frees small blocks constantly; the platform
+# allocators are slow at exactly that (macOS's notably so on `free`).
+mimalloc = { version = "0.1", default-features = false }
 
 [lib]
 name = "hydra"

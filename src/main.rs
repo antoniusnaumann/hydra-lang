@@ -10,6 +10,9 @@ use hydra::format::format_source;
 use hydra::value::to_text;
 use hydra::vm::{run_file, Options};
 
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const USAGE: &str = "\
 hydra — the Hydra language (see spec/hydra_spec.md)
 
