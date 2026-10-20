@@ -244,3 +244,15 @@ isolation (`--strict` still makes dead-trail crashes fatal).
 The Rust embedding API returns `RunResult.exit_code` or `RunResult.crash`;
 it never exits or panics the host process. `exit()` defaults to status 0.
 Use `::exit` and `::panic` to reach these builtins past shadows.
+
+## Discarding: `do(value)` → `:null`
+
+```hydra
+fn do(value)
+end
+```
+
+Takes one value and ignores it. Passing an argument consumes it (like `_ = …`),
+so `do` is the expression form of dropping a result on purpose: `do
+push(&xs, 1)` prints nothing at the top level, and `do reject("no")` constructs a
+rejection without handing the call back. Its own `:null` is never printed.

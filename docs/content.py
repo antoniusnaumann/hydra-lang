@@ -6,6 +6,7 @@ BUILTINS = {
     "len": ("Values", "number", "Count list elements, dict entries, or Unicode characters in a string."),
     "has": ("Values", "boolean", "Test for a dict key or list index. Negative indices count from the end."),
     "get": ("Values", "value", "Read a dict key or list index, returning `fallback` when absent. Does not insert anything."),
+    "do": ("Values", ":null", "Discard a value. Passing it consumes it, so `do push(&xs, 1)` prints nothing at the top level and `do reject()` rejects nothing."),
     "push": ("Values", "number", "Append a copied value to a list; return its new length. The list argument must use `&`."),
     "return": ("Control", "[:return, …values]", "Construct a return request. Unconsumed, return its payload from the current function; an empty request returns `:null`."),
     "break": ("Control", ":break", "Construct a loop-stop request. Unconsumed, stop the nearest loop in this function; a parallel loop stops as a whole."),

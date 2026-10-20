@@ -381,3 +381,23 @@ mine := ::push(&rows, 1)
     assert_eq!(read("theirs"), "pushed img to host");
     assert_eq!(read("mine"), "1");
 }
+
+#[test]
+fn do_consumes_its_argument_and_answers_null() {
+    assert_eq!(expr("do(5)"), ":null");
+    // A rejection passed to `do` is data, so the function does not hand the
+    // call back.
+    let src = "
+fn f()
+	do reject(\"no\")
+	return 1
+end
+x := f()
+";
+    assert_eq!(eval(src, "x"), "1");
+    // An unconsumed panic would stop the program; a consumed one does not.
+    let result = run("do panic(\"boom\")\nx := 1\n");
+    assert!(result.crash.is_none(), "{:?}", result.crash.map(|c| c.message));
+    let src = "xs := []\ndo push(&xs, 1)\nn := len(xs)\n";
+    assert_eq!(eval(src, "n"), "1");
+}

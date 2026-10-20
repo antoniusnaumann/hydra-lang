@@ -296,6 +296,7 @@ pub enum Native {
     Continue,
     Exit,
     Panic,
+    Do,
 
     EnvArgs,
     EnvGet,
@@ -593,6 +594,7 @@ pub const NATIVES: &[Native] = &[
     Native::Continue,
     Native::Exit,
     Native::Panic,
+    Native::Do,
     Native::FsJoin,
     Native::FsParent,
     Native::FsName,
@@ -810,6 +812,9 @@ impl Native {
             Native::Continue => info!(None, "continue", "continue()", &[]),
             Native::Exit => info!(None, "exit", "exit(code = 0)", &[("code", Def)]),
             Native::Panic => info!(None, "panic", "panic(msg)", &[("msg", Plain)]),
+            // Passing a value consumes it, so a call that only takes one is how
+            // a statement says its result is deliberately dropped.
+            Native::Do => info!(None, "do", "do(value)", &[("value", Plain)]),
             Native::Reject => {
                 info!(None, "reject", "reject(msg = :null)", &[("msg", Def)])
             }

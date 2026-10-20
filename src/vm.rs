@@ -1206,6 +1206,7 @@ impl Vm {
                 let _ = out.flush();
                 Ok(vec![Value::null()])
             }
+            Native::Do => Ok(vec![Value::null()]),
             Native::Has => Ok(vec![boolean(member_opt(&arg(0), &arg(1))?.is_some())]),
             Native::Get => Ok(vec![member_opt(&arg(0), &arg(1))?.unwrap_or_else(|| arg(2))]),
             Native::Len => {
