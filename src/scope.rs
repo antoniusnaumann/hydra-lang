@@ -10,9 +10,9 @@
 //! closures holding the old one keep the old one) while `x = …` writes into the
 //! cell an outward search finds.
 
-use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use crate::hash::FxHashMap;
 use crate::value::{Cell, Value};
 
 pub type ScopeRef = Arc<Scope>;
@@ -24,17 +24,17 @@ impl std::fmt::Debug for Scope {
 }
 
 pub struct Scope {
-    vars: RwLock<HashMap<Arc<str>, Cell>>,
+    vars: RwLock<FxHashMap<Arc<str>, Cell>>,
     parent: Option<ScopeRef>,
 }
 
 impl Scope {
     pub fn root() -> ScopeRef {
-        Arc::new(Scope { vars: RwLock::new(HashMap::new()), parent: None })
+        Arc::new(Scope { vars: RwLock::new(FxHashMap::default()), parent: None })
     }
 
     pub fn child(parent: &ScopeRef) -> ScopeRef {
-        Arc::new(Scope { vars: RwLock::new(HashMap::new()), parent: Some(parent.clone()) })
+        Arc::new(Scope { vars: RwLock::new(FxHashMap::default()), parent: Some(parent.clone()) })
     }
 
     pub fn parent(&self) -> Option<&ScopeRef> {
@@ -43,8 +43,14 @@ impl Scope {
 
     /// `x := expr` — a fresh binding in this scope, shadowing any outer one.
     pub fn declare(&self, name: &str, value: Value) -> Cell {
+        self.declare_shared(&Arc::from(name), value)
+    }
+
+    /// `declare`, for a name the caller already holds shared — a compiled
+    /// declaration or a parameter — so binding it allocates no new string.
+    pub fn declare_shared(&self, name: &Arc<str>, value: Value) -> Cell {
         let cell = Arc::new(RwLock::new(value));
-        self.vars.write().unwrap_or_else(|e| e.into_inner()).insert(Arc::from(name), cell.clone());
+        self.vars.write().unwrap_or_else(|e| e.into_inner()).insert(name.clone(), cell.clone());
         cell
     }
 

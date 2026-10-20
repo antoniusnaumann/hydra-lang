@@ -18,22 +18,25 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, RwLock};
 
 use crate::ast::BlockKind;
-use crate::compile::{compile_program, Chunk, Instr, Root, Unconsumed};
+use crate::compile::{compile_program, CallCache, Chunk, Instr, ParamInfo, Root, Unconsumed};
 use crate::errors::{Crash, HydraError, Pos, Site};
 use crate::lexer::is_private;
 use crate::parser::parse;
 use crate::scope::{Scope, ScopeRef};
+use crate::text::Text;
 use crate::sched::{
-    BlockCtx, BlockId, CancelFlag, Frame, IterState, Msg, OnReturn, RejectedBy, Retry, ScopeSlot,
-    Task, TaskId, TaskState, Waiter,
+    BlockCtx, BlockId, CancelFlag, Frame, IterState, Local, ModuleBinding, Msg, OnReturn, RejectedBy,
+    Retry, RetryMore, Task, TaskId, TaskState, Waiter,
 };
 use crate::value::{
-    binary_op, boolean, copy_value, deref, get_member, member_opt, new_dict, new_list, path_segment,
-    push_place, read_place, sym, to_text, unary_op, update_place, write_place, Cell, Closure,
-    Native, PathSeg, RefValue, Sym, Value, BUILTIN_MODULES,
+    binary_op, boolean, cell, copy_value, deref, get_member, get_member_in, member_opt, new_dict,
+    new_list,
+    builtin_epoch, builtin_shadowed, path_segment, push_num, push_place, read_place, sym, is_null_sym, to_text, unary_op, update_local,
+    update_place, write_local, write_place, Cell, Closure, Native, PathSeg, RefValue, Sym, Value,
+    BUILTIN_MODULES, CHANNEL_NATIVES, NATIVES,
 };
 
 #[derive(Clone, Debug)]
@@ -228,22 +231,27 @@ impl Vm {
         let mut sched = self.sched.lock().unwrap_or_else(|e| e.into_inner());
         let id = sched.next_id;
         sched.next_id += 1;
+        let locals = empty_slots(chunk.slots);
         let task = Task {
             id,
             frames: vec![Frame {
                 chunk,
                 ip: 0,
-                scopes: vec![ScopeSlot { scope, dynamic: false }],
+                base: scope,
+                scopes: Vec::new(),
+                locals: 0,
+                outer_root: true,
                 iters: Vec::new(),
                 stack_base: 0,
                 module,
                 on_return: OnReturn::PushValue,
                 call_site: Pos::NONE,
                 is_module_body: true,
-                provided: Vec::new(),
                 retry: None,
             }],
             stack: Vec::new(),
+            locals,
+            args: Vec::new(),
             cancel: self.root_cancel.clone(),
             block: None,
             blocks: Vec::new(),
@@ -295,8 +303,13 @@ impl Vm {
 
     /// One worker: take a ready trail, step it for a slice, hand it back.
     fn work(&self) {
+        // A trail that used up its slice while nothing else was ready: this
+        // worker keeps it rather than queueing it for whichever worker wakes.
+        let mut kept: Option<Task> = None;
         loop {
-            let mut task = {
+            let mut task = if let Some(task) = kept.take() {
+                task
+            } else {
                 let mut sched = self.sched.lock().unwrap_or_else(|e| e.into_inner());
                 loop {
                     match sched.ready.pop_front() {
@@ -331,6 +344,11 @@ impl Vm {
             sched.running -= 1;
             let was_ready = sched.ready.len();
             match outcome {
+                Ok(Flow::Yield) if sched.ready.is_empty() && !sched.deliveries.contains_key(&id) => {
+                    sched.running += 1;
+                    kept = Some(task);
+                    continue;
+                }
                 Ok(Flow::Yield) => {
                     sched.tasks.insert(id, task);
                     sched.ready.push_back(id);
@@ -347,9 +365,10 @@ impl Vm {
                 Ok(Flow::Next) => unreachable!("a slice never ends mid-step"),
                 Err(crash) => self.finish_task(&mut sched, task, Err(crash)),
             }
-            // Wake a parked worker only when there is more to take than before,
-            // or when this was the last one running and everyone should leave.
-            let gained = sched.ready.len() > was_ready;
+            // Wake a parked worker only when there is more to take than before
+            // and more than this worker takes next, or when this was the last
+            // one running and everyone should leave.
+            let gained = sched.ready.len() > was_ready && sched.ready.len() > 1;
             let finished = sched.ready.is_empty() && sched.running == 0;
             drop(sched);
             if finished {
@@ -371,27 +390,236 @@ impl Vm {
             task.push(value);
         }
         let mut budget = self.options.step_budget;
-        // The running chunk is held for the whole slice and refreshed only when
-        // a call or a return changes frames. Cloning it per instruction would
-        // put an atomic refcount on a chunk every worker shares.
-        let mut chunk = match task.frames.last() {
-            Some(frame) => frame.chunk.clone(),
-            None => return Ok(Flow::Done),
-        };
+        // Falling off the end of a body returns nothing.
+        const END: Instr = Instr::ReturnNull;
         loop {
             if self.terminated.load(Ordering::Acquire) {
                 return Ok(Flow::Stop);
             }
-            if task.frames.is_empty() {
-                return Ok(Flow::Done);
-            }
-            if !Arc::ptr_eq(&chunk, &task.frame().chunk) {
-                chunk = task.frame().chunk.clone();
-            }
-            match self.step(task, &chunk, &mut budget) {
-                Ok(Flow::Next) => continue,
-                Ok(other) => return Ok(other),
-                Err(crash) => return Err(self.decorate(task, crash)),
+            // The running chunk is held while its frame runs, and taken again
+            // only when a call or a return changes frames. Cloning it per
+            // instruction would put an atomic refcount on a chunk every
+            // worker shares.
+            let chunk = match task.frames.last() {
+                Some(frame) => frame.chunk.clone(),
+                None => return Ok(Flow::Done),
+            };
+            let code = &chunk.code[..];
+            loop {
+                let frame = task.frames.last_mut().expect("a running task has a frame");
+                let at = frame.ip;
+                frame.ip += 1;
+                let instr = code.get(at).unwrap_or(&END);
+                // The instructions every loop and every expression is made of
+                // run here, in a function small enough to stay in registers;
+                // everything else goes to `step`.
+                let outcome = match instr {
+                    Instr::PushNum(n) => {
+                        task.stack.push(Value::Num(*n));
+                        continue;
+                    }
+                    Instr::PushSym(s) => {
+                        task.stack.push(Value::Sym(s.clone()));
+                        continue;
+                    }
+                    Instr::PushStr(s) => {
+                        task.stack.push(Value::Str(s.clone()));
+                        continue;
+                    }
+                    Instr::Load(Root::Local { slot, .. }) => {
+                        let at = frame.locals + *slot as usize;
+                        match read_slot(&task.locals[at]) {
+                            Ok(Some(value)) => {
+                                task.stack.push(value);
+                                continue;
+                            }
+                            // Empty: the name means what it would without
+                            // the slot, which is the general path's to find.
+                            Ok(None) => self.step(task, instr, &mut budget),
+                            Err(crash) => Err(crash),
+                        }
+                    }
+                    Instr::GetMemberLocal { slot, .. } => {
+                        let at = frame.locals + *slot as usize;
+                        if let (Local::Val(container), Some(key)) = (&task.locals[at], task.stack.last()) {
+                            match get_member_in(container, key) {
+                                Ok(value) => {
+                                    task.rejection = None;
+                                    *task.stack.last_mut().expect("the key") = value;
+                                    continue;
+                                }
+                                Err(crash) => Err(crash),
+                            }
+                        } else {
+                            self.step(task, instr, &mut budget)
+                        }
+                    }
+                    Instr::IterNext { exit } => {
+                        let iter = frame.iters.last_mut().expect("iterator");
+                        let data = iter.list.read().unwrap_or_else(|e| e.into_inner());
+                        match data.items.get(iter.index) {
+                            None => {
+                                drop(data);
+                                frame.ip = *exit;
+                                continue;
+                            }
+                            Some(Value::Ref(_)) => {
+                                drop(data);
+                                self.step(task, instr, &mut budget)
+                            }
+                            Some(item) => {
+                                let value = copy_value(item);
+                                drop(data);
+                                iter.index += 1;
+                                task.stack.push(value);
+                                continue;
+                            }
+                        }
+                    }
+                    Instr::DeclareLocal(slot) => {
+                        let at = frame.locals + *slot as usize;
+                        let value = task.stack.pop().expect("a value to bind");
+                        task.rejection = None;
+                        if task.should_stop() {
+                            return Ok(Flow::Stop);
+                        }
+                        task.locals[at] = Local::Val(value);
+                        continue;
+                    }
+                    Instr::Update { root: Root::Local { slot, .. }, segs: 0, op }
+                        if matches!(
+                            (task.stack.last(), &task.locals[frame.locals + *slot as usize]),
+                            (Some(Value::Num(_)), Local::Val(Value::Num(_)))
+                        ) =>
+                    {
+                        // `n += 1` on a number the frame holds: read, apply
+                        // and write with nothing in between to lock.
+                        let at = frame.locals + *slot as usize;
+                        let operand = task.stack.pop().expect("an operand");
+                        if task.should_stop() {
+                            return Ok(Flow::Stop);
+                        }
+                        let Local::Val(current) = &mut task.locals[at] else { unreachable!() };
+                        match binary_op(*op, current, &operand) {
+                            Ok(value) => {
+                                *current = value;
+                                continue;
+                            }
+                            Err(crash) => Err(crash),
+                        }
+                    }
+                    // A statement whose result is a plain `:null` — `do …`,
+                    // `print …` — has nothing to print or hand on.
+                    Instr::Unconsumed { spread, .. }
+                        if matches!(task.stack.last(), Some(Value::Sym(s)) if is_null_sym(s))
+                            && (!*spread || task.extras.is_empty()) =>
+                    {
+                        task.stack.pop();
+                        task.rejection = None;
+                        continue;
+                    }
+                    // `n += 1` on a top-level number: the slot holds the
+                    // binding's cell, and the update is one step under its
+                    // lock, as `update_place` makes it (QUESTIONS.md §20).
+                    Instr::Update { root: Root::Local { slot, .. }, segs: 0, op }
+                        if matches!(
+                            (task.stack.last(), &task.locals[frame.locals + *slot as usize]),
+                            (Some(Value::Num(_)), Local::Boxed(_))
+                        ) =>
+                    {
+                        let at = frame.locals + *slot as usize;
+                        let operand = task.stack.pop().expect("an operand");
+                        if task.should_stop() {
+                            return Ok(Flow::Stop);
+                        }
+                        let Local::Boxed(cell) = &task.locals[at] else { unreachable!() };
+                        let mut current = cell.write().unwrap_or_else(|e| e.into_inner());
+                        if let Value::Num(_) = *current {
+                            match binary_op(*op, &current, &operand) {
+                                Ok(value) => {
+                                    *current = value;
+                                    continue;
+                                }
+                                Err(crash) => Err(crash),
+                            }
+                        } else {
+                            drop(current);
+                            task.stack.push(operand);
+                            self.step(task, instr, &mut budget)
+                        }
+                    }
+                    Instr::MakeRef { root: Root::Local { slot, .. }, segs: 0 }
+                        if matches!(task.locals[frame.locals + *slot as usize], Local::Boxed(_)) =>
+                    {
+                        let Local::Boxed(cell) = &task.locals[frame.locals + *slot as usize] else {
+                            unreachable!()
+                        };
+                        let reference = RefValue { root: cell.clone(), path: EMPTY_PATH.clone() };
+                        task.stack.push(Value::Ref(reference));
+                        continue;
+                    }
+                    Instr::Tick => {
+                        // Refusals belong only to the result of the current
+                        // statement.
+                        task.rejection = None;
+                        // A statement boundary: where a cancelled trail stops,
+                        // and the scheduling point (§9.1, §9.5).
+                        if task.should_stop() || self.terminated.load(Ordering::Acquire) {
+                            return Ok(Flow::Stop);
+                        }
+                        if budget == 0 {
+                            task.frame_mut().ip -= 1;
+                            return Ok(Flow::Yield);
+                        }
+                        budget -= 1;
+                        continue;
+                    }
+                    Instr::Binary(op) => {
+                        let right = task.pop();
+                        let left = task.pop();
+                        match binary_op(*op, &left, &right) {
+                            Ok(value) => {
+                                task.stack.push(value);
+                                continue;
+                            }
+                            Err(crash) => Err(crash),
+                        }
+                    }
+                    Instr::JumpIfFalse(target) => {
+                        if !task.stack.pop().expect("a condition").truthy() {
+                            frame.ip = *target;
+                        }
+                        continue;
+                    }
+                    Instr::Jump(target) => {
+                        let target = *target;
+                        if target <= frame.ip {
+                            // A backward jump is a loop iteration: bill it, so
+                            // a loop whose body has no statements still yields
+                            // (§9.1).
+                            if budget == 0 {
+                                frame.ip = target;
+                                return Ok(Flow::Yield);
+                            }
+                            budget -= 1;
+                        }
+                        frame.ip = target;
+                        continue;
+                    }
+                    _ => self.step(task, instr, &mut budget),
+                };
+                match outcome {
+                    Ok(Flow::Next) => {
+                        // A call or a return moved to another frame, whose
+                        // code this loop does not hold.
+                        match task.frames.last() {
+                            Some(frame) if Arc::ptr_eq(&frame.chunk, &chunk) => continue,
+                            _ => break,
+                        }
+                    }
+                    Ok(other) => return Ok(other),
+                    Err(crash) => return Err(self.decorate(task, crash)),
+                }
             }
         }
     }
@@ -416,20 +644,9 @@ impl Vm {
         crash
     }
 
-    fn step(&self, task: &mut Task, chunk: &Chunk, budget: &mut u32) -> Result<Flow, Crash> {
-        // Falling off the end of a body returns nothing.
-        const END: Instr = Instr::ReturnNull;
-        let instr = {
-            let frame = task.frame_mut();
-            if frame.ip >= chunk.code.len() {
-                &END
-            } else {
-                let at = frame.ip;
-                frame.ip += 1;
-                &chunk.code[at]
-            }
-        };
-
+    /// One instruction, with the frame's `ip` already past it.
+    #[inline(never)]
+    fn step(&self, task: &mut Task, instr: &Instr, budget: &mut u32) -> Result<Flow, Crash> {
         match instr {
             Instr::PushNum(n) => task.push(Value::Num(*n)),
             Instr::PushStr(s) => task.push(Value::Str(s.clone())),
@@ -560,12 +777,24 @@ impl Vm {
             }
             Instr::Interpolate(n) => {
                 let at = task.stack.len() - *n;
-                let parts: Vec<Value> = task.stack.split_off(at);
-                let mut text = String::new();
-                for part in &parts {
-                    text.push_str(&to_text(part));
+                // `"\(s)"` of one string is that string.
+                if let [Value::Str(_)] = &task.stack[at..] {
+                    return Ok(Flow::Next);
                 }
-                task.push(Value::Str(Arc::from(text.as_str())));
+                let room: usize = task.stack[at..]
+                    .iter()
+                    .map(|part| if let Value::Str(s) = part { s.len() } else { 8 })
+                    .sum();
+                let mut text = Text::empty(room);
+                for part in &task.stack[at..] {
+                    match part {
+                        Value::Str(s) => text.push_str(s),
+                        Value::Num(n) => push_num(&mut text, *n),
+                        other => text.push_str(&to_text(other)),
+                    }
+                }
+                task.stack.truncate(at);
+                task.push(Value::Str(text));
             }
             Instr::MakeSym => {
                 let value = task.pop();
@@ -579,11 +808,11 @@ impl Vm {
                     }
                 }
             }
-            Instr::MakeClosure { name, params, chunk } => {
+            Instr::MakeClosure { name, chunk } => {
                 let scope = task.scope().clone();
                 task.push(Value::Fn(Arc::new(Closure {
-                    name: name.to_string(),
-                    params: params.as_ref().clone(),
+                    name: name.clone(),
+                    params: chunk.params.clone(),
                     chunk: chunk.clone(),
                     scope,
                 })));
@@ -593,11 +822,29 @@ impl Vm {
                 let value = self.load(task, root)?;
                 task.push(value);
             }
-            Instr::Declare(name) => {
+            Instr::DeclareLocal(slot) => {
                 let value = task.pop();
                 task.rejection = None;
                 if task.should_stop() {
                     return Ok(Flow::Stop);
+                }
+                let at = task.frame().locals + *slot as usize;
+                task.locals[at] = Local::Val(value);
+            }
+            Instr::ClearLocals { from, to } => {
+                let base = task.frame().locals;
+                for slot in &mut task.locals[base + *from as usize..base + *to as usize] {
+                    *slot = Local::Empty;
+                }
+            }
+            Instr::Declare { name, slot, builtin } => {
+                let value = task.pop();
+                task.rejection = None;
+                if task.should_stop() {
+                    return Ok(Flow::Stop);
+                }
+                if *builtin {
+                    builtin_shadowed();
                 }
                 // Redeclaring a name already bound in this scope is a *fresh*
                 // binding, and a closure that captured the old one must keep
@@ -606,7 +853,9 @@ impl Vm {
                     let child = Scope::child(task.scope());
                     task.frame_mut().push_scope(child, true);
                 }
-                task.scope().declare(name, value);
+                let cell = task.scope().declare_shared(name, value);
+                let at = task.frame().locals + *slot as usize;
+                task.locals[at] = Local::Boxed(cell);
             }
             Instr::Store { root, segs } => {
                 let value = task.pop();
@@ -616,8 +865,7 @@ impl Vm {
                 if task.should_stop() {
                     return Ok(Flow::Stop);
                 }
-                let cell = self.cell_for(task, root)?;
-                write_place(&cell, &path, value)?;
+                self.write(task, root, &path, value)?;
             }
             Instr::StoreUnder { root, segs } => {
                 // The values arrived together, so this target's path sits on
@@ -628,8 +876,7 @@ impl Vm {
                 if task.should_stop() {
                     return Ok(Flow::Stop);
                 }
-                let cell = self.cell_for(task, root)?;
-                write_place(&cell, &path, value)?;
+                self.write(task, root, &path, value)?;
             }
             Instr::TakeValues(count) => {
                 let value = task.pop();
@@ -655,13 +902,38 @@ impl Vm {
                 if task.should_stop() {
                     return Ok(Flow::Stop);
                 }
-                let cell = self.cell_for(task, root)?;
-                update_place(&cell, &path, op, &operand)?;
+                if let Some(at) = live_slot(task, root) {
+                    match &mut task.locals[at] {
+                        Local::Val(value) => update_local(value, &path, *op, &operand)?,
+                        Local::Boxed(cell) => update_place(cell, &path, *op, &operand)?,
+                        Local::Empty => unreachable!("a live slot"),
+                    }
+                } else {
+                    let cell = self.cell_for(task, root)?;
+                    update_place(&cell, &path, *op, &operand)?;
+                }
             }
             Instr::MakeRef { root, segs } => {
                 let path = self.take_path(task, *segs)?;
-                let cell = self.cell_for(task, root)?;
-                task.push(Value::Ref(RefValue { root: cell, path: Arc::new(path) }));
+                let cell = match live_slot(task, root) {
+                    // A `&` is the one thing that needs the slot's value to have
+                    // storage of its own, so this is where it gets some.
+                    Some(at) => match std::mem::replace(&mut task.locals[at], Local::Empty) {
+                        Local::Val(value) => {
+                            let boxed = cell(value);
+                            task.locals[at] = Local::Boxed(boxed.clone());
+                            boxed
+                        }
+                        Local::Boxed(boxed) => {
+                            task.locals[at] = Local::Boxed(boxed.clone());
+                            boxed
+                        }
+                        Local::Empty => unreachable!("a live slot"),
+                    },
+                    None => self.cell_for(task, root)?,
+                };
+                let path = if path.is_empty() { EMPTY_PATH.clone() } else { Arc::new(path) };
+                task.push(Value::Ref(RefValue { root: cell, path }));
             }
             Instr::GetMember => {
                 task.rejection = None;
@@ -670,11 +942,30 @@ impl Vm {
                 let value = get_member(&obj, &key)?;
                 task.push(value);
             }
+            Instr::GetMemberLocal { slot, name } => {
+                task.rejection = None;
+                let key = task.pop();
+                let at = task.frame().locals + *slot as usize;
+                let value = match &task.locals[at] {
+                    Local::Val(container) => get_member_in(container, &key)?,
+                    Local::Boxed(cell) => {
+                        let container = cell.read().unwrap_or_else(|e| e.into_inner());
+                        get_member_in(&container, &key)?
+                    }
+                    // Not bound yet: the name means what it would without
+                    // the slot.
+                    Local::Empty => {
+                        let container = self.load(task, &Root::Name(name.clone()))?;
+                        get_member(&container, &key)?
+                    }
+                };
+                task.push(value);
+            }
 
             Instr::Binary(op) => {
                 let right = task.pop();
                 let left = task.pop();
-                task.push(binary_op(op, &left, &right)?);
+                task.push(binary_op(*op, &left, &right)?);
             }
             Instr::Unary(op) => {
                 let value = task.pop();
@@ -728,38 +1019,110 @@ impl Vm {
                 // One candidate, because the callee was written as something
                 // other than a name — a rejection is the call's answer, and
                 // what it said is kept for the crash if nothing consumes it.
-                let retry = Retry { name: None, rest: Vec::new(), args, rejected: Vec::new() };
+                let retry = Retry::at(None, Vec::new(), args);
                 return self.enter_with(task, callee, bound, Some(retry));
             }
-            Instr::CallName { name, positional, names } => {
+            Instr::CallName { name, locals, native, cache, imports, positional, names } => {
+                // A name this site already found to mean the builtin alone
+                // still does if nothing has bound a builtin's name since.
+                if let Some(native) = native.filter(|_| locals.is_empty()) {
+                    let frame = task.frame();
+                    if frame.outer_root && cache.holds(builtin_epoch(), frame.module) {
+                        if names.is_empty() {
+                            if let Some(flow) = self.call_plain(task, native, *positional) {
+                                return flow;
+                            }
+                        }
+                        let args = take_args(task, *positional, names);
+                        let callee = Value::Native(native);
+                        let Some(bound) = bind_args(&callee, &args) else {
+                            return Err(rejected(Some(name), &[callee], &args, &[]));
+                        };
+                        let retry = Retry::at(Some(name), Vec::new(), args);
+                        return self.enter_with(task, callee, bound, Some(retry));
+                    }
+                }
+                // One candidate is the usual call, and then there is no list
+                // to build and no order to work out.
+                if names.is_empty() {
+                    let epoch = builtin_epoch();
+                    let sole = self.sole_candidate(task, name, locals, *native, imports)?;
+                    if let (Some(native), Some(Value::Native(found))) = (native, &sole) {
+                        let frame = task.frame();
+                        if native == found && locals.is_empty() && frame.outer_root {
+                            cache.set(epoch, frame.module);
+                        }
+                    }
+                    match sole {
+                        Some(Value::Fn(closure)) => {
+                            if let Some(flow) = call_positional(task, &closure, *positional, name) {
+                                return Ok(flow);
+                            }
+                        }
+                        Some(Value::Native(native)) => {
+                            if let Some(flow) = self.call_plain(task, native, *positional) {
+                                return flow;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let epoch = builtin_epoch();
                 let args = take_args(task, *positional, names);
                 // Every function bound to the name is a candidate, innermost
                 // first; the first that accepts the call is the one (§3).
-                let candidates = self.candidates(task, name)?;
+                let candidates = self.candidates(task, name, locals)?;
+                if let (Some(native), [Value::Native(found)]) = (native, candidates.as_slice()) {
+                    let frame = task.frame();
+                    if *native == *found && locals.is_empty() && frame.outer_root {
+                        cache.set(epoch, frame.module);
+                    }
+                }
                 if candidates.is_empty() {
                     return Err(Crash::new(format!("`{name}` is not declared")));
                 }
                 let Some((callee, bound, rest)) = Vm::resolve(&candidates, &args) else {
                     return Err(rejected(Some(name), &candidates, &args, &[]));
                 };
-                let retry = Retry::at(name, rest, args);
+                let retry = Retry::at(Some(name), rest, args);
                 return self.enter_with(task, callee, bound, Some(retry));
             }
-            Instr::CallNs { module, name, positional, names } => {
+            Instr::CallNs { module, name, written, natives, cache, positional, names } => {
+                // `::name` is always the builtin; `json::parse` is the json
+                // module's as long as `json` still names that module here.
+                let builtin = module.is_empty() || cache.holds(builtin_epoch(), task.frame().module);
+                if builtin && names.is_empty() {
+                    // Resolution tries the concrete arities first, in order;
+                    // the first that takes this many arguments is the call.
+                    let fits = natives.iter().copied().find(|n| {
+                        let shape = &NATIVE_SHAPES[*n as usize];
+                        !shape.variadic && (shape.required..=shape.total).contains(positional)
+                    });
+                    if let Some(native) = fits {
+                        if let Some(flow) = self.call_plain(task, native, *positional) {
+                            return flow;
+                        }
+                    }
+                }
+                let epoch = builtin_epoch();
                 let args = take_args(task, *positional, names);
-                let candidates = self.ns_candidates(task, module, name)?;
-                let written = if module.is_empty() {
-                    format!("::{name}")
+                // With nothing under the name, the general path says why.
+                let candidates = if builtin && !natives.is_empty() {
+                    natives.iter().map(|n| Value::Native(*n)).collect()
                 } else {
-                    format!("{module}::{name}")
+                    let candidates = self.ns_candidates(task, module, name)?;
+                    if self.names_builtin_module(task, module) {
+                        cache.set(epoch, task.frame().module);
+                    }
+                    candidates
                 };
                 let Some((callee, bound, rest)) = Vm::resolve(&candidates, &args) else {
-                    return Err(rejected(Some(&written), &candidates, &args, &[]));
+                    return Err(rejected(Some(written), &candidates, &args, &[]));
                 };
-                let retry = Retry::at(&written, rest, args);
+                let retry = Retry::at(Some(written), rest, args);
                 return self.enter_with(task, callee, bound, Some(retry));
             }
-            Instr::CallMethod { name, positional, names } => {
+            Instr::CallMethod { name, locals, positional, names } => {
                 let mut args = take_args(task, *positional, names);
                 let receiver = task.pop();
                 // A field of that name wins, but only if it holds something
@@ -788,14 +1151,14 @@ impl Vm {
                     let Some(bound) = bind_args(&callee, &args) else {
                         return Err(rejected(Some(name), &[callee], &args, &[]));
                     };
-                    let retry = Retry::at(name, Vec::new(), args);
+                    let retry = Retry::at(Some(name), Vec::new(), args);
                     return self.enter_with(task, callee, bound, Some(retry));
                 }
 
                 // Otherwise the receiver is the first argument, and the rest of
                 // the call resolves exactly as a written-out one does (§3).
                 args.positional.insert(0, receiver);
-                let candidates = self.candidates(task, name)?;
+                let candidates = self.candidates(task, name, locals)?;
                 if candidates.is_empty() {
                     return Err(Crash::new(format!(
                         "no field `.{name}` and no function `{name}`: \
@@ -805,14 +1168,27 @@ impl Vm {
                 let Some((callee, bound, rest)) = Vm::resolve(&candidates, &args) else {
                     return Err(rejected(Some(name), &candidates, &args, &[]));
                 };
-                let retry = Retry::at(name, rest, args);
+                let retry = Retry::at(Some(name), rest, args);
                 return self.enter_with(task, callee, bound, Some(retry));
             }
-            Instr::Return(count) => {
-                let at = task.stack.len() - count;
-                let values: Vec<Value> = task.stack.split_off(at);
-                return self.pop_frame(task, values);
+            Instr::ReturnFast { count, cache } => {
+                let frame = task.frame();
+                if !frame.outer_root {
+                    // Nothing to learn here; the call behind this decides.
+                    return Ok(Flow::Next);
+                }
+                let module = frame.module;
+                if !cache.holds(builtin_epoch(), module) {
+                    let epoch = builtin_epoch();
+                    let candidates = self.candidates(task, "return", &[])?;
+                    if !matches!(candidates.as_slice(), [Value::Native(Native::Return)]) {
+                        return Ok(Flow::Next);
+                    }
+                    cache.set(epoch, module);
+                }
+                return self.return_values(task, *count);
             }
+            Instr::Return(count) => return self.return_values(task, *count),
             Instr::ReturnNull => {
                 return self.pop_frame(task, vec![Value::null()]);
             }
@@ -868,8 +1244,9 @@ impl Vm {
                 task.frame_mut().iters.pop();
             }
 
-            Instr::SkipIfProvided { index, target } => {
-                if task.frame().provided.get(*index) == Some(&true) {
+            Instr::SkipIfLocal { slot, target } => {
+                let at = task.frame().locals + *slot as usize;
+                if !matches!(task.locals[at], Local::Empty) {
                     task.frame_mut().ip = *target;
                 }
             }
@@ -997,47 +1374,144 @@ impl Vm {
         candidates: &[Value],
         args: &CallArgs,
     ) -> Option<(Value, Vec<Option<Value>>, Vec<Value>)> {
+        // The usual call has one candidate, and then there is no order to
+        // work out and nothing to fall back to.
+        if let [only] = candidates {
+            return bind_args(only, args).map(|bound| (only.clone(), bound, Vec::new()));
+        }
         let ordered: Vec<&Value> = candidates
             .iter()
             .filter(|c| !is_variadic(c))
             .chain(candidates.iter().filter(|c| is_variadic(c)))
             .collect();
-        let at = ordered.iter().position(|c| bind_args(c, args).is_some())?;
-        let callee = ordered[at].clone();
-        let bound = bind_args(&callee, args).expect("it bound a moment ago");
-        let rest: Vec<Value> = ordered[at + 1..].iter().map(|c| (*c).clone()).collect();
-        Some((callee, bound, rest))
+        ordered.iter().enumerate().find_map(|(at, callee)| {
+            let bound = bind_args(callee, args)?;
+            let rest = ordered[at + 1..].iter().map(|c| (*c).clone()).collect();
+            Some(((*callee).clone(), bound, rest))
+        })
     }
 
     /// Every function the name could mean, innermost binding first, then the
     /// most recent `use` first, then the builtin (§3, §7).
-    fn candidates(&self, task: &Task, name: &str) -> Result<Vec<Value>, Crash> {
-        let mut cells: Vec<Cell> = task.scope().all_bindings(name);
-        let module = task.frame().module;
-        if let Some(imported) =
-            self.module(module).imports.read().unwrap_or_else(|e| e.into_inner()).get(name)
-        {
-            cells.extend(imported.iter().cloned());
-        }
-        let mut out = Vec::new();
-        for cell in cells {
+    fn candidates(&self, task: &Task, name: &str, locals: &[u32]) -> Result<Vec<Value>, Crash> {
+        let read = |cell: &Cell| -> Result<Value, Crash> {
             let value = cell.read().unwrap_or_else(|e| e.into_inner()).clone();
-            out.push(match value {
-                Value::Ref(r) => read_place(&r.root, &r.path)?,
-                other => copy_value(&other),
-            });
+            match value {
+                Value::Ref(r) => read_place(&r.root, &r.path),
+                other => Ok(copy_value(&other)),
+            }
+        };
+        let mut out = Vec::new();
+        // The slots hold the bindings this chunk declared, innermost first,
+        // and so come before anything a search finds. A slot can hold the
+        // very cell a scope does, and a candidate is tried once.
+        let base = task.frame().locals;
+        let mut seen: Vec<&Cell> = Vec::new();
+        for slot in locals {
+            let slot = &task.locals[base + *slot as usize];
+            if let Local::Boxed(cell) = slot {
+                seen.push(cell);
+            }
+            if let Some(value) = read_slot(slot)? {
+                out.push(value);
+            }
+        }
+        let mut scope = Some(&**task.scope());
+        while let Some(s) = scope {
+            if let Some(cell) = s.get_local(name) {
+                if !seen.iter().any(|c| Arc::ptr_eq(c, &cell)) {
+                    out.push(read(&cell)?);
+                }
+            }
+            scope = s.parent().map(|p| &**p);
+        }
+        let module = self.module(task.frame().module);
+        let imported = module
+            .imports
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned();
+        for cell in imported.iter().flatten() {
+            out.push(read(cell)?);
         }
         // A `use fs as *` puts the module's builtins here — after the imports
         // and before the flat ones, which is where §7 says an import goes.
-        for module in
-            self.module(module).star_builtins.read().unwrap_or_else(|e| e.into_inner()).iter()
-        {
+        for module in module.star_builtins.read().unwrap_or_else(|e| e.into_inner()).iter() {
             out.extend(Native::in_module(module, name).into_iter().map(Value::Native));
         }
         if let Some(native) = Native::lookup(name) {
             out.push(Value::Native(native));
         }
         Ok(out)
+    }
+
+    /// The one function `name` can mean here, or `None` where there are more
+    /// candidates than one — or none, which the general path reports. The
+    /// same search as [`Vm::candidates`], stopping at the second find; the
+    /// imports are skipped while `imports` remembers they lack the name.
+    fn sole_candidate(
+        &self,
+        task: &Task,
+        name: &str,
+        locals: &[u32],
+        native: Option<Native>,
+        imports: &CallCache,
+    ) -> Result<Option<Value>, Crash> {
+        let mut found: Option<Value> = None;
+        let mut boxed: Option<&Cell> = None;
+        let base = task.frame().locals;
+        for slot in locals {
+            let slot = &task.locals[base + *slot as usize];
+            if let Some(value) = read_slot(slot)? {
+                if found.is_some() {
+                    return Ok(None);
+                }
+                found = Some(value);
+                if let Local::Boxed(cell) = slot {
+                    boxed = Some(cell);
+                }
+            }
+        }
+        let mut scope = Some(&**task.scope());
+        while let Some(s) = scope {
+            if let Some(cell) = s.get_local(name) {
+                if !boxed.is_some_and(|b| Arc::ptr_eq(b, &cell)) {
+                    if found.is_some() {
+                        return Ok(None);
+                    }
+                    let value = cell.read().unwrap_or_else(|e| e.into_inner()).clone();
+                    found = Some(match value {
+                        Value::Ref(r) => read_place(&r.root, &r.path)?,
+                        other => copy_value(&other),
+                    });
+                }
+            }
+            scope = s.parent().map(|p| &**p);
+        }
+        let module_id = task.frame().module;
+        let epoch = builtin_epoch();
+        if !imports.holds(epoch, module_id) {
+            let module = self.module(module_id);
+            let imported = module.imports.read().unwrap_or_else(|e| e.into_inner()).contains_key(name);
+            let starred = module
+                .star_builtins
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|m| !Native::in_module(m, name).is_empty());
+            if imported || starred {
+                return Ok(None);
+            }
+            imports.set(epoch, module_id);
+        }
+        if let Some(native) = native {
+            if found.is_some() {
+                return Ok(None);
+            }
+            found = Some(Value::Native(native));
+        }
+        Ok(found)
     }
 
     /// Enter a call whose arguments are already matched to its parameters,
@@ -1056,56 +1530,21 @@ impl Vm {
         // is the only one who can (§5.1). This is checked *after* resolution,
         // deliberately: a missing `&` is an error to report, not a reason to
         // quietly pick a different function.
-        for (spec, value) in specs.iter().zip(bound.iter()) {
-            if spec.by_ref {
-                match value {
-                    Some(Value::Ref(_)) => {}
-                    Some(_) => {
-                        return Err(Crash::new(format!(
-                            "`{}` takes `{}` by reference: write `&…` at the call site, \
-                             or it is handed a copy",
-                            signature_of(&callee),
-                            spec.name
-                        )))
-                    }
-                    None => {}
-                }
-            }
-        }
+        check_refs(&callee, specs, &bound)?;
 
         match callee {
             Value::Fn(closure) => {
-                let scope = Scope::child(&closure.scope);
-                let mut provided = vec![false; closure.params.len()];
-                for (i, (param, value)) in closure.params.iter().zip(bound).enumerate() {
-                    if let Some(value) = value {
-                        // The bare `*` has no name and binds nothing: it only
-                        // closes the positional list (channels §6.1).
-                        if !param.name.is_empty() {
-                            scope.declare(&param.name, value);
-                        }
-                        provided[i] = true;
-                    }
-                }
-                let call_site = {
-                    let frame = task.frame();
-                    frame.chunk.pos.get(frame.ip.saturating_sub(1)).copied().unwrap_or(Pos::NONE)
+                let locals = task.locals.len();
+                // Parameter `i` is slot `i`. One the call left out stays empty
+                // until its default fills it, and so does the bare `*`, which
+                // binds nothing (channels §6.1).
+                let base = if closure.chunk.flat {
+                    task.locals.extend(bound.into_iter().map(|v| v.map_or(Local::Empty, Local::Val)));
+                    closure.scope.clone()
+                } else {
+                    scoped_params(task, &closure, bound)
                 };
-                let module = task.frame().module;
-                let stack_base = task.stack.len();
-                task.frames.push(Frame {
-                    chunk: closure.chunk.clone(),
-                    ip: 0,
-                    scopes: vec![ScopeSlot { scope, dynamic: false }],
-                    iters: Vec::new(),
-                    stack_base,
-                    module,
-                    on_return: OnReturn::PushValue,
-                    call_site,
-                    is_module_body: false,
-                    provided,
-                    retry: retry.map(Box::new),
-                });
+                enter_frame(task, &closure, locals, base, retry);
                 Ok(Flow::Next)
             }
             Value::Native(native) => {
@@ -1139,23 +1578,35 @@ impl Vm {
                     Native::Return => {
                         let values = bound.into_iter().next().flatten().expect("variadic values");
                         let Value::List(values) = values else { unreachable!("bound variadic list") };
-                        let mut tagged = vec![Value::Sym(sym("return"))];
-                        tagged.extend(values.read().unwrap_or_else(|e| e.into_inner()).items.iter().map(copy_value));
+                        // The variadic list was built for this call, so it is
+                        // usually ours alone and can become the request itself.
+                        let tagged = match Arc::try_unwrap(values) {
+                            Ok(node) => {
+                                let mut items = node.into_inner().unwrap_or_else(|e| e.into_inner()).items;
+                                items.insert(0, Value::Sym(SYM_RETURN.clone()));
+                                items
+                            }
+                            Err(values) => {
+                                let mut tagged = vec![Value::Sym(SYM_RETURN.clone())];
+                                tagged.extend(values.read().unwrap_or_else(|e| e.into_inner()).items.iter().map(copy_value));
+                                tagged
+                            }
+                        };
                         NativeOut::Values(vec![new_list(tagged)])
                     }
-                    Native::Break => NativeOut::Values(vec![Value::Sym(sym("break"))]),
-                    Native::Continue => NativeOut::Values(vec![Value::Sym(sym("continue"))]),
+                    Native::Break => NativeOut::Values(vec![Value::Sym(SYM_BREAK.clone())]),
+                    Native::Continue => NativeOut::Values(vec![Value::Sym(SYM_CONTINUE.clone())]),
                     Native::Exit => {
                         let code = bound.into_iter().next().flatten().unwrap_or(Value::Num(0.0));
-                        NativeOut::Values(vec![new_list(vec![Value::Sym(sym("exit")), code])])
+                        NativeOut::Values(vec![new_list(vec![Value::Sym(SYM_EXIT.clone()), code])])
                     }
                     Native::Panic => {
                         let msg = bound.into_iter().next().flatten().expect("required panic message");
-                        NativeOut::Values(vec![new_list(vec![Value::Sym(sym("panic")), msg])])
+                        NativeOut::Values(vec![new_list(vec![Value::Sym(SYM_PANIC.clone()), msg])])
                     }
                     Native::Reject => {
                         let msg = bound.into_iter().next().flatten().unwrap_or_else(Value::null);
-                        NativeOut::Values(vec![new_list(vec![Value::Sym(sym(REJECT)), msg])])
+                        NativeOut::Values(vec![new_list(vec![Value::Sym(SYM_REJECT.clone()), msg])])
                     }
                     Native::Send => self.send(task, &bound)?,
                     Native::Receive => self.receive(task, &bound)?,
@@ -1164,19 +1615,9 @@ impl Vm {
                         NativeOut::Values(vec![index_of(me)])
                     }
                     other if crate::stdlib::blocking(other) => self.blocking_native(task.id, other, bound)?,
-                    other => NativeOut::Values(self.native(task, other, bound)?),
+                    other => self.native(task, other, &bound)?,
                 };
-                match out {
-                    NativeOut::Values(values) => {
-                        let mut answered = values.into_iter();
-                        let value = answered.next().unwrap_or_else(Value::null);
-                        task.extras = answered.collect();
-                        task.push(value);
-                        Ok(Flow::Next)
-                    }
-                    // The trail is parked; what it answers arrives later.
-                    NativeOut::Blocked => Ok(Flow::Blocked),
-                }
+                Ok(answer(task, out))
             }
             other => Err(Crash::new(format!("cannot call a {}", other.kind()))),
         }
@@ -1187,13 +1628,14 @@ impl Vm {
         &self,
         task: &Task,
         native: Native,
-        args: Vec<Option<Value>>,
-    ) -> Result<Vec<Value>, Crash> {
+        args: &[Option<Value>],
+    ) -> Result<NativeOut, Crash> {
         let arg = |i: usize| args.get(i).cloned().flatten().unwrap_or_else(Value::null);
+        let one = |value: Value| Ok(NativeOut::One(value));
         match native {
             // Dynamic, no token threading, `:true` outside any trail — and
             // false during crash shutdown too (§9.5).
-            Native::Alive => Ok(vec![boolean(!task.cancel.is_cancelled())]),
+            Native::Alive => one(boolean(!task.cancel.is_cancelled())),
             Native::Print => {
                 let end = match args.get(1).cloned().flatten() {
                     Some(end) => to_text(&deref(&end)?),
@@ -1204,11 +1646,11 @@ impl Vm {
                 // and never mid-line.
                 let _ = write!(out, "{}{end}", to_text(&deref(&arg(0))?));
                 let _ = out.flush();
-                Ok(vec![Value::null()])
+                one(Value::null())
             }
-            Native::Do => Ok(vec![Value::null()]),
-            Native::Has => Ok(vec![boolean(member_opt(&arg(0), &arg(1))?.is_some())]),
-            Native::Get => Ok(vec![member_opt(&arg(0), &arg(1))?.unwrap_or_else(|| arg(2))]),
+            Native::Do => one(Value::null()),
+            Native::Has => one(boolean(member_opt(&arg(0), &arg(1))?.is_some())),
+            Native::Get => one(member_opt(&arg(0), &arg(1))?.unwrap_or_else(|| arg(2))),
             Native::Len => {
                 let value = deref(&arg(0))?;
                 let len = match &value {
@@ -1223,23 +1665,56 @@ impl Vm {
                         )))
                     }
                 };
-                Ok(vec![Value::Num(len as f64)])
+                one(Value::Num(len as f64))
             }
             Native::Send | Native::Receive | Native::Channel => {
                 unreachable!("the channel calls are dispatched before this")
             }
             Native::Push => {
-                let Value::Ref(target) = arg(0) else {
+                let Some(Some(Value::Ref(target))) = args.first() else {
                     unreachable!("checked by the by-reference rule above")
                 };
                 let len = push_place(&target.root, &target.path, arg(1))?;
-                Ok(vec![Value::Num(len as f64)])
+                one(Value::Num(len as f64))
             }
             // A module's builtins live with the module (spec/hydra_fs.md).
-            other if other.module() == Some("list") => crate::list::call(other, &args),
-            other if other.module() == Some("fs") => crate::fs::call(other, &args),
-            other => crate::stdlib::call(other, &args, &self.options.script_args),
+            other if other.module() == Some("list") => crate::list::call(other, args).map(NativeOut::Values),
+            other if other.module() == Some("fs") => crate::fs::call(other, args).map(NativeOut::Values),
+            other => crate::stdlib::call(other, args, &self.options.script_args).map(|answer| match answer {
+                crate::stdlib::Answer::One(value) => NativeOut::One(value),
+                crate::stdlib::Answer::Many(values) => NativeOut::Values(values),
+            }),
         }
+    }
+
+    /// Call a builtin that only computes an answer — no control atom, no
+    /// channel, nothing that parks, nothing written in Hydra — with its
+    /// positional arguments bound straight off the stack. `None` when the
+    /// builtin or the call's shape needs the general path; the stack is then
+    /// as it was.
+    fn call_plain(&self, task: &mut Task, native: Native, positional: usize) -> Option<Result<Flow, Crash>> {
+        let shape = NATIVE_SHAPES.get(native as usize)?;
+        if !shape.plain || positional > shape.total || positional < shape.required {
+            return None;
+        }
+        task.rejection = None;
+        if native == Native::Do {
+            // Consuming its argument is all `do` does.
+            task.stack.pop();
+            return Some(Ok(answer(task, NativeOut::One(Value::null()))));
+        }
+        let mut args = std::mem::take(&mut task.args);
+        let at = task.stack.len() - positional;
+        args.extend(task.stack.drain(at..).map(Some));
+        args.resize(shape.total, None);
+        let specs = &NATIVE_SPECS[native as usize];
+        let out = match check_refs(&Value::Native(native), specs, &args) {
+            Ok(()) => self.native(task, native, &args),
+            Err(crash) => Err(crash),
+        };
+        args.clear();
+        task.args = args;
+        Some(out.map(|out| answer(task, out)))
     }
 
     /// Offload waits without occupying one of the VM's scheduler workers.
@@ -1250,7 +1725,7 @@ impl Vm {
         let wake = self.wake.clone();
         self.sched.lock().unwrap_or_else(|e| e.into_inner()).pending_io += 1;
         let spawn = std::thread::Builder::new().name("hydra-io".into()).spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::stdlib::call(native, &args, &[])))
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::stdlib::call(native, &args, &[]).map(crate::stdlib::Answer::into_vec)))
                 .unwrap_or_else(|_| Err(Crash::new("standard module worker panicked")));
             let mut sched = sched.lock().unwrap_or_else(|e| e.into_inner());
             sched.pending_io -= 1;
@@ -1407,34 +1882,64 @@ impl Vm {
     /// tries the next candidate that accepts the same arguments. With none
     /// left, the rejection is the call's answer, unchanged, and what every
     /// candidate said is kept for the crash if nothing consumes it.
+    /// Return the top `count` values of the stack — `:null` for none.
+    fn return_values(&self, task: &mut Task, count: usize) -> Result<Flow, Crash> {
+        if count == 1 {
+            let value = task.pop();
+            // One plain value to an ordinary call: nothing to retry, nothing
+            // spread, and no vector to build for it.
+            let frame = task.frame();
+            if !frame.is_module_body
+                && matches!(frame.on_return, OnReturn::PushValue)
+                && task.frames.len() > 1
+                && !is_reject(&value)
+            {
+                let frame = task.frames.pop().expect("a frame to return from");
+                task.stack.truncate(frame.stack_base);
+                task.locals.truncate(frame.locals);
+                task.rejection = None;
+                task.extras.clear();
+                task.push(value);
+                return Ok(Flow::Next);
+            }
+            return self.pop_frame(task, vec![value]);
+        }
+        let at = task.stack.len() - count;
+        let mut values: Vec<Value> = task.stack.split_off(at);
+        if values.is_empty() {
+            values.push(Value::null());
+        }
+        self.pop_frame(task, values)
+    }
+
     fn pop_frame(&self, task: &mut Task, values: Vec<Value>) -> Result<Flow, Crash> {
         let mut frame = task.frames.pop().expect("a frame to return from");
         task.stack.truncate(frame.stack_base);
+        task.locals.truncate(frame.locals);
         if frame.is_module_body {
             // Declarations may have opened shadowing levels, so the namespace
             // a module exports is the scope it *ended* with (§6, §7).
             *self.module(frame.module).scope.write().unwrap_or_else(|e| e.into_inner()) =
                 frame.scope().clone();
         }
-        if let (true, Some(mut retry)) =
-            (values.first().is_some_and(is_reject), frame.retry.take().map(|r| *r))
+        if let (true, Some(retry)) =
+            (values.first().is_some_and(is_reject), frame.retry.take())
         {
             let cause = task.rejection.take();
             let message = if cause.is_none() { rejection_message(&values)? } else { None };
-            retry.rejected.push(RejectedBy { signature: frame.chunk.signature(), message, cause });
-            if let Some((callee, bound, rest)) = Vm::resolve(&retry.rest, &retry.args) {
-                let next = Retry {
-                    name: retry.name.clone(),
-                    rest,
-                    args: retry.args.clone(),
-                    rejected: retry.rejected,
-                };
+            let mut more = retry.more.unwrap_or_else(|| {
+                Box::new(RetryMore { rest: Vec::new(), args: CallArgs::counted(retry.count), rejected: Vec::new() })
+            });
+            more.rejected.push(RejectedBy { signature: frame.chunk.signature(), message, cause });
+            if let Some((callee, bound, rest)) = Vm::resolve(&more.rest, &more.args) {
+                more.rest = rest;
+                let next = Retry { name: retry.name.clone(), more: Some(more), count: 0 };
                 // The caller's frame is on top again and still points just
                 // past its call, so the next candidate is called from there.
                 return self.enter_with(task, callee, bound, Some(next));
             }
             task.rejection = Some(
-                rejected(retry.name.as_deref(), &[], &retry.args, &retry.rejected).message,
+                rejected(retry.name.as_deref(), &[], &more.args, &more.rejected).into_message(),
             );
         }
         if !values.first().is_some_and(is_reject) {
@@ -1450,7 +1955,8 @@ impl Vm {
                 task.extras = answered.collect();
                 task.push(value);
             }
-            OnReturn::BindModule { name, alias, unqualified, module } => {
+            OnReturn::BindModule(binding) => {
+                let ModuleBinding { name, alias, unqualified, module } = *binding;
                 self.bind_module(task, module, &name, &alias, unqualified);
             }
         }
@@ -1481,13 +1987,29 @@ impl Vm {
 
     fn take_path(&self, task: &mut Task, segs: usize) -> Result<Vec<PathSeg>, Crash> {
         let at = task.stack.len() - segs;
-        let raw: Vec<Value> = task.stack.split_off(at);
-        raw.iter().map(path_segment).collect()
+        let path = task.stack[at..].iter().map(path_segment).collect();
+        task.stack.truncate(at);
+        path
+    }
+
+    /// `place = value`, into a slot or into the binding a search finds.
+    fn write(&self, task: &mut Task, root: &Root, path: &[PathSeg], value: Value) -> Result<(), Crash> {
+        if let Some(at) = live_slot(task, root) {
+            return match &mut task.locals[at] {
+                Local::Val(slot) => write_local(slot, path, value),
+                Local::Boxed(cell) => write_place(cell, path, value),
+                Local::Empty => unreachable!("a live slot"),
+            };
+        }
+        let cell = self.cell_for(task, root)?;
+        write_place(&cell, path, value)
     }
 
     fn cell_for(&self, task: &Task, root: &Root) -> Result<Cell, Crash> {
         match root {
-            Root::Name(name) => self.lookup(task, name).ok_or_else(|| {
+            // Only reached for a slot that is still empty, which means the name
+            // means what it would have without one.
+            Root::Name(name) | Root::Local { name, .. } => self.lookup(task, name).ok_or_else(|| {
                 // `=` to a name with no binding anywhere crashes (§6).
                 Crash::new(format!("`{name}` is not declared; use `:=` to declare it"))
             }),
@@ -1503,6 +2025,17 @@ impl Vm {
         let module = self.module(module);
         let imports = module.imports.read().unwrap_or_else(|e| e.into_inner());
         imports.get(name).and_then(|c| c.first().cloned())
+    }
+
+    /// Whether `module::` here selects the builtin module of that very name:
+    /// no file answers to it and no `use … as` pointed it elsewhere.
+    fn names_builtin_module(&self, task: &Task, module: &str) -> bool {
+        let importer = self.module(task.frame().module);
+        if importer.aliases.read().unwrap_or_else(|e| e.into_inner()).contains_key(module) {
+            return false;
+        }
+        let builtin = importer.builtin_aliases.read().unwrap_or_else(|e| e.into_inner()).get(module).copied();
+        builtin == Some(module)
     }
 
     /// What a builtin module has under a name, for the importer's own aliases.
@@ -1608,6 +2141,13 @@ impl Vm {
 
     fn load(&self, task: &Task, root: &Root) -> Result<Value, Crash> {
         let cell = match root {
+            Root::Local { slot, name } => {
+                let at = task.frame().locals + *slot as usize;
+                match read_slot(&task.locals[at])? {
+                    Some(value) => return Ok(value),
+                    None => return self.load(task, &Root::Name(name.clone())),
+                }
+            }
             Root::Name(name) => match self.lookup(task, name) {
                 Some(cell) => cell,
                 // A builtin is a global name consulted *after* the scope
@@ -1645,9 +2185,15 @@ impl Vm {
         // A trail's scope's parent is the block's enclosing scope, so the trail
         // reads and writes the parent's bindings while everything it declares
         // with `:=` stays local to it (§6).
+        let outer_root = task.scope().parent().is_none();
         let scope = Scope::child(task.scope());
+        let mut locals = empty_slots(body.slots);
         if let Some((name, value)) = init {
-            scope.declare(&name, value);
+            if Native::lookup(&name).is_some() {
+                builtin_shadowed();
+            }
+            // The compiler put the variable in slot 0 of the trail's chunk.
+            locals[0] = Local::Boxed(scope.declare(&name, value));
         }
         let mut sched = self.sched.lock().unwrap_or_else(|e| e.into_inner());
         let block = task.blocks.last().copied();
@@ -1670,17 +2216,21 @@ impl Vm {
             frames: vec![Frame {
                 chunk: body,
                 ip: 0,
-                scopes: vec![ScopeSlot { scope, dynamic: false }],
+                base: scope,
+                scopes: Vec::new(),
+                locals: 0,
+                outer_root,
                 iters: Vec::new(),
                 stack_base: 0,
                 module: task.frame().module,
                 on_return: OnReturn::PushValue,
                 call_site: Pos::NONE,
                 is_module_body: false,
-                provided: Vec::new(),
                 retry: None,
             }],
             stack: Vec::new(),
+            locals,
+            args: Vec::new(),
             cancel: cancel.clone(),
             block,
             blocks: Vec::new(),
@@ -1848,22 +2398,26 @@ impl Vm {
         let id = self.new_module(name, path);
         let scope = self.module_scope(id);
         let stack_base = task.stack.len();
+        let locals = task.locals.len();
+        task.locals.resize_with(locals + chunk.slots, || Local::Empty);
         task.frames.push(Frame {
             chunk,
             ip: 0,
-            scopes: vec![ScopeSlot { scope, dynamic: false }],
+            base: scope,
+            scopes: Vec::new(),
+            locals,
+            outer_root: true,
             iters: Vec::new(),
             stack_base,
             module: id,
-            on_return: OnReturn::BindModule {
+            on_return: OnReturn::BindModule(Box::new(ModuleBinding {
                 name: Arc::from(name),
                 alias: Arc::from(alias),
                 unqualified,
                 module: id,
-            },
+            })),
             call_site: Pos::NONE,
             is_module_body: true,
-            provided: Vec::new(),
             retry: None,
         });
         Ok(Flow::Next)
@@ -1891,6 +2445,8 @@ impl Vm {
     /// under another name (§7).
     fn bind_builtin(&self, task: &Task, builtin: &'static str, alias: &str, unqualified: bool) {
         let importer = self.module(task.frame().module);
+        // Any `use` can change what a qualified or a bare name means.
+        builtin_shadowed();
         importer
             .builtin_aliases
             .write()
@@ -1925,6 +2481,7 @@ impl Vm {
         unqualified: bool,
     ) {
         let importer = task.frame().module;
+        builtin_shadowed();
         if unqualified {
             let exported_scope = self.module_scope(module);
             let exported: Vec<(String, Cell)> = exported_scope
@@ -1960,6 +2517,9 @@ impl Vm {
 pub struct CallArgs {
     positional: Vec<Value>,
     named: Vec<(Arc<str>, Value)>,
+    /// Set where only the count was kept: the call had nothing else to try,
+    /// so the arguments are needed for nothing but the diagnostic.
+    counted: Option<usize>,
 }
 
 impl CallArgs {
@@ -1971,15 +2531,30 @@ impl CallArgs {
         CallArgs {
             positional: self.positional.iter().map(copy_value).collect(),
             named: self.named.iter().map(|(n, v)| (n.clone(), copy_value(v))).collect(),
+            counted: self.counted,
         }
     }
 
+    pub fn has_names(&self) -> bool {
+        !self.named.is_empty()
+    }
+
+    pub fn positional_count(&self) -> usize {
+        self.counted.unwrap_or(self.positional.len())
+    }
+
+    /// `positional` arguments, of which only the number is kept.
+    fn counted(positional: usize) -> CallArgs {
+        CallArgs { positional: Vec::new(), named: Vec::new(), counted: Some(positional) }
+    }
+
     fn describe(&self) -> String {
+        let positional = self.counted.unwrap_or(self.positional.len());
         let named: Vec<String> = self.named.iter().map(|(n, _)| format!("{n} =")).collect();
         if named.is_empty() {
-            format!("{} argument(s)", self.positional.len())
+            format!("{positional} argument(s)")
         } else {
-            format!("{} positional and {}", self.positional.len(), named.join(", "))
+            format!("{positional} positional and {}", named.join(", "))
         }
     }
 }
@@ -1991,50 +2566,244 @@ fn take_args(task: &mut Task, positional: usize, names: &[Arc<str>]) -> CallArgs
     let named_values: Vec<Value> = task.stack.split_off(at);
     let at = task.stack.len() - positional;
     let positional = task.stack.split_off(at);
-    CallArgs { positional, named: names.iter().cloned().zip(named_values).collect() }
+    CallArgs { positional, named: names.iter().cloned().zip(named_values).collect(), counted: None }
 }
 
-/// What one parameter expects, for a closure or a builtin alike.
-struct ParamSpec {
-    /// Empty for the bare `*`, which binds nothing (channels §6.1).
-    name: Arc<str>,
-    has_default: bool,
-    by_ref: bool,
-    /// A `*`: it collects what is left of the positional arguments, which is
-    /// also what makes everything after it fillable by name only.
+fn empty_slots(count: usize) -> Vec<Local> {
+    std::iter::repeat_with(|| Local::Empty).take(count).collect()
+}
+
+/// Where in the task's slots `root` lives, if it is a slot that holds
+/// something. An empty one falls back to the name (see [`Root::Local`]).
+fn live_slot(task: &Task, root: &Root) -> Option<usize> {
+    let Root::Local { slot, .. } = root else { return None };
+    let at = task.frame().locals + *slot as usize;
+    (!matches!(task.locals[at], Local::Empty)).then_some(at)
+}
+
+/// Read a slot the way a variable is read: through a `&`, then copied (§5.1).
+fn read_slot(slot: &Local) -> Result<Option<Value>, Crash> {
+    match slot {
+        Local::Empty => Ok(None),
+        Local::Val(Value::Ref(r)) => read_place(&r.root, &r.path).map(Some),
+        Local::Val(value) => Ok(Some(copy_value(value))),
+        Local::Boxed(cell) => {
+            let value = cell.read().unwrap_or_else(|e| e.into_inner()).clone();
+            match value {
+                Value::Ref(r) => read_place(&r.root, &r.path).map(Some),
+                other => Ok(Some(copy_value(&other))),
+            }
+        }
+    }
+}
+
+/// A function whose names need a scope gets one per call, with its
+/// parameters declared in it and their cells in the parameters' slots.
+fn scoped_params(task: &mut Task, closure: &Closure, bound: Vec<Option<Value>>) -> ScopeRef {
+    let scope = Scope::child(&closure.scope);
+    if closure.params.iter().any(|p| p.builtin) {
+        builtin_shadowed();
+    }
+    for (param, value) in closure.params.iter().zip(bound) {
+        task.locals.push(match value {
+            Some(value) if !param.name.is_empty() => Local::Boxed(scope.declare_shared(&param.name, value)),
+            _ => Local::Empty,
+        });
+    }
+    scope
+}
+
+/// Push the frame of a call whose parameters are bound from `locals` on.
+fn enter_frame(task: &mut Task, closure: &Arc<Closure>, locals: usize, base: ScopeRef, retry: Option<Retry>) {
+    task.locals.resize_with(locals + closure.chunk.slots, || Local::Empty);
+    let frame = task.frame();
+    let call_site = frame.chunk.pos.get(frame.ip.saturating_sub(1)).copied().unwrap_or(Pos::NONE);
+    let module = frame.module;
+    let stack_base = task.stack.len();
+    task.frames.push(Frame {
+        chunk: closure.chunk.clone(),
+        ip: 0,
+        base,
+        scopes: Vec::new(),
+        locals,
+        outer_root: closure.scope.parent().is_none(),
+        iters: Vec::new(),
+        stack_base,
+        module,
+        on_return: OnReturn::PushValue,
+        call_site,
+        is_module_body: false,
+        retry,
+    });
+}
+
+/// Call a function with `positional` arguments straight off the stack, when
+/// that is all the call needs: no variadic, nothing left out that lacks a
+/// default, every `&` parameter handed a reference. `None` leaves the stack
+/// as it was, for the general path to bind — or to report.
+fn call_positional(task: &mut Task, closure: &Arc<Closure>, positional: usize, name: &Arc<str>) -> Option<Flow> {
+    let params = &closure.params;
+    let (required, total) = closure.chunk.positional?;
+    if !(required..=total).contains(&positional) {
+        return None;
+    }
+    let at = task.stack.len() - positional;
+    if closure.chunk.by_ref
+        && params.iter().zip(&task.stack[at..]).any(|(p, v)| p.by_ref && !matches!(v, Value::Ref(_)))
+    {
+        return None;
+    }
+    task.rejection = None;
+    // Nothing else is left to try, so a rejection needs the count and
+    // nothing more.
+    let retry = Retry::counted(name, positional);
+    let locals = task.locals.len();
+    let base = if closure.chunk.flat {
+        task.locals.extend(task.stack.drain(at..).map(Local::Val));
+        closure.scope.clone()
+    } else {
+        let mut bound: Vec<Option<Value>> = task.stack.drain(at..).map(Some).collect();
+        bound.resize(params.len(), None);
+        scoped_params(task, closure, bound)
+    };
+    enter_frame(task, closure, locals, base, Some(retry));
+    Some(Flow::Next)
+}
+
+/// `&name` in the signature says the caller must mark it, and the caller is
+/// the only one who can (§5.1). This is checked *after* resolution,
+/// deliberately: a missing `&` is an error to report, not a reason to quietly
+/// pick a different function.
+fn check_refs(callee: &Value, specs: &[ParamInfo], bound: &[Option<Value>]) -> Result<(), Crash> {
+    for (spec, value) in specs.iter().zip(bound) {
+        if spec.by_ref && matches!(value, Some(v) if !matches!(v, Value::Ref(_))) {
+            return Err(Crash::new(format!(
+                "`{}` takes `{}` by reference: write `&…` at the call site, \
+                 or it is handed a copy",
+                signature_of(callee),
+                spec.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Push what a builtin answered: the first value, with the rest held for a
+/// binding site that names them (channels §6.2).
+fn answer(task: &mut Task, out: NativeOut) -> Flow {
+    match out {
+        NativeOut::One(value) => {
+            task.extras.clear();
+            task.push(value);
+            Flow::Next
+        }
+        NativeOut::Values(values) => {
+            let mut answered = values.into_iter();
+            let value = answered.next().unwrap_or_else(Value::null);
+            task.extras = answered.collect();
+            task.push(value);
+            Flow::Next
+        }
+        // The trail is parked; what it answers arrives later.
+        NativeOut::Blocked => Flow::Blocked,
+    }
+}
+
+/// What the general call path would find out about a builtin on every call,
+/// worked out once.
+struct NativeShape {
+    required: usize,
+    total: usize,
     variadic: bool,
+    /// It computes an answer and nothing more, so [`Vm::call_plain`] can call
+    /// it: not a control atom, a channel call, one that parks, or one of the
+    /// modules whose builtins are written in Hydra or end the program.
+    plain: bool,
 }
 
-fn param_specs(callee: &Value) -> Option<Vec<ParamSpec>> {
+static NATIVE_SHAPES: LazyLock<Vec<NativeShape>> = LazyLock::new(|| {
+    NATIVE_SPECS
+        .iter()
+        .enumerate()
+        .map(|(at, specs)| {
+            let native = NATIVES.iter().chain(CHANNEL_NATIVES).copied().find(|n| *n as usize == at);
+            let plain = native.is_some_and(|native| {
+                !matches!(
+                    native,
+                    Native::Return
+                        | Native::Break
+                        | Native::Continue
+                        | Native::Exit
+                        | Native::Panic
+                        | Native::Reject
+                        | Native::Send
+                        | Native::Receive
+                        | Native::Channel
+                ) && !crate::stdlib::blocking(native)
+                    && !matches!(native.module(), Some("list" | "cli"))
+                    && !specs.iter().any(|s| s.variadic)
+            });
+            NativeShape {
+                required: specs.iter().filter(|s| !s.has_default).count(),
+                total: specs.len(),
+                variadic: specs.iter().any(|s| s.variadic),
+                plain,
+            }
+        })
+        .collect()
+});
+
+static EMPTY_PATH: LazyLock<Arc<Vec<PathSeg>>> = LazyLock::new(|| Arc::new(Vec::new()));
+
+/// What a callee's parameters expect, for a closure or a builtin alike.
+/// Borrowed: a call asks this several times, and neither kind ever changes.
+fn param_specs(callee: &Value) -> Option<&[ParamInfo]> {
     match callee {
-        Value::Fn(closure) => Some(
-            closure
-                .params
-                .iter()
-                .map(|p| ParamSpec {
-                    name: p.name.clone(),
-                    has_default: p.has_default,
-                    by_ref: p.by_ref,
-                    variadic: p.variadic,
-                })
-                .collect(),
-        ),
-        Value::Native(native) => Some(
-            native
-                .param_names()
-                .iter()
-                .enumerate()
-                .map(|(i, name)| ParamSpec {
-                    name: Arc::from(*name),
-                    has_default: i >= native.required(),
-                    by_ref: native.by_ref().get(i) == Some(&true),
-                    variadic: native.variadic() == Some(i),
-                })
-                .collect(),
-        ),
+        Value::Fn(closure) => Some(&closure.params),
+        Value::Native(native) => NATIVE_SPECS.get(*native as usize).map(|specs| &specs[..]),
         _ => None,
     }
 }
+
+// The control atoms the builtins construct, interned once rather than on every
+// `return(…)`: interning takes the table's lock.
+static SYM_RETURN: LazyLock<Sym> = LazyLock::new(|| sym("return"));
+static SYM_BREAK: LazyLock<Sym> = LazyLock::new(|| sym("break"));
+static SYM_CONTINUE: LazyLock<Sym> = LazyLock::new(|| sym("continue"));
+static SYM_EXIT: LazyLock<Sym> = LazyLock::new(|| sym("exit"));
+static SYM_PANIC: LazyLock<Sym> = LazyLock::new(|| sym("panic"));
+static SYM_REJECT: LazyLock<Sym> = LazyLock::new(|| sym(REJECT));
+
+/// Every builtin's parameters, indexed by the builtin.
+static NATIVE_SPECS: LazyLock<Vec<Vec<ParamInfo>>> = LazyLock::new(|| {
+    let mut table = Vec::new();
+    for (native, specs) in NATIVES.iter().chain(CHANNEL_NATIVES).map(|&native| {
+            let by_ref = native.by_ref();
+            let variadic = native.variadic();
+            let specs = native
+                .param_names()
+                .iter()
+                .enumerate()
+                .map(|(i, name)| ParamInfo {
+                    name: Arc::from(*name),
+                    has_default: i >= native.required(),
+                    by_ref: by_ref.get(i) == Some(&true),
+                    variadic: variadic == Some(i),
+                    keyword_only: variadic.is_some_and(|at| i > at),
+                    builtin: false,
+                })
+                .collect::<Vec<ParamInfo>>();
+            (native, specs)
+        })
+    {
+        let at = native as usize;
+        if table.len() <= at {
+            table.resize_with(at + 1, Vec::new);
+        }
+        table[at] = specs;
+    }
+    table
+});
 
 fn signature_of(callee: &Value) -> String {
     match callee {
@@ -2160,6 +2929,7 @@ enum SendMode {
 /// What a native answered: values to push, or a trail parked until a sibling
 /// answers it (channels §6.5).
 enum NativeOut {
+    One(Value),
     Values(Vec<Value>),
     Blocked,
 }
@@ -2409,5 +3179,5 @@ fn rejection_message(values: &[Value]) -> Result<Option<String>, Crash> {
 }
 
 fn is_null(value: &Value) -> bool {
-    matches!(value, Value::Sym(s) if *s == sym("null"))
+    matches!(value, Value::Sym(s) if is_null_sym(s))
 }

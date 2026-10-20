@@ -36,10 +36,12 @@
 //! which is what makes `a += 1` atomic with respect to `a` where §9.2 leaves a
 //! plain `a = a + 1` last-write-wins (QUESTIONS.md §20).
 
-use std::collections::HashMap;
+
+use crate::hash::{FxBuild, FxHashMap};
+use crate::text::Text;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, RwLock, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, LazyLock, RwLock, Weak};
 
 use crate::compile::{Chunk, ParamInfo};
 use crate::errors::Crash;
@@ -96,12 +98,22 @@ impl fmt::Debug for Sym {
     }
 }
 
-static INTERNED: LazyLock<Mutex<HashMap<Box<str>, Weak<str>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static INTERNED: LazyLock<RwLock<FxHashMap<Box<str>, Weak<str>>>> =
+    LazyLock::new(|| RwLock::new(FxHashMap::default()));
 
 /// Intern a symbol name. Equal names always give the identical symbol.
 pub fn sym(name: &str) -> Sym {
-    let mut table = INTERNED.lock().unwrap_or_else(|e| e.into_inner());
+    // Most names are already there, and finding one only needs to read: trails
+    // building keys at once do not queue behind each other.
+    if let Some(strong) = INTERNED
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(name)
+        .and_then(|weak| weak.upgrade())
+    {
+        return Sym(strong);
+    }
+    let mut table = INTERNED.write().unwrap_or_else(|e| e.into_inner());
     if let Some(weak) = table.get(name) {
         if let Some(strong) = weak.upgrade() {
             return Sym(strong);
@@ -119,7 +131,7 @@ pub fn sym(name: &str) -> Sym {
 
 /// How many names the intern table is holding, for tests about collectability.
 pub fn interned_count() -> usize {
-    let mut table = INTERNED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut table = INTERNED.write().unwrap_or_else(|e| e.into_inner());
     table.retain(|_, weak| weak.strong_count() > 0);
     table.len()
 }
@@ -144,6 +156,26 @@ pub fn boolean(b: bool) -> Value {
     Value::Sym(if b { sym_true() } else { sym_false() })
 }
 
+/// Counts the bindings ever made of a name a flat builtin also has, and the
+/// `use`s that brought names in. A call site that found its name to mean the
+/// builtin and nothing else keeps that answer for as long as this has not
+/// moved: nothing that could have changed it has happened since.
+static BUILTIN_EPOCH: AtomicU32 = AtomicU32::new(1);
+
+pub fn builtin_epoch() -> u32 {
+    BUILTIN_EPOCH.load(Ordering::Acquire)
+}
+
+/// Something now binds a builtin's name, or a `use` brought names in.
+pub fn builtin_shadowed() {
+    BUILTIN_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Whether `s` is `:null`, without taking a handle on it.
+pub fn is_null_sym(s: &Sym) -> bool {
+    *s == *SYM_NULL
+}
+
 // --- containers -------------------------------------------------------------
 
 #[derive(Debug)]
@@ -158,27 +190,33 @@ pub struct ListData {
 }
 
 /// Entries are kept in insertion order: a dict is compared key by key (§5), and
-/// deterministic order keeps rendering and iteration reproducible.
+/// deterministic order keeps rendering and iteration reproducible. Hashed, so a
+/// lookup does not walk every key.
+pub type Entries = indexmap::IndexMap<Sym, Value, FxBuild>;
+
 #[derive(Debug)]
 pub struct DictData {
-    pub entries: Vec<(Sym, Value)>,
+    pub entries: Entries,
     pub shared: AtomicBool,
 }
 
 impl DictData {
     pub fn get(&self, key: &Sym) -> Option<&Value> {
-        self.entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+        self.entries.get(key)
     }
 
     pub fn position(&self, key: &Sym) -> Option<usize> {
-        self.entries.iter().position(|(k, _)| k == key)
+        self.entries.get_index_of(key)
     }
 
+    /// The value at a position `position` answered.
+    pub fn slot(&mut self, index: usize) -> &mut Value {
+        &mut self.entries[index]
+    }
+
+    /// Replacing a value keeps the key where it was.
     pub fn set(&mut self, key: Sym, value: Value) {
-        match self.position(&key) {
-            Some(i) => self.entries[i].1 = value,
-            None => self.entries.push((key, value)),
-        }
+        self.entries.insert(key, value);
     }
 }
 
@@ -190,6 +228,7 @@ pub fn new_list(items: Vec<Value>) -> Value {
 }
 
 pub fn new_dict(entries: Vec<(Sym, Value)>) -> Value {
+    let entries = entries.into_iter().collect();
     Value::Dict(Arc::new(RwLock::new(DictData { entries, shared: AtomicBool::new(false) })))
 }
 
@@ -199,15 +238,16 @@ pub fn list_items(list: &ListRef) -> Vec<Value> {
 }
 
 pub fn dict_entries(dict: &DictRef) -> Vec<(Sym, Value)> {
-    dict.read().unwrap_or_else(|e| e.into_inner()).entries.clone()
+    let data = dict.read().unwrap_or_else(|e| e.into_inner());
+    data.entries.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 
 // --- closures ---------------------------------------------------------------
 
 /// A closure captures its enclosing **scope**, not a copy of it (§5).
 pub struct Closure {
-    pub name: String,
-    pub params: Vec<ParamInfo>,
+    pub name: Arc<str>,
+    pub params: Arc<[ParamInfo]>,
     pub chunk: Arc<Chunk>,
     pub scope: ScopeRef,
 }
@@ -279,7 +319,7 @@ pub struct NativeInfo {
 /// Two natives may share a name within a module, which is how a reader offers
 /// both `read(path)` and `read(path, fallback)`: resolution by shape picks
 /// between them exactly as it does for two functions a program declares (§3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Native {
     Alive,
     Print,
@@ -626,6 +666,20 @@ pub const NATIVES: &[Native] = &[
 ];
 
 /// The calls that only mean something inside a trail (channels §6.4).
+/// Builtins by module and name, in `NATIVES` order. Every call resolves its
+/// name against this, so it is a table rather than a scan.
+type ByName = FxHashMap<(Option<&'static str>, &'static str), Vec<Native>>;
+
+static BY_NAME: LazyLock<ByName> =
+    LazyLock::new(|| {
+        let mut table: FxHashMap<_, Vec<Native>> = FxHashMap::default();
+        for native in NATIVES.iter().copied() {
+            let info = native.info();
+            table.entry((info.module, info.name)).or_default().push(native);
+        }
+        table
+    });
+
 pub const CHANNEL_NATIVES: &[Native] = &[Native::Send, Native::Receive, Native::Channel];
 
 /// Modules the interpreter and `check` know without a file. A file of the same
@@ -961,23 +1015,13 @@ impl Native {
     /// The flat builtins, which unqualified lookup falls back to (§7). A
     /// module's are not among them.
     pub fn lookup(name: &str) -> Option<Native> {
-        NATIVES.iter().copied().find(|n| {
-            let info = n.info();
-            info.module.is_none() && info.name == name
-        })
+        BY_NAME.get(&(None, name)).and_then(|natives| natives.first().copied())
     }
 
     /// Every builtin a module has under that name — more than one where it
     /// offers overloads, and in the order they are tried.
     pub fn in_module(module: &str, name: &str) -> Vec<Native> {
-        NATIVES
-            .iter()
-            .copied()
-            .filter(|n| {
-                let info = n.info();
-                info.module == Some(module) && info.name == name
-            })
-            .collect()
+        BY_NAME.get(&(Some(module), name)).cloned().unwrap_or_default()
     }
 
     /// Every name a builtin module exports, for `use fs as *` and for `check`.
@@ -1124,7 +1168,9 @@ impl fmt::Debug for RefValue {
 #[derive(Clone, Debug)]
 pub enum Value {
     Num(f64),
-    Str(Arc<str>),
+    /// Shared, and appended to in place by `s += t` when nothing else
+    /// holds it — which is what keeps building a string in a loop linear.
+    Str(Text),
     Sym(Sym),
     List(ListRef),
     Dict(DictRef),
@@ -1156,7 +1202,7 @@ impl Value {
     /// `0`, `""` and `[]` (§5).
     pub fn truthy(&self) -> bool {
         match self {
-            Value::Sym(s) => *s != sym_null() && *s != sym_false(),
+            Value::Sym(s) => *s != *SYM_NULL && *s != *SYM_FALSE,
             _ => true,
         }
     }
@@ -1204,6 +1250,12 @@ fn unshare(slot: &mut Value) {
                 if !data.shared.load(Ordering::Relaxed) {
                     return;
                 }
+                // The mark is sticky, but the copies it records may be gone.
+                // A node only this slot holds has nobody left to see a write.
+                if Arc::strong_count(rc) == 1 {
+                    data.shared.store(false, Ordering::Relaxed);
+                    return;
+                }
                 data.items.iter().map(copy_value).collect()
             };
             *rc = Arc::new(RwLock::new(ListData { items, shared: AtomicBool::new(false) }));
@@ -1214,7 +1266,11 @@ fn unshare(slot: &mut Value) {
                 if !data.shared.load(Ordering::Relaxed) {
                     return;
                 }
-                data.entries.iter().map(|(k, v)| (k.clone(), copy_value(v))).collect()
+                if Arc::strong_count(rc) == 1 {
+                    data.shared.store(false, Ordering::Relaxed);
+                    return;
+                }
+                data.entries.iter().map(|(k, v)| (k.clone(), copy_value(v))).collect::<Entries>()
             };
             *rc = Arc::new(RwLock::new(DictData { entries, shared: AtomicBool::new(false) }));
         }
@@ -1318,6 +1374,19 @@ pub fn get_member(container: &Value, key: &Value) -> Result<Value, Crash> {
     }
 }
 
+/// [`get_member`] on a container that is borrowed where it lives rather
+/// than copied out first.
+pub fn get_member_in(container: &Value, key: &Value) -> Result<Value, Crash> {
+    if let Value::Ref(_) = container {
+        return get_member(container, key);
+    }
+    let seg = path_segment(key)?;
+    match member_of(container, &seg)? {
+        Some(value) => read_through(&value),
+        None => Err(missing(&seg)),
+    }
+}
+
 /// `container[key]`, or `None` when the key or index is simply absent.
 ///
 /// Reading a missing key crashes (§5); `has` and `get` are how a program asks
@@ -1382,22 +1451,34 @@ pub fn read_place(root: &Cell, path: &[PathSeg]) -> Result<Value, Crash> {
 ///
 /// Writing a missing key **creates** it; reading one crashes (§5).
 pub fn write_place(root: &Cell, path: &[PathSeg], value: Value) -> Result<(), Crash> {
-    let mut root = root.clone();
-    let mut path = path.to_vec();
+    // The first walk borrows what it was given; only a redirect owns a new
+    // root and path.
+    let mut at: Option<(Cell, Vec<PathSeg>)> = None;
     for _ in 0..MAX_REDIRECTS {
+        let (root, path) = match &at {
+            Some((root, path)) => (root, path.as_slice()),
+            None => (root, path),
+        };
         let step = {
             let mut guard = root.write().unwrap_or_else(|e| e.into_inner());
-            write_slot(&mut guard, &path, value.clone())?
+            write_slot(&mut guard, path, value.clone())?
         };
         match step {
             Walk::Done(()) => return Ok(()),
-            Walk::Redirect { root: next, path: rest } => {
-                root = next;
-                path = rest;
-            }
+            Walk::Redirect { root: next, path: rest } => at = Some((next, rest)),
         }
     }
     Err(Crash::new("a cycle of references was followed while assigning"))
+}
+
+/// `write_place` for a value a frame holds directly rather than in a cell.
+/// Nothing else can reach it, so there is no lock to take; a `&` it holds is
+/// still written through.
+pub fn write_local(slot: &mut Value, path: &[PathSeg], value: Value) -> Result<(), Crash> {
+    match write_slot(slot, path, value.clone())? {
+        Walk::Done(()) => Ok(()),
+        Walk::Redirect { root, path } => write_place(&root, &path, value),
+    }
 }
 
 fn write_slot(slot: &mut Value, path: &[PathSeg], value: Value) -> Result<Walk<()>, Crash> {
@@ -1421,10 +1502,10 @@ fn write_slot(slot: &mut Value, path: &[PathSeg], value: Value) -> Result<Walk<(
             };
             let mut data = rc.write().unwrap_or_else(|e| e.into_inner());
             match data.position(key) {
-                Some(i) => write_slot(&mut data.entries[i].1, &path[1..], value),
+                Some(i) => write_slot(data.slot(i), &path[1..], value),
                 None if last => {
                     // Key writes create (§5).
-                    data.entries.push((key.clone(), value));
+                    data.set(key.clone(), value);
                     Ok(Walk::Done(()))
                 }
                 None => Err(Crash::new(format!("no key .{} in this dict", key.name()))),
@@ -1463,15 +1544,18 @@ fn write_slot(slot: &mut Value, path: &[PathSeg], value: Value) -> Result<Walk<(
 pub fn update_place(
     root: &Cell,
     path: &[PathSeg],
-    op: &str,
+    op: BinOp,
     operand: &Value,
 ) -> Result<(), Crash> {
-    let mut root = root.clone();
-    let mut path = path.to_vec();
+    let mut at: Option<(Cell, Vec<PathSeg>)> = None;
     for _ in 0..MAX_REDIRECTS {
+        let (root, path) = match &at {
+            Some((root, path)) => (root, path.as_slice()),
+            None => (root, path),
+        };
         let step = {
             let mut guard = root.write().unwrap_or_else(|e| e.into_inner());
-            update_slot(&mut guard, &path, op, operand)?
+            update_slot(&mut guard, path, op, operand)?
         };
         match step {
             Walk::Done(()) => return Ok(()),
@@ -1479,19 +1563,24 @@ pub fn update_place(
             // goes first, exactly as a write does, and the read-modify-write
             // then happens whole under the lock of the root that really holds
             // the value.
-            Walk::Redirect { root: next, path: rest } => {
-                root = next;
-                path = rest;
-            }
+            Walk::Redirect { root: next, path: rest } => at = Some((next, rest)),
         }
     }
     Err(Crash::new("a cycle of references was followed while updating"))
 }
 
+/// `update_place` for a value a frame holds directly.
+pub fn update_local(slot: &mut Value, path: &[PathSeg], op: BinOp, operand: &Value) -> Result<(), Crash> {
+    match update_slot(slot, path, op, operand)? {
+        Walk::Done(()) => Ok(()),
+        Walk::Redirect { root, path } => update_place(&root, &path, op, operand),
+    }
+}
+
 fn update_slot(
     slot: &mut Value,
     path: &[PathSeg],
-    op: &str,
+    op: BinOp,
     operand: &Value,
 ) -> Result<Walk<()>, Crash> {
     if let Value::Ref(r) = slot {
@@ -1502,6 +1591,12 @@ fn update_slot(
         // The read and the write, with the lock on this slot's owner held
         // across both. `binary_op` runs on the value that is there now, and
         // nothing can look at the slot until the result is in it.
+        if let (BinOp::Add, Value::Str(text), Value::Str(tail)) = (op, &mut *slot, operand) {
+            // Appending: in place when this binding is the string's only
+            // holder, a copy for this binding alone otherwise.
+            text.push_str(tail);
+            return Ok(Walk::Done(()));
+        }
         *slot = binary_op(op, &*slot, operand)?;
         return Ok(Walk::Done(()));
     };
@@ -1514,7 +1609,7 @@ fn update_slot(
             };
             let mut data = rc.write().unwrap_or_else(|e| e.into_inner());
             match data.position(key) {
-                Some(i) => update_slot(&mut data.entries[i].1, &path[1..], op, operand),
+                Some(i) => update_slot(data.slot(i), &path[1..], op, operand),
                 // A plain `=` would create the key (§5); this one reads it
                 // first, and reading a missing key crashes — the same crash
                 // `d.k = d.k + 1` would raise on its way to the write.
@@ -1541,19 +1636,19 @@ fn update_slot(
 /// Append to the list at `root` + `path`, path-copying shared nodes on the way,
 /// and answer the new length. This is what `push(&list, v)` does.
 pub fn push_place(root: &Cell, path: &[PathSeg], value: Value) -> Result<usize, Crash> {
-    let mut root = root.clone();
-    let mut path = path.to_vec();
+    let mut at: Option<(Cell, Vec<PathSeg>)> = None;
     for _ in 0..MAX_REDIRECTS {
+        let (root, path) = match &at {
+            Some((root, path)) => (root, path.as_slice()),
+            None => (root, path),
+        };
         let step = {
             let mut guard = root.write().unwrap_or_else(|e| e.into_inner());
-            push_slot(&mut guard, &path, value.clone())?
+            push_slot(&mut guard, path, value.clone())?
         };
         match step {
             Walk::Done(len) => return Ok(len),
-            Walk::Redirect { root: next, path: rest } => {
-                root = next;
-                path = rest;
-            }
+            Walk::Redirect { root: next, path: rest } => at = Some((next, rest)),
         }
     }
     Err(Crash::new("a cycle of references was followed while appending"))
@@ -1583,7 +1678,7 @@ fn push_slot(slot: &mut Value, path: &[PathSeg], value: Value) -> Result<Walk<us
             };
             let mut data = rc.write().unwrap_or_else(|e| e.into_inner());
             match data.position(key) {
-                Some(i) => push_slot(&mut data.entries[i].1, &path[1..], value),
+                Some(i) => push_slot(data.slot(i), &path[1..], value),
                 None => Err(Crash::new(format!("no key .{} in this dict", key.name()))),
             }
         }
@@ -1713,6 +1808,17 @@ fn deep_equal_inner(a: &Value, b: &Value, visited: &mut Vec<(usize, usize)>, dep
 
 /// JavaScript-shaped number rendering, which is what the spec follows for
 /// numbers everywhere else (§2).
+/// Append what [`num_to_text`] would answer, without building it apart.
+pub fn push_num(text: &mut Text, n: f64) {
+    use std::fmt::Write;
+    // A whole number a float holds exactly prints as the integer it is.
+    if n.fract() == 0.0 && n.abs() < 9_007_199_254_740_992.0 {
+        let _ = write!(text, "{}", n as i64);
+    } else {
+        text.push_str(&num_to_text(n));
+    }
+}
+
 pub fn num_to_text(n: f64) -> String {
     if n.is_nan() {
         return "NaN".to_string();
@@ -1795,22 +1901,133 @@ fn int_result(n: i32) -> Value {
     Value::Num(n as f64)
 }
 
-pub fn binary_op(op: &str, a: &Value, b: &Value) -> Result<Value, Crash> {
+/// A binary operator, decided once by the compiler rather than by comparing
+/// its text on every evaluation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinOp {
+    Eq,
+    Ne,
+    Is,
+    IsNot,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    BitOr,
+    BitAnd,
+    BitXor,
+    Shl,
+    Shr,
+    UShr,
+}
+
+impl BinOp {
+    const ALL: [BinOp; 19] = [
+        BinOp::Eq,
+        BinOp::Ne,
+        BinOp::Is,
+        BinOp::IsNot,
+        BinOp::Add,
+        BinOp::Sub,
+        BinOp::Mul,
+        BinOp::Div,
+        BinOp::Rem,
+        BinOp::Lt,
+        BinOp::Gt,
+        BinOp::Le,
+        BinOp::Ge,
+        BinOp::BitOr,
+        BinOp::BitAnd,
+        BinOp::BitXor,
+        BinOp::Shl,
+        BinOp::Shr,
+        BinOp::UShr,
+    ];
+
+    pub fn parse(text: &str) -> Option<BinOp> {
+        BinOp::ALL.into_iter().find(|op| op.symbol() == text)
+    }
+
+    pub fn symbol(self) -> &'static str {
+        match self {
+            BinOp::Eq => "==",
+            BinOp::Ne => "!=",
+            BinOp::Is => "===",
+            BinOp::IsNot => "!==",
+            BinOp::Add => "+",
+            BinOp::Sub => "-",
+            BinOp::Mul => "*",
+            BinOp::Div => "/",
+            BinOp::Rem => "%",
+            BinOp::Lt => "<",
+            BinOp::Gt => ">",
+            BinOp::Le => "<=",
+            BinOp::Ge => ">=",
+            BinOp::BitOr => "|",
+            BinOp::BitAnd => "&",
+            BinOp::BitXor => "^",
+            BinOp::Shl => "<<",
+            BinOp::Shr => ">>",
+            BinOp::UShr => ">>>",
+        }
+    }
+}
+
+/// `x % y`, truncating like `fmod`. Whole numbers well inside the range a
+/// float holds exactly take the integer instruction instead of the library
+/// call, which is most of what `%` is ever used on.
+fn remainder(x: f64, y: f64) -> f64 {
+    const EXACT: f64 = 9_007_199_254_740_992.0; // 2^53
+    if x.fract() == 0.0 && y.fract() == 0.0 && x.abs() < EXACT && y.abs() < EXACT && y != 0.0 {
+        let r = (x as i64 % y as i64) as f64;
+        // fmod keeps the dividend's sign on a zero result too.
+        return if r == 0.0 && x.is_sign_negative() { -0.0 } else { r };
+    }
+    x % y
+}
+
+pub fn binary_op(op: BinOp, a: &Value, b: &Value) -> Result<Value, Crash> {
+    // Two numbers are what nearly every operator meets.
+    if let (Value::Num(x), Value::Num(y)) = (a, b) {
+        let (x, y) = (*x, *y);
+        match op {
+            BinOp::Add => return Ok(Value::Num(x + y)),
+            BinOp::Sub => return Ok(Value::Num(x - y)),
+            BinOp::Mul => return Ok(Value::Num(x * y)),
+            BinOp::Div => return Ok(Value::Num(x / y)),
+            BinOp::Rem => return Ok(Value::Num(remainder(x, y))),
+            BinOp::Lt => return Ok(boolean(x < y)),
+            BinOp::Gt => return Ok(boolean(x > y)),
+            BinOp::Le => return Ok(boolean(x <= y)),
+            BinOp::Ge => return Ok(boolean(x >= y)),
+            BinOp::Eq | BinOp::Is => return Ok(boolean(x == y)),
+            BinOp::Ne | BinOp::IsNot => return Ok(boolean(x != y)),
+            _ => {}
+        }
+    }
     match op {
-        "==" => return Ok(boolean(deep_equal(a, b))),
-        "!=" => return Ok(boolean(!deep_equal(a, b))),
-        "===" => return Ok(boolean(identical(a, b))),
-        "!==" => return Ok(boolean(!identical(a, b))),
+        BinOp::Eq => return Ok(boolean(deep_equal(a, b))),
+        BinOp::Ne => return Ok(boolean(!deep_equal(a, b))),
+        BinOp::Is => return Ok(boolean(identical(a, b))),
+        BinOp::IsNot => return Ok(boolean(!identical(a, b))),
         _ => {}
     }
+    let op_text = op.symbol();
 
     // `+` concatenates two strings. It does *not* convert: interpolation is how
     // a value is rendered, so `"n = " + 3` is a bad operand rather than a
     // silent conversion — write `"n = \(3)"`.
-    if op == "+" {
+    if op == BinOp::Add {
         match (a, b) {
             (Value::Str(x), Value::Str(y)) => {
-                return Ok(Value::Str(Arc::from(format!("{x}{y}").as_str())))
+                let mut joined = x.clone();
+                joined.push_str(y);
+                return Ok(Value::Str(joined));
             }
             (Value::Str(_), other) | (other, Value::Str(_)) => {
                 return Err(Crash::new(format!(
@@ -1823,40 +2040,28 @@ pub fn binary_op(op: &str, a: &Value, b: &Value) -> Result<Value, Crash> {
         }
     }
 
-    match op {
-        "+" | "-" | "*" | "/" | "%" | "<" | ">" | "<=" | ">=" => {
-            let x = a.as_num(op)?;
-            let y = b.as_num(op)?;
-            Ok(match op {
-                "+" => Value::Num(x + y),
-                "-" => Value::Num(x - y),
-                "*" => Value::Num(x * y),
-                "/" => Value::Num(x / y),
-                "%" => Value::Num(x % y),
-                "<" => boolean(x < y),
-                ">" => boolean(x > y),
-                "<=" => boolean(x <= y),
-                ">=" => boolean(x >= y),
-                _ => unreachable!(),
-            })
-        }
-        "|" | "&" | "^" | "<<" | ">>" | ">>>" => {
-            let x = a.as_num(op)?;
-            let y = b.as_num(op)?;
-            Ok(match op {
-                "|" => int_result(to_int32(x) | to_int32(y)),
-                "&" => int_result(to_int32(x) & to_int32(y)),
-                "^" => int_result(to_int32(x) ^ to_int32(y)),
-                // Shift counts are taken modulo 32 (§2).
-                "<<" => int_result(to_int32(x).wrapping_shl(to_uint32(y) & 31)),
-                ">>" => int_result(to_int32(x).wrapping_shr(to_uint32(y) & 31)),
-                // The one operator that can produce a value above 2^31 - 1 (§2).
-                ">>>" => Value::Num((to_uint32(x) >> (to_uint32(y) & 31)) as f64),
-                _ => unreachable!(),
-            })
-        }
-        other => Err(Crash::new(format!("unknown operator `{other}`"))),
-    }
+    let x = a.as_num(op_text)?;
+    let y = b.as_num(op_text)?;
+    Ok(match op {
+        BinOp::Add => Value::Num(x + y),
+        BinOp::Sub => Value::Num(x - y),
+        BinOp::Mul => Value::Num(x * y),
+        BinOp::Div => Value::Num(x / y),
+        BinOp::Rem => Value::Num(remainder(x, y)),
+        BinOp::Lt => boolean(x < y),
+        BinOp::Gt => boolean(x > y),
+        BinOp::Le => boolean(x <= y),
+        BinOp::Ge => boolean(x >= y),
+        BinOp::BitOr => int_result(to_int32(x) | to_int32(y)),
+        BinOp::BitAnd => int_result(to_int32(x) & to_int32(y)),
+        BinOp::BitXor => int_result(to_int32(x) ^ to_int32(y)),
+        // Shift counts are taken modulo 32 (§2).
+        BinOp::Shl => int_result(to_int32(x).wrapping_shl(to_uint32(y) & 31)),
+        BinOp::Shr => int_result(to_int32(x).wrapping_shr(to_uint32(y) & 31)),
+        // The one operator that can produce a value above 2^31 - 1 (§2).
+        BinOp::UShr => Value::Num((to_uint32(x) >> (to_uint32(y) & 31)) as f64),
+        BinOp::Eq | BinOp::Ne | BinOp::Is | BinOp::IsNot => unreachable!("decided above"),
+    })
 }
 
 pub fn unary_op(op: &str, v: &Value) -> Result<Value, Crash> {

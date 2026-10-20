@@ -65,7 +65,7 @@ fn unconsumed_control_never_implicitly_returns_from_a_function() {
     for body in [":break", ":continue", "break()", "continue()"] {
         let source = format!("fn helper()\n{body}\nend\nfor n in [1]\nhelper()\nend\n");
         let result = run(&source, 1);
-        let message = result.crash.unwrap().message;
+        let message = result.crash.unwrap().into_message();
         assert!(message.contains("no enclosing loop in this function"), "{message}");
     }
 }

@@ -121,7 +121,9 @@ name = "hydra-lang"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "indexmap",
  "rustls",
+ "serde",
  "serde_json",
  "ureq",
 ]

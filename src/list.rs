@@ -61,24 +61,30 @@ fn compare(a: &Value, b: &Value, depth: usize) -> Result<Ordering, Crash> {
     }
 }
 
+/// A stable sort, crashing on the first pair that cannot be ordered.
 fn sorted(mut values: Vec<Value>) -> Result<Vec<Value>, Crash> {
     if values.len() < 2 {
         return Ok(values);
     }
-    let right = values.split_off(values.len() / 2);
-    let mut left = sorted(values)?.into_iter().peekable();
-    let mut right = sorted(right)?.into_iter().peekable();
-    let mut result = Vec::new();
-    while let (Some(a), Some(b)) = (left.peek(), right.peek()) {
-        result.push(if compare(a, b, 0)? != Ordering::Greater {
-            left.next().unwrap()
-        } else {
-            right.next().unwrap()
-        });
+    // A list of plain numbers is the usual case, and needs no comparison that
+    // can fail once NaN is ruled out.
+    if values.iter().all(|v| matches!(v, Value::Num(n) if !n.is_nan())) {
+        let num = |v: &Value| if let Value::Num(n) = v { *n } else { unreachable!() };
+        values.sort_by(|a, b| num(a).partial_cmp(&num(b)).expect("not NaN"));
+        return Ok(values);
     }
-    result.extend(left);
-    result.extend(right);
-    Ok(result)
+    let mut failed = None;
+    values.sort_by(|a, b| match compare(a, b, 0) {
+        Ok(order) => order,
+        Err(crash) => {
+            failed.get_or_insert(crash);
+            Ordering::Equal
+        }
+    });
+    match failed {
+        Some(crash) => Err(crash),
+        None => Ok(values),
+    }
 }
 
 /// Compile once, then enter a fresh closure in the caller's task, never a nested VM.
@@ -113,7 +119,7 @@ pub(crate) fn script(native: Native, args: &[Option<Value>]) -> Result<Option<Va
         scope.declare(native.name(), Value::Native(*native));
     }
     Ok(Some(Value::Fn(Arc::new(Closure {
-        name: format!("list::{}", native.name()),
+        name: Arc::from(format!("list::{}", native.name())),
         params: chunk.params.clone(),
         chunk: chunk.clone(),
         scope,

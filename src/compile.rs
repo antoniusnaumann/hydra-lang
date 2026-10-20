@@ -10,28 +10,77 @@
 //! to remember in twenty places.
 //!
 //! Nothing about the language changes: scopes are still hash maps with parent
-//! pointers (§6), and names are still resolved dynamically.
+//! pointers (§6), and names are still resolved dynamically — wherever anyone
+//! could tell. Within one chunk, though, a name the chunk declared itself is
+//! resolved here, to a slot in the frame:
+//!
+//! * A block that creates no closure and opens no `parallel` block cannot be
+//!   seen by anything but its own code (see [`captures`]), so its names live
+//!   in their slots and nowhere else.
+//! * Any other block is a real scope, because a closure or a trail will look
+//!   names up in it. Its names are still declared there, and the slot holds
+//!   the same cell, so this chunk reaches the binding without a search.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::ast::*;
 use crate::errors::{HydraError, Pos, Result};
-use crate::value::{sym, Sym};
+use crate::text::Text;
+use crate::value::{sym, BinOp, Native, Sym};
 
 /// Where a place expression is rooted. Only a variable — possibly selected out
 /// of a module — can root an assignment or a `&` (§5.1).
 #[derive(Clone, Debug)]
 pub enum Root {
     Name(Arc<str>),
+    /// A name the compiler resolved to one of the frame's slots. `name` is for
+    /// a slot that is still empty — a parameter whose default has not run —
+    /// where the name means whatever it would have meant without the slot.
+    Local { slot: u32, name: Arc<str> },
     Ns { module: Arc<str>, name: Arc<str> },
 }
 
 impl Root {
     pub fn describe(&self) -> String {
         match self {
-            Root::Name(n) => n.to_string(),
+            Root::Name(n) | Root::Local { name: n, .. } => n.to_string(),
             Root::Ns { module, name } => format!("{module}::{name}"),
         }
+    }
+}
+
+/// What a call by name last learned about its name: that it meant the
+/// builtin and nothing else, as of a given [`builtin_epoch`] and from a given
+/// module (whose imports were part of the question). Zero is "nothing yet".
+///
+/// [`builtin_epoch`]: crate::value::builtin_epoch
+#[derive(Default)]
+pub struct CallCache(AtomicU64);
+
+impl CallCache {
+    fn key(epoch: u32, module: usize) -> u64 {
+        (u64::from(epoch) << 32) | (module as u64 + 1)
+    }
+
+    pub fn holds(&self, epoch: u32, module: usize) -> bool {
+        self.0.load(Ordering::Relaxed) == CallCache::key(epoch, module)
+    }
+
+    pub fn set(&self, epoch: u32, module: usize) {
+        self.0.store(CallCache::key(epoch, module), Ordering::Relaxed);
+    }
+}
+
+impl Clone for CallCache {
+    fn clone(&self) -> CallCache {
+        CallCache(AtomicU64::new(self.0.load(Ordering::Relaxed)))
+    }
+}
+
+impl std::fmt::Debug for CallCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CallCache")
     }
 }
 
@@ -53,7 +102,7 @@ pub enum Unconsumed {
 #[derive(Clone, Debug)]
 pub enum Instr {
     PushNum(f64),
-    PushStr(Arc<str>),
+    PushStr(Text),
     PushSym(Sym),
     MakeList(usize),
     /// Pops `n` key/value pairs. Keys are values rather than a static table
@@ -64,7 +113,7 @@ pub enum Instr {
     /// Pops a string and interns it as a symbol — the runtime half of a
     /// symbol built by interpolation (§2).
     MakeSym,
-    MakeClosure { name: Arc<str>, params: Arc<Vec<ParamInfo>>, chunk: Arc<Chunk> },
+    MakeClosure { name: Arc<str>, chunk: Arc<Chunk> },
     Pop,
     /// The result of an expression written as a statement, which nothing
     /// consumed (§8.1). `spread` says the expression was a call, so the extras
@@ -73,8 +122,16 @@ pub enum Instr {
 
     /// Read a variable: dereference a `&` transparently, then copy (§5.1).
     Load(Root),
-    /// `x := v` — a fresh binding in the current scope, shadowing (§6).
-    Declare(Arc<str>),
+    /// `x := v` — a fresh binding in the current scope, shadowing (§6). The
+    /// slot gets the binding's cell too, which is how this chunk reaches it.
+    /// `builtin` says a flat builtin has the name too, so that binding it
+    /// changes what a call by that name can mean.
+    Declare { name: Arc<str>, slot: u32, builtin: bool },
+    /// `x := v` for a name that lives in a slot: a fresh binding there.
+    DeclareLocal(u32),
+    /// Empty the slots of a block that is being left, so what they held is
+    /// released when the block ends rather than when the frame does.
+    ClearLocals { from: u32, to: u32 },
     /// `place = v` — writes into the binding an outward search finds (§6),
     /// path-copying shared nodes and creating a missing final key (§5).
     Store { root: Root, segs: usize },
@@ -90,13 +147,16 @@ pub enum Instr {
     /// as **one** step, holding the lock the store takes for the read as well.
     /// A load and a store would let another trail write in between and lose the
     /// update (QUESTIONS.md §20).
-    Update { root: Root, segs: usize, op: &'static str },
+    Update { root: Root, segs: usize, op: BinOp },
     /// `&place` (§5.1).
     MakeRef { root: Root, segs: usize },
     /// `a[k]`, which is also what `a.k` compiles to (§5).
     GetMember,
+    /// `a[k]` for an `a` in a slot, with only `k` on the stack: the element
+    /// is read where it is, without first copying `a` out to the stack.
+    GetMemberLocal { slot: u32, name: Arc<str> },
 
-    Binary(&'static str),
+    Binary(BinOp),
     Unary(&'static str),
 
     Jump(usize),
@@ -113,16 +173,46 @@ pub enum Instr {
     Call { positional: usize, names: Arc<Vec<Arc<str>>> },
     /// Call by name: every function bound to that name is a candidate, and the
     /// first that accepts the argument count and names is the one (§3).
-    CallName { name: Arc<str>, positional: usize, names: Arc<Vec<Arc<str>>> },
+    /// `locals` are the slots that hold the name, innermost first; they are
+    /// candidates ahead of the scope chain. `native` is the flat builtin of
+    /// that name, the last candidate there is. `cache` remembers that the
+    /// name meant that builtin alone; `imports` that the module has no
+    /// import of the name.
+    CallName {
+        name: Arc<str>,
+        locals: Arc<[u32]>,
+        native: Option<Native>,
+        cache: CallCache,
+        imports: CallCache,
+        positional: usize,
+        names: Arc<Vec<Arc<str>>>,
+    },
+    /// `return(a, b…)` as a statement in a function, with its `count`
+    /// arguments on the stack: when `return` still means the builtin here,
+    /// return them, as the call and its unconsumed result would. Otherwise
+    /// fall through to the call, which is compiled right after.
+    ReturnFast { count: usize, cache: CallCache },
     /// `receiver.name(…)`. The field wins where the receiver has one of that
     /// name holding something callable; otherwise the call is `name(receiver, …)`
     /// — the receiver becomes the first argument (§5.2).
-    CallMethod { name: Arc<str>, positional: usize, names: Arc<Vec<Arc<str>>> },
+    CallMethod { name: Arc<str>, locals: Arc<[u32]>, positional: usize, names: Arc<Vec<Arc<str>>> },
     /// `mod::name(…)`, and `x.mod::name(…)` with the receiver already first
     /// among the arguments. A qualified call falls through to nothing, but the
     /// module may have several candidates under the name, and resolution by
     /// shape picks between them (§7).
-    CallNs { module: Arc<str>, name: Arc<str>, positional: usize, names: Arc<Vec<Arc<str>>> },
+    /// `written` is `module::name` (or `::name`), for diagnostics.
+    /// `natives` is what the builtin module of that name has under the name,
+    /// which is what the call means wherever `module` is that builtin module
+    /// — the usual case, and the one `cache` remembers.
+    CallNs {
+        module: Arc<str>,
+        name: Arc<str>,
+        written: Arc<str>,
+        natives: Arc<[Native]>,
+        cache: CallCache,
+        positional: usize,
+        names: Arc<Vec<Arc<str>>>,
+    },
     /// Return `n` values, the first of which is the meaningful one and the rest
     /// additional information (channels §6.2).
     Return(usize),
@@ -140,10 +230,11 @@ pub enum Instr {
     /// stops (§9.1, §9.5).
     Tick,
 
-    /// Jump past a parameter's default when the call supplied that argument.
-    /// Defaults are evaluated in the *function's* scope, so a later one can
-    /// refer to an earlier parameter.
-    SkipIfProvided { index: usize, target: usize },
+    /// Jump past a parameter's default when the call supplied that argument,
+    /// which is when the parameter's slot is not empty. Defaults are evaluated
+    /// in the *function's* scope, so a later one can refer to an earlier
+    /// parameter.
+    SkipIfLocal { slot: u32, target: usize },
 
     /// Open a `parallel` / `race` block.
     /// `arity` is how many trails the block will have, where that is known
@@ -179,6 +270,8 @@ pub struct ParamInfo {
     pub variadic: bool,
     /// Declared after the variadic, so only a named argument can fill it.
     pub keyword_only: bool,
+    /// A flat builtin has the name too (see [`Instr::Declare`]).
+    pub builtin: bool,
 }
 
 /// A compiled body: a function, a module, a trail, or a closure.
@@ -188,7 +281,21 @@ pub struct Chunk {
     pub code: Vec<Instr>,
     /// One position per instruction, for crash diagnostics.
     pub pos: Vec<Pos>,
-    pub params: Vec<ParamInfo>,
+    /// Shared with every closure made from this chunk: a call reads them,
+    /// and nothing ever changes them.
+    pub params: Arc<[ParamInfo]>,
+    /// How many slots a frame of this chunk needs.
+    pub slots: usize,
+    /// Parameter `i` is slot `i`. When this is set they live there alone and
+    /// a call opens no scope for them; otherwise the slots hold the cells of
+    /// the function's scope.
+    pub flat: bool,
+    /// How many positional arguments a call can bind by position alone:
+    /// enough to reach the last parameter without a default, and no more
+    /// than there are parameters. `None` with a variadic, which collects.
+    pub positional: Option<(usize, usize)>,
+    /// A parameter is `&`, so an argument has to be checked for one.
+    pub by_ref: bool,
 }
 
 impl Chunk {
@@ -228,8 +335,20 @@ struct LoopCtx {
     owns_iter: bool,
     scope_depth: usize,
     iter_depth: usize,
+    /// The first slot inside the loop: leaving it empties everything above.
+    slot_floor: u32,
     breaks: Vec<usize>,
     continues: Vec<usize>,
+}
+
+/// The names one block declared, in order. A name declared twice has two
+/// entries, and the later one is what the name means from there on (§6).
+struct Block {
+    names: Vec<(Arc<str>, u32)>,
+    /// The first slot this block owns.
+    floor: u32,
+    /// A real scope, which the names are declared into as well.
+    scoped: bool,
 }
 
 pub struct Compiler {
@@ -246,10 +365,18 @@ pub struct Compiler {
     in_fn: bool,
     /// This chunk is an iteration body with an implicit parallel-loop handler.
     parallel_loop: bool,
+    /// Open blocks, innermost last. A block without a scope only ever has
+    /// blocks without one inside it.
+    blocks: Vec<Block>,
+    next_slot: u32,
+    max_slots: u32,
+    /// The function's parameters and top-level names are slots.
+    flat: bool,
 }
 
 pub fn compile_program(program: &Program) -> Result<Arc<Chunk>> {
     let mut c = Compiler::new(&program.file, false);
+    c.open_block(true);
     c.block(&program.body)?;
     c.emit(Instr::ReturnNull, Pos::NONE);
     Ok(Arc::new(c.finish(program.file.clone(), Vec::new())))
@@ -267,11 +394,87 @@ impl Compiler {
             in_trail,
             in_fn: false,
             parallel_loop: false,
+            blocks: Vec::new(),
+            next_slot: 0,
+            max_slots: 0,
+            flat: false,
         }
     }
 
     fn finish(self, name: String, params: Vec<ParamInfo>) -> Chunk {
-        Chunk { name, file: self.file, code: self.code, pos: self.pos, params }
+        let required = params.iter().rposition(|p| !p.has_default).map_or(0, |i| i + 1);
+        let positional = (!params.iter().any(|p| p.variadic)).then_some((required, params.len()));
+        let by_ref = params.iter().any(|p| p.by_ref);
+        Chunk {
+            positional,
+            by_ref,
+            name,
+            file: self.file,
+            code: self.code,
+            pos: self.pos,
+            params: params.into(),
+            slots: self.max_slots as usize,
+            flat: self.flat,
+        }
+    }
+
+    // --- slots --------------------------------------------------------------
+
+    fn open_block(&mut self, scoped: bool) {
+        self.blocks.push(Block { names: Vec::new(), floor: self.next_slot, scoped });
+    }
+
+    /// Close the innermost block, emptying the slots it declared.
+    fn close_block(&mut self, pos: Pos) {
+        let block = self.blocks.pop().expect("a block to close");
+        if block.floor < self.next_slot {
+            self.emit(Instr::ClearLocals { from: block.floor, to: self.next_slot }, pos);
+        }
+        self.next_slot = block.floor;
+    }
+
+    /// A fresh slot for `name` in the innermost block. Registered only now,
+    /// after the value was compiled, so `x := x + 1` reads the old `x`.
+    fn declare_slot(&mut self, name: &str) -> u32 {
+        let slot = self.next_slot;
+        self.next_slot += 1;
+        self.max_slots = self.max_slots.max(self.next_slot);
+        let block = self.blocks.last_mut().expect("an open block");
+        if !name.is_empty() {
+            block.names.push((Arc::from(name), slot));
+        }
+        slot
+    }
+
+    /// Bind the value on the stack to `name`: in a slot, and in the current
+    /// scope as well where the block is one.
+    fn declare(&mut self, name: &str, pos: Pos) {
+        let scoped = self.blocks.last().expect("an open block").scoped;
+        let slot = self.declare_slot(name);
+        if scoped {
+            let builtin = Native::lookup(name).is_some();
+            self.emit(Instr::Declare { name: Arc::from(name), slot, builtin }, pos);
+        } else {
+            self.emit(Instr::DeclareLocal(slot), pos);
+        }
+    }
+
+    /// Every slot `name` refers to, innermost first.
+    fn slots_of(&self, name: &str) -> Vec<u32> {
+        self.blocks
+            .iter()
+            .rev()
+            .flat_map(|block| block.names.iter().rev())
+            .filter(|(n, _)| n.as_ref() == name)
+            .map(|(_, slot)| *slot)
+            .collect()
+    }
+
+    fn root(&self, name: &str) -> Root {
+        match self.slots_of(name).first() {
+            Some(&slot) => Root::Local { slot, name: Arc::from(name) },
+            None => Root::Name(Arc::from(name)),
+        }
     }
 
     fn emit(&mut self, instr: Instr, pos: Pos) -> usize {
@@ -293,8 +496,15 @@ impl Compiler {
             | Instr::OrJump(t)
             | Instr::IterNext { exit: t, .. }
             | Instr::JumpIfDecided(t)
-            | Instr::SkipIfProvided { target: t, .. } => *t = target,
+            | Instr::SkipIfLocal { target: t, .. } => *t = target,
             other => panic!("cannot patch {other:?}"),
+        }
+    }
+
+    fn binary(&self, op: &str, pos: Pos) -> Result<BinOp> {
+        match BinOp::parse(op) {
+            Some(op) => Ok(op),
+            None => self.err(format!("unknown operator `{op}`"), pos),
         }
     }
 
@@ -313,11 +523,18 @@ impl Compiler {
 
     /// A body that opens a scope of its own (§6).
     fn scoped_block(&mut self, body: &[Stmt], pos: Pos) -> Result<()> {
-        self.emit(Instr::PushScope, pos);
-        self.scope_depth += 1;
+        let scoped = captures(body);
+        if scoped {
+            self.emit(Instr::PushScope, pos);
+            self.scope_depth += 1;
+        }
+        self.open_block(scoped);
         self.block(body)?;
-        self.scope_depth -= 1;
-        self.emit(Instr::PopScope(1), pos);
+        self.close_block(pos);
+        if scoped {
+            self.scope_depth -= 1;
+            self.emit(Instr::PopScope(1), pos);
+        }
         Ok(())
     }
 
@@ -337,7 +554,7 @@ impl Compiler {
             }
             Stmt::FnDecl { name, def, pos } => {
                 self.closure(def, name, *pos)?;
-                self.emit(Instr::Declare(Arc::from(name.as_str())), *pos);
+                self.declare(name, *pos);
             }
             Stmt::Decl { names, value, pos } => {
                 // A closure declared as `f := fn(…)` answers to `f` in
@@ -357,7 +574,7 @@ impl Compiler {
                         self.emit(Instr::Pop, *pos);
                         continue;
                     }
-                    self.emit(Instr::Declare(Arc::from(name.as_str())), *pos);
+                    self.declare(name, *pos);
                 }
             }
             Stmt::Assign { targets, op, value, pos } => {
@@ -380,7 +597,10 @@ impl Compiler {
                         // `a[next()] += 1` calls `next` once, like the
                         // `a[i] = a[i] + 1` it stands for and unlike the text
                         // of it.
-                        Some(op) => self.emit(Instr::Update { root, segs, op }, *pos),
+                        Some(op) => {
+                            let op = self.binary(op, *pos)?;
+                            self.emit(Instr::Update { root, segs, op }, *pos)
+                        }
                     };
                 } else {
                     // Several targets for one call that returns several values.
@@ -400,12 +620,30 @@ impl Compiler {
                 }
             }
             Stmt::Expr { expr, .. } => {
-                self.expr(expr)?;
                 let at = match (self.in_fn, self.in_trail) {
                     (false, _) => Unconsumed::TopLevel,
                     (true, false) => Unconsumed::Function,
                     (true, true) => Unconsumed::TrailInFunction,
                 };
+                match expr {
+                    // `return(…)` in a function, where it most likely means
+                    // the builtin: try returning straight away, and keep the
+                    // call and its handler behind that for when it does not.
+                    Expr::Call { callee, args, pos: call_pos, .. }
+                        if at == Unconsumed::Function
+                            && matches!(callee.as_ref(), Expr::Name { name, .. } if name == "return")
+                            && args.iter().all(|a| a.name.is_none())
+                            && self.slots_of("return").is_empty() =>
+                    {
+                        for arg in args {
+                            self.expr(&arg.value)?;
+                        }
+                        let count = args.len();
+                        self.emit(Instr::ReturnFast { count, cache: CallCache::default() }, *call_pos);
+                        self.call_name("return", count, Arc::new(Vec::new()), *call_pos);
+                    }
+                    _ => self.expr(expr)?,
+                }
                 self.handle_loop_signals(pos)?;
                 let spread = matches!(expr, Expr::Call { .. });
                 self.emit(Instr::Unconsumed { spread, at }, pos);
@@ -427,7 +665,7 @@ impl Compiler {
                     *pos,
                 );
                 for trail in trails {
-                    let chunk = self.trail_chunk(&trail.body, trail.column, false)?;
+                    let chunk = self.trail_chunk(&trail.body, trail.column, false, None)?;
                     self.emit(
                         Instr::SpawnTrail { body: chunk, var: None, column: trail.column },
                         trail.pos,
@@ -444,7 +682,7 @@ impl Compiler {
                     },
                     *pos,
                 );
-                let chunk = self.trail_chunk(body, 0, true)?;
+                let chunk = self.trail_chunk(body, 0, true, Some(var))?;
                 self.expr(iterable)?;
                 self.emit(Instr::IterStart, *pos);
                 self.iter_depth += 1;
@@ -472,7 +710,7 @@ impl Compiler {
                     },
                     *pos,
                 );
-                let chunk = self.trail_chunk(body, 0, true)?;
+                let chunk = self.trail_chunk(body, 0, true, None)?;
                 let top = self.here();
                 // Race completion or :break stops spawning before the next condition.
                 let decided = self.emit(Instr::JumpIfDecided(0), *pos);
@@ -528,6 +766,7 @@ impl Compiler {
             owns_iter: false,
             scope_depth: self.scope_depth,
             iter_depth: self.iter_depth,
+            slot_floor: self.next_slot,
             breaks: Vec::new(),
             continues: Vec::new(),
         });
@@ -558,6 +797,7 @@ impl Compiler {
             owns_iter: true,
             scope_depth: self.scope_depth,
             iter_depth: self.iter_depth,
+            slot_floor: self.next_slot,
             breaks: Vec::new(),
             continues: Vec::new(),
         });
@@ -565,12 +805,19 @@ impl Compiler {
         // The loop variable is declared in the body's own scope, fresh each
         // iteration, so a closure made in the body captures that iteration's
         // binding (§6).
-        self.emit(Instr::PushScope, pos);
-        self.scope_depth += 1;
-        self.emit(Instr::Declare(Arc::from(var)), pos);
+        let scoped = captures(body);
+        if scoped {
+            self.emit(Instr::PushScope, pos);
+            self.scope_depth += 1;
+        }
+        self.open_block(scoped);
+        self.declare(var, pos);
         self.block(body)?;
-        self.scope_depth -= 1;
-        self.emit(Instr::PopScope(1), pos);
+        self.close_block(pos);
+        if scoped {
+            self.scope_depth -= 1;
+            self.emit(Instr::PopScope(1), pos);
+        }
         self.emit(Instr::Jump(top), pos);
 
         let exit = self.here();
@@ -611,13 +858,16 @@ impl Compiler {
 
     /// Unwind scopes and iterators back to a loop, then jump.
     fn jump_out_of(&mut self, index: usize, pos: Pos, is_break: bool) -> Result<()> {
-        let (scope_depth, iter_depth, owns_iter) = {
+        let (scope_depth, iter_depth, owns_iter, slot_floor) = {
             let ctx = &self.loops[index];
-            (ctx.scope_depth, ctx.iter_depth, ctx.owns_iter)
+            (ctx.scope_depth, ctx.iter_depth, ctx.owns_iter, ctx.slot_floor)
         };
         let scopes = self.scope_depth - scope_depth;
         if scopes > 0 {
             self.emit(Instr::PopScope(scopes), pos);
+        }
+        if slot_floor < self.next_slot {
+            self.emit(Instr::ClearLocals { from: slot_floor, to: self.next_slot }, pos);
         }
         // `break` leaves the loop, so a `for`'s own iterator goes too;
         // `continue` jumps back to the top and keeps it.
@@ -660,7 +910,8 @@ impl Compiler {
                 self.emit(Instr::MakeDict(entries.len()), *pos);
             }
             Expr::Name { name, pos } => {
-                self.emit(Instr::Load(Root::Name(Arc::from(name.as_str()))), *pos);
+                let root = self.root(name);
+                self.emit(Instr::Load(root), *pos);
             }
             Expr::Namespace { module, name, pos } => {
                 self.emit(
@@ -680,11 +931,21 @@ impl Compiler {
                 )
             }
             Expr::Key { obj, key, pos } => {
+                if let Some(root) = self.local_root(obj, key.is_static()) {
+                    self.symbol(key)?;
+                    self.emit(root, *pos);
+                    return Ok(());
+                }
                 self.expr(obj)?;
                 self.symbol(key)?;
                 self.emit(Instr::GetMember, *pos);
             }
             Expr::Index { obj, index, pos } => {
+                if let Some(root) = self.local_root(obj, is_pure(index)) {
+                    self.expr(index)?;
+                    self.emit(root, *pos);
+                    return Ok(());
+                }
                 self.expr(obj)?;
                 self.expr(index)?;
                 self.emit(Instr::GetMember, *pos);
@@ -699,10 +960,7 @@ impl Compiler {
                         for arg in args {
                             self.expr(&arg.value)?;
                         }
-                        self.emit(
-                            Instr::CallName { name: Arc::from(name.as_str()), positional, names },
-                            *pos,
-                        );
+                        self.call_name(name, positional, names, *pos);
                     }
                     // `x.f(…)`: a field call, or a free function with `x` as
                     // its first argument (§5.2). Which one is a runtime
@@ -713,8 +971,14 @@ impl Compiler {
                         for arg in args {
                             self.expr(&arg.value)?;
                         }
+                        let locals = self.slots_of(name).into();
                         self.emit(
-                            Instr::CallMethod { name: Arc::from(name.as_str()), positional, names },
+                            Instr::CallMethod {
+                                name: Arc::from(name.as_str()),
+                                locals,
+                                positional,
+                                names,
+                            },
                             *pos,
                         );
                     }
@@ -729,6 +993,9 @@ impl Compiler {
                             Instr::CallNs {
                                 module: Arc::from(module.as_str()),
                                 name: Arc::from(name.as_str()),
+                                written: Arc::from(format!("{module}::{name}")),
+                                natives: ns_natives(module, name),
+                                cache: CallCache::default(),
                                 positional: positional + 1,
                                 names,
                             },
@@ -743,6 +1010,9 @@ impl Compiler {
                             Instr::CallNs {
                                 module: Arc::from(module.as_str()),
                                 name: Arc::from(name.as_str()),
+                                written: Arc::from(format!("{module}::{name}")),
+                                natives: ns_natives(module, name),
+                                cache: CallCache::default(),
                                 positional,
                                 names,
                             },
@@ -784,6 +1054,7 @@ impl Compiler {
                 op => {
                     self.expr(left)?;
                     self.expr(right)?;
+                    let op = self.binary(op, *pos)?;
                     self.emit(Instr::Binary(op), *pos);
                 }
             },
@@ -792,21 +1063,47 @@ impl Compiler {
         Ok(())
     }
 
+    /// The instruction that indexes `obj` in place, when `obj` is a name in a
+    /// slot and the key cannot change it: the key is evaluated after `obj`
+    /// is read, and a pure key is what makes that order unobservable.
+    fn local_root(&self, obj: &Expr, pure_key: bool) -> Option<Instr> {
+        let Expr::Name { name, .. } = obj else { return None };
+        match self.root(name) {
+            Root::Local { slot, name } if pure_key => Some(Instr::GetMemberLocal { slot, name }),
+            _ => None,
+        }
+    }
+
+    /// Call `name` with its arguments already on the stack.
+    fn call_name(&mut self, name: &str, positional: usize, names: Arc<Vec<Arc<str>>>, pos: Pos) {
+        let locals = self.slots_of(name).into();
+        let instr = Instr::CallName {
+            name: Arc::from(name),
+            locals,
+            native: Native::lookup(name),
+            cache: CallCache::default(),
+            imports: CallCache::default(),
+            positional,
+            names,
+        };
+        self.emit(instr, pos);
+    }
+
     /// A string literal: one instruction when it is literal, a concatenation
     /// of its pieces when it interpolates (§1).
     fn interpolated(&mut self, parts: &[StrPart], pos: Pos) -> Result<()> {
         if parts.is_empty() {
-            self.emit(Instr::PushStr(Arc::from("")), pos);
+            self.emit(Instr::PushStr(Text::new("")), pos);
             return Ok(());
         }
         if let [StrPart::Text(text)] = parts {
-            self.emit(Instr::PushStr(Arc::from(text.as_str())), pos);
+            self.emit(Instr::PushStr(Text::new(text)), pos);
             return Ok(());
         }
         for part in parts {
             match part {
                 StrPart::Text(text) => {
-                    self.emit(Instr::PushStr(Arc::from(text.as_str())), pos);
+                    self.emit(Instr::PushStr(Text::new(text)), pos);
                 }
                 StrPart::Expr(expr) => self.expr(expr)?,
             }
@@ -830,12 +1127,27 @@ impl Compiler {
     fn closure(&mut self, def: &Arc<ClosureDef>, name: &str, pos: Pos) -> Result<()> {
         let mut sub = Compiler::new(&self.file, self.in_trail);
         sub.in_fn = true;
+        // Parameter `i` is slot `i`, and the body's names follow. Where
+        // nothing inside can capture the function's scope, nothing needs it
+        // to exist, and the slots are all there is.
+        sub.flat = !closure_captures(def);
+        sub.open_block(!sub.flat);
+        for param in &def.params {
+            sub.declare_slot(&param.name);
+        }
         // The prologue fills in the parameters the call did not supply.
         for (index, param) in def.params.iter().enumerate() {
             let Some(default) = &param.default else { continue };
-            let skip = sub.emit(Instr::SkipIfProvided { index, target: 0 }, param.pos);
+            let slot = index as u32;
+            let skip = sub.emit(Instr::SkipIfLocal { slot, target: 0 }, param.pos);
             sub.expr(default)?;
-            sub.emit(Instr::Declare(Arc::from(param.name.as_str())), param.pos);
+            if sub.flat {
+                sub.emit(Instr::DeclareLocal(slot), param.pos);
+            } else {
+                let name = Arc::from(param.name.as_str());
+                let builtin = Native::lookup(&param.name).is_some();
+                sub.emit(Instr::Declare { name, slot, builtin }, param.pos);
+            }
             let after = sub.here();
             sub.patch(skip, after);
         }
@@ -861,14 +1173,12 @@ impl Compiler {
                 has_default: p.default.is_some(),
                 variadic: p.variadic,
                 keyword_only: p.keyword_only,
+                builtin: Native::lookup(&p.name).is_some(),
             })
             .collect();
         let display = if name.is_empty() { "fn".to_string() } else { name.to_string() };
-        let chunk = Arc::new(sub.finish(display, params.clone()));
-        self.emit(
-            Instr::MakeClosure { name: Arc::from(name), params: Arc::new(params), chunk },
-            pos,
-        );
+        let chunk = Arc::new(sub.finish(display, params));
+        self.emit(Instr::MakeClosure { name: Arc::from(name), chunk }, pos);
         Ok(())
     }
 
@@ -880,7 +1190,7 @@ impl Compiler {
         loop {
             match current {
                 Expr::Name { name, .. } => {
-                    let root = Root::Name(Arc::from(name.as_str()));
+                    let root = self.root(name);
                     return self.emit_segments(root, segs);
                 }
                 Expr::Namespace { module, name, pos } if module.is_empty() => {
@@ -925,21 +1235,113 @@ impl Compiler {
     }
 
     /// Compile one trail body into its own chunk (§4, §9).
+    /// `var` is the `parallel for` variable, which the trail starts with in
+    /// its scope and in slot 0.
     fn trail_chunk(
         &mut self,
         body: &[Stmt],
         column: usize,
         parallel_loop: bool,
+        var: Option<&str>,
     ) -> Result<Arc<Chunk>> {
         let mut sub = Compiler::new(&self.file, true);
         sub.in_fn = self.in_fn;
         sub.parallel_loop = parallel_loop;
+        sub.open_block(true);
+        if let Some(var) = var {
+            sub.declare_slot(var);
+        }
         sub.block(body)?;
         sub.emit(Instr::ReturnNull, Pos::NONE);
         Ok(Arc::new(sub.finish(format!("trail {column}"), Vec::new())))
     }
 }
 
+/// The builtins `module::name` names when `module` is a builtin module.
+fn ns_natives(module: &str, name: &str) -> Arc<[Native]> {
+    if module.is_empty() {
+        return Native::lookup(name).into_iter().collect();
+    }
+    Native::in_module(module, name).into()
+}
+
 fn is_discard(target: &Expr) -> bool {
     matches!(target, Expr::Name { name, .. } if is_discard_name(name))
+}
+
+/// Whether evaluating `expr` can do nothing but compute a value: no call, so
+/// no binding can change while it runs.
+fn is_pure(expr: &Expr) -> bool {
+    let parts = |parts: &[StrPart]| parts.iter().all(|p| matches!(p, StrPart::Text(_)) || matches!(p, StrPart::Expr(e) if is_pure(e)));
+    match expr {
+        Expr::Num { .. } | Expr::Name { .. } => true,
+        Expr::Str { parts: p, .. } => parts(p),
+        Expr::Sym(s) => parts(&s.parts),
+        Expr::Unary { operand, .. } => is_pure(operand),
+        Expr::Binary { left, right, .. } => is_pure(left) && is_pure(right),
+        Expr::Index { obj, index, .. } => is_pure(obj) && is_pure(index),
+        Expr::Key { obj, key, .. } => is_pure(obj) && parts(&key.parts),
+        _ => false,
+    }
+}
+
+/// Whether anything in `body` can see its scope after the code that declared
+/// into it has moved on: a closure captures the scope chain it was made in,
+/// and a trail reads and writes the one its block stands in (§6). A body
+/// without either is only ever looked at by its own instructions, which is
+/// what lets the compiler resolve its names to slots.
+fn captures(body: &[Stmt]) -> bool {
+    body.iter().any(stmt_captures)
+}
+
+fn closure_captures(def: &ClosureDef) -> bool {
+    def.params.iter().any(|p| p.default.as_ref().is_some_and(expr_captures))
+        || match &def.body {
+            ClosureBody::Expr(expr) => expr_captures(expr),
+            ClosureBody::Block(body) => captures(body),
+        }
+}
+
+fn stmt_captures(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::FnDecl { .. }
+        | Stmt::Parallel { .. }
+        | Stmt::ParallelFor { .. }
+        | Stmt::ParallelWhile { .. } => true,
+        Stmt::Use { .. } => false,
+        Stmt::Decl { value, .. } | Stmt::Expr { expr: value, .. } => expr_captures(value),
+        Stmt::Assign { targets, value, .. } => {
+            targets.iter().any(expr_captures) || expr_captures(value)
+        }
+        Stmt::If { branches, .. } => branches.iter().any(|b| {
+            b.cond.as_ref().is_some_and(expr_captures) || captures(&b.body)
+        }),
+        Stmt::For { iterable, body, .. } => expr_captures(iterable) || captures(body),
+        Stmt::While { cond, body, .. } => expr_captures(cond) || captures(body),
+    }
+}
+
+fn expr_captures(expr: &Expr) -> bool {
+    let parts = |parts: &[StrPart]| {
+        parts.iter().any(|p| matches!(p, StrPart::Expr(e) if expr_captures(e)))
+    };
+    match expr {
+        Expr::Closure(_) => true,
+        Expr::Num { .. } | Expr::Name { .. } | Expr::Namespace { .. } => false,
+        Expr::Str { parts: p, .. } => parts(p),
+        Expr::Sym(s) => parts(&s.parts),
+        Expr::List { items, .. } => items.iter().any(expr_captures),
+        Expr::Dict { entries, .. } => {
+            entries.iter().any(|(key, value)| parts(&key.parts) || expr_captures(value))
+        }
+        Expr::Key { obj, key, .. } => expr_captures(obj) || parts(&key.parts),
+        Expr::Method { obj, .. } => expr_captures(obj),
+        Expr::Index { obj, index, .. } => expr_captures(obj) || expr_captures(index),
+        Expr::Call { callee, args, .. } => {
+            expr_captures(callee) || args.iter().any(|a| expr_captures(&a.value))
+        }
+        Expr::Unary { operand, .. } => expr_captures(operand),
+        Expr::Ref { target, .. } => expr_captures(target),
+        Expr::Binary { left, right, .. } => expr_captures(left) || expr_captures(right),
+    }
 }

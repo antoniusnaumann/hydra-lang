@@ -52,7 +52,7 @@ impl Sandbox {
     }
 
     fn crash_of(&self, src: &str) -> String {
-        self.run(src).crash.map(|c| c.message).unwrap_or_else(|| "<no crash>".into())
+        self.run(src).crash.map(|c| c.into_message()).unwrap_or_else(|| "<no crash>".into())
     }
 }
 

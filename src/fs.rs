@@ -74,7 +74,7 @@ fn ok_with_reason(value: Value) -> Result<Vec<Value>, Crash> {
 }
 
 fn string(text: impl Into<String>) -> Value {
-    Value::Str(std::sync::Arc::from(text.into().as_str()))
+    Value::Str(crate::text::Text::from(text.into()))
 }
 
 /// Normalise a joined path: `join("a/", "/b")` is `"a/b"`, and `.` and a

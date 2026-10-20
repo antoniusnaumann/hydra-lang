@@ -8,6 +8,8 @@ default-run = "hydra"
 # Protocol and format implementations shared by the standard modules.
 [dependencies]
 serde_json = { version = "1", features = ["preserve_order"] }
+serde = "1"
+indexmap = "2"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }

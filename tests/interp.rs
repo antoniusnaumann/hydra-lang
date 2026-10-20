@@ -36,7 +36,7 @@ fn expr(src: &str) -> String {
 
 fn crash_of(src: &str) -> String {
     let result = run(src);
-    result.crash.map(|c| c.message).unwrap_or_else(|| "<no crash>".into())
+    result.crash.map(|c| c.into_message()).unwrap_or_else(|| "<no crash>".into())
 }
 
 // --- values -----------------------------------------------------------------
@@ -189,6 +189,34 @@ kept := a.x
 fn insertion_copies() {
     let src = "a := { :x : 1 }\nd := { :held : a }\na.x = 2\nheld := d.held.x\n";
     assert_eq!(eval(src, "held"), "1");
+}
+
+#[test]
+fn a_write_after_a_copy_still_leaves_the_copy_alone() {
+    // A read hands out a copy and marks the node; the write after it must
+    // still split from any copy that is alive.
+    let src = "a := [1, 2]\nb := a\na[0] = a[0] + 1\nmine := a[0]\ntheirs := b[0]\n";
+    assert_eq!(eval(src, "mine"), "2");
+    assert_eq!(eval(src, "theirs"), "1");
+    let src = "a := [[1], [2]]\nb := a[0]\na[0][0] = a[0][0] + 1\nmine := a[0][0]\ntheirs := b[0]\n";
+    assert_eq!(eval(src, "mine"), "2");
+    assert_eq!(eval(src, "theirs"), "1");
+    let src = "
+fn look(d)
+	return d.x
+end
+a := { :x : 1 }
+seen := look(a)
+a.x = a.x + seen
+kept := a.x
+";
+    assert_eq!(eval(src, "kept"), "2");
+}
+
+#[test]
+fn a_dict_keeps_insertion_order_when_a_key_is_replaced() {
+    let src = "d := { :a : 1, :b : 2 }\nd.a = 3\nd[:c] = 4\nshown := \"\\(d)\"\n";
+    assert_eq!(eval(src, "shown"), "{ :a : 3, :b : 2, :c : 4 }");
 }
 
 #[test]
@@ -566,4 +594,334 @@ fn aggressive_continuation_evaluates_and_survives_formatting() {
     assert_eq!(eval(&formatted, "y"), "38");
     assert_eq!(eval("a := 2\nx := 32\n\n-a\n", "x"), "32");
     assert_eq!(eval("a := 2\nx := 32\n-a\n", "x"), "30");
+}
+
+// Names in a block nothing can capture live in the frame's slots. These pin
+// down that nobody can tell (§6).
+
+#[test]
+fn a_slot_declaration_reads_the_old_binding_on_its_right() {
+    let src = "
+fn f(x)
+	x := x + 1
+	x := x * 10
+	return x
+end
+r := f(1)
+";
+    assert_eq!(eval(src, "r"), "20");
+}
+
+#[test]
+fn a_reference_to_a_slot_keeps_the_binding_it_was_taken_of() {
+    // A fresh `:=` is a fresh binding, so the `&` taken before it still sees
+    // the old one — and writes through it reach only that one.
+    let src = "
+fn f()
+	x := 1
+	r := &x
+	x := 2
+	r = 5
+	return [x, r]
+end
+out := f()
+";
+    assert_eq!(eval(src, "out"), "[2, 5]");
+}
+
+#[test]
+fn a_reference_to_a_loop_variable_is_that_iteration_s() {
+    let src = "
+refs := []
+seen := []
+for i in [1, 2, 3]
+	do push(&refs, &i)
+end
+for r in refs
+	do push(&seen, r)
+end
+";
+    assert_eq!(eval(src, "seen"), "[1, 2, 3]");
+}
+
+#[test]
+fn a_write_through_a_slot_reference_reaches_the_slot() {
+    let src = "
+fn bump(&n)
+	n += 1
+end
+fn f()
+	x := 1
+	bump(&x)
+	bump(&x)
+	xs := [1]
+	do push(&xs, x)
+	return xs
+end
+out := f()
+";
+    assert_eq!(eval(src, "out"), "[1, 3]");
+}
+
+#[test]
+fn a_reference_parameter_held_in_a_slot_is_written_through() {
+    let src = "
+fn set(&target, value)
+	target = value
+	target[0] = 9
+end
+xs := [1, 2]
+set(&xs, [0, 0])
+";
+    assert_eq!(eval(src, "xs"), "[9, 0]");
+}
+
+#[test]
+fn a_default_sees_earlier_parameters_and_the_outer_name_for_a_missing_one() {
+    let src = "
+y := 100
+fn f(a, b = a + 1, c = y)
+	return [a, b, c]
+end
+one := f(1)
+two := f(1, c = 7)
+";
+    assert_eq!(eval(src, "one"), "[1, 2, 100]");
+    assert_eq!(eval(src, "two"), "[1, 2, 7]");
+}
+
+#[test]
+fn a_function_redeclared_in_a_slot_block_is_still_a_candidate() {
+    // Shadowing with another shape does not hide the first (§3).
+    let src = "
+fn one(a)
+	return [:one, a]
+end
+fn two(a, b)
+	return [:two, a, b]
+end
+fn f(g, h)
+	g := h
+	return [g(1), g(1, 2)]
+end
+r := f(one, two)
+";
+    assert_eq!(eval(src, "r"), "[[:one, 1], [:two, 1, 2]]");
+}
+
+#[test]
+fn break_and_continue_leave_slot_blocks_cleanly() {
+    let src = "
+fn f()
+	total := 0
+	for i in [1, 2, 3, 4, 5]
+		sq := i * i
+		if sq == 4
+			skipped := sq
+			continue()
+		end
+		if sq > 10
+			break()
+		end
+		total += sq
+	end
+	return total
+end
+r := f()
+";
+    assert_eq!(eval(src, "r"), "10");
+}
+
+#[test]
+fn a_slot_name_shadows_an_outer_one_only_after_it_is_declared() {
+    let src = "
+x := 1
+seen := []
+i := 0
+while i < 2
+	do push(&seen, x)
+	x := 10 + i
+	do push(&seen, x)
+	i += 1
+end
+";
+    assert_eq!(eval(src, "seen"), "[1, 10, 1, 11]");
+    assert_eq!(eval(src, "x"), "1");
+}
+
+#[test]
+fn a_block_with_a_closure_keeps_its_scope() {
+    // The closure is what makes this block a real scope: each iteration's
+    // `i` is captured separately (§6).
+    let src = "
+fs := []
+for i in [1, 2, 3]
+	do push(&fs, fn() i)
+end
+out := []
+for f in fs
+	do push(&out, f())
+end
+";
+    assert_eq!(eval(src, "out"), "[1, 2, 3]");
+}
+
+#[test]
+fn a_list_in_a_left_block_does_not_hold_up_a_write() {
+    // The slot is emptied when its block ends, so the copy it held is gone
+    // and the write after the loop can happen in place. Either way the
+    // result is the same; this is about the copy not leaking.
+    let src = "
+xs := [1, 2, 3]
+for i in [0]
+	copy := xs
+end
+xs[0] = 7
+";
+    assert_eq!(eval(src, "xs"), "[7, 2, 3]");
+}
+
+#[test]
+fn a_binding_in_a_slot_and_a_scope_is_one_candidate() {
+    // A scoped block's names are in its slots as well; a call that searches
+    // both still tries each function once (§3).
+    let src = "
+fn pick(x)
+	reject(\"first\")
+end
+fn pick(x)
+	reject(\"second\")
+end
+pick(1)
+";
+    let crash = crash_of(src);
+    assert_eq!(crash.matches("rejected it").count(), 2, "{crash}");
+}
+
+#[test]
+fn remainder_truncates_like_fmod() {
+    assert_eq!(expr("[7 % 3, -7 % 3, 7 % -3, 5.5 % 2, 1 % 0 == 1 % 0]"), "[1, -1, 1, 1.5, :false]");
+    // The sign of a zero result is the dividend's, as fmod has it.
+    assert_eq!(expr("1 / (-4 % 2)"), expr("1 / -0"));
+}
+
+// A call site remembers that its name meant the builtin, and has to forget
+// it the moment anything binds that name.
+
+#[test]
+fn a_builtin_shadowed_after_a_call_is_what_the_next_call_reaches() {
+    let src = "
+fn add(&xs, v)
+	push(&xs, v)
+end
+xs := []
+add(&xs, 1)
+fn push(&target, v)
+	target = [:mine, v]
+end
+add(&xs, 2)
+";
+    assert_eq!(eval(src, "xs"), "[:mine, 2]");
+}
+
+#[test]
+fn return_shadowed_after_a_call_is_an_ordinary_call() {
+    let src = "
+fn f()
+	return(1)
+end
+before := f()
+fn return(x)
+	x * 100
+end
+after := f()
+";
+    assert_eq!(eval(src, "before"), "1");
+    // The shadowing `return` answers 100, which the function drops, and the
+    // function then ends without returning anything.
+    assert_eq!(eval(src, "after"), ":null");
+}
+
+#[test]
+fn a_builtin_shadowed_in_one_closure_s_scope_only_reaches_that_closure() {
+    // Two closures from the same code, made in scopes that differ in whether
+    // they bind `len`. Neither may borrow the other's answer.
+    let src = "
+fn make(shadow)
+	f := fn(xs) len(xs)
+	if shadow
+		return(f)
+	end
+	return(f)
+end
+fn make_shadowed()
+	len := fn(xs) 42
+	return(fn(xs) len(xs))
+end
+plain := make(:false)
+shadowed := make_shadowed()
+a := plain([1, 2])
+b := shadowed([1, 2])
+c := plain([1, 2, 3])
+";
+    assert_eq!(eval(src, "a"), "2");
+    assert_eq!(eval(src, "b"), "42");
+    assert_eq!(eval(src, "c"), "3");
+}
+
+#[test]
+fn appending_to_a_string_leaves_its_copies_alone() {
+    // `s += t` appends in place when the binding is the string's only holder,
+    // and must copy when it is not.
+    let src = "
+a := \"x\"
+b := a
+a += \"y\"
+xs := [a]
+a += \"z\"
+fn grow(s)
+	s += \"!\"
+	return s
+end
+c := grow(a)
+";
+    assert_eq!(eval(src, "a"), "xyz");
+    assert_eq!(eval(src, "b"), "x");
+    assert_eq!(eval(src, "xs"), "[xy]");
+    assert_eq!(eval(src, "c"), "xyz!");
+}
+
+#[test]
+fn indexing_a_variable_reads_it_before_the_index_runs() {
+    // `xs[bump()]` reads `xs` first, so what `bump` assigns is not what is
+    // indexed — whether or not the read is done in place.
+    let src = "
+xs := [1, 2]
+fn bump()
+	xs = [10, 20]
+	return 0
+end
+r := xs[bump()]
+s := xs[0]
+";
+    assert_eq!(eval(src, "r"), "1");
+    assert_eq!(eval(src, "s"), "10");
+    // A slot that is still empty means the name outside it.
+    let src = "
+b := [7]
+fn f(a = b[0], b = [5])
+	return [a, b[0]]
+end
+r := f()
+";
+    assert_eq!(eval(src, "r"), "[7, 5]");
+    // Through a reference parameter.
+    let src = "
+fn first(&xs)
+	return xs[0]
+end
+ys := [3, 4]
+r := first(&ys)
+";
+    assert_eq!(eval(src, "r"), "3");
 }

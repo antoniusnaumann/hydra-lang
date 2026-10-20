@@ -26,7 +26,7 @@ fn eval(src: &str, name: &str) -> String {
 }
 
 fn crash_of(src: &str) -> String {
-    run(src).crash.map(|c| c.message).unwrap_or_else(|| "<no crash>".into())
+    run(src).crash.map(|c| c.into_message()).unwrap_or_else(|| "<no crash>".into())
 }
 
 fn codes(src: &str) -> Vec<&'static str> {

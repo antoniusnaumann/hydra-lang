@@ -17,7 +17,7 @@ use crate::ast::BlockKind;
 use crate::compile::Chunk;
 use crate::errors::Pos;
 use crate::scope::ScopeRef;
-use crate::value::{ListRef, Value};
+use crate::value::{Cell, ListRef, Value};
 
 pub type TaskId = u64;
 pub type BlockId = u64;
@@ -74,7 +74,15 @@ pub enum OnReturn {
     PushValue,
     /// A module body ran; bind it into the importer under the rules of its
     /// `use` (§7).
-    BindModule { name: Arc<str>, alias: Arc<str>, unqualified: bool, module: usize },
+    BindModule(Box<ModuleBinding>),
+}
+
+/// A `use` waiting for the module body it ran to return.
+pub struct ModuleBinding {
+    pub name: Arc<str>,
+    pub alias: Arc<str>,
+    pub unqualified: bool,
+    pub module: usize,
 }
 
 /// One level of a frame's scope stack.
@@ -89,11 +97,38 @@ pub struct ScopeSlot {
     pub dynamic: bool,
 }
 
+/// One of a frame's slots: a name the compiler resolved to a fixed place,
+/// because no closure or trail could see the scope it was declared in.
+///
+/// A slot holds its value directly until a `&` is taken of it. Then the value
+/// moves into a [`Cell`] the reference shares, and reads and writes go
+/// through that cell from there on. A fresh `:=` puts a plain value back, so
+/// a reference taken earlier keeps the binding it was taken of (§6).
+pub enum Local {
+    /// Not declared yet, or out of its block.
+    Empty,
+    Val(Value),
+    Boxed(Cell),
+}
+
 pub struct Frame {
     pub chunk: Arc<Chunk>,
     pub ip: usize,
-    /// Innermost last. Each `PushScope` opens a child of the current one (§6).
+    /// The scope the frame starts in: the module's, a trail's, a function's
+    /// own — or, for a function whose names all live in slots, the scope its
+    /// closure captured.
+    pub base: ScopeRef,
+    /// Innermost last, above `base`. Each `PushScope` opens a child of the
+    /// current one (§6).
     pub scopes: Vec<ScopeSlot>,
+    /// Where this frame's slots start in the task's [`Task::locals`].
+    pub locals: usize,
+    /// Past the scopes this frame's own code declares into, the chain is a
+    /// root scope and nothing else. A name the frame did not declare can then
+    /// only mean that root's binding, an import or a builtin, which is what
+    /// lets a call site remember that it meant the builtin
+    /// ([`crate::compile::CallCache`]).
+    pub outer_root: bool,
     pub iters: Vec<IterState>,
     pub stack_base: usize,
     pub module: usize,
@@ -102,15 +137,11 @@ pub struct Frame {
     /// A module's toplevel (including the main program's): its final scope is
     /// the namespace `use` exports from (§7).
     pub is_module_body: bool,
-    /// Which parameters the call supplied, so the prologue knows which
-    /// defaults to evaluate. Named arguments can leave holes, so this is a
-    /// mask and not a count.
-    pub provided: Vec<bool>,
     /// Where a `:reject` this frame answers with goes (§3): the candidates the
     /// call has not tried yet, the arguments to try them with, and what the
     /// ones before it said on the way out. Absent for a module body or a
     /// trail, which no call opened.
-    pub retry: Option<Box<Retry>>,
+    pub retry: Option<Retry>,
 }
 
 /// One candidate's refusal, kept for the crash that reports them all (§3).
@@ -123,9 +154,20 @@ pub struct RejectedBy {
 
 /// Where a rejected call goes: the rest of the candidate list, in the order
 /// the call would have tried them.
+///
+/// Every call keeps one, so it is small: a call with nothing else to try
+/// keeps only how it was written, and the rest is boxed for the calls that
+/// have something to fall back to.
 pub struct Retry {
     /// How the call was written, for the diagnostic.
-    pub name: Option<String>,
+    pub name: Option<Arc<str>>,
+    /// Everything else; `None` stands for no candidates left, refused by
+    /// nobody yet, and positional arguments numbering `count`.
+    pub more: Option<Box<RetryMore>>,
+    pub count: usize,
+}
+
+pub struct RetryMore {
     pub rest: Vec<Value>,
     pub args: crate::vm::CallArgs,
     pub rejected: Vec<RejectedBy>,
@@ -135,22 +177,32 @@ impl Retry {
     /// What a call leaves behind in case the callee rejects: the candidates
     /// it has not tried, and the arguments to try them with. Kept even when
     /// there are none left, because the crash still needs to say what the call
-    /// was and what the one candidate said about it.
+    /// was and what the one candidate said about it — though then the count
+    /// of its arguments is all that needs keeping.
     ///
     /// Where there *is* something left, the arguments are marked shared on the
     /// way in. Holding a handle is free — that is what copy-on-write is for —
     /// but the next candidate has to be handed what the caller wrote, not what
     /// the one that rejected did to it (§5.1). Marking them is what makes a
     /// write in the rejecting candidate split its own copy.
-    pub fn at(name: &str, rest: Vec<Value>, args: crate::vm::CallArgs) -> Retry {
+    pub fn at(name: Option<&Arc<str>>, rest: Vec<Value>, args: crate::vm::CallArgs) -> Retry {
+        let name = name.cloned();
+        if rest.is_empty() && !args.has_names() {
+            return Retry { name, more: None, count: args.positional_count() };
+        }
         let args = if rest.is_empty() { args } else { args.retained() };
-        Retry { name: Some(name.to_string()), rest, args, rejected: Vec::new() }
+        Retry { name, count: 0, more: Some(Box::new(RetryMore { rest, args, rejected: Vec::new() })) }
+    }
+
+    /// A call of `count` positional arguments with nothing else to try.
+    pub fn counted(name: &Arc<str>, count: usize) -> Retry {
+        Retry { name: Some(name.clone()), more: None, count }
     }
 }
 
 impl Frame {
     pub fn scope(&self) -> &ScopeRef {
-        &self.scopes.last().expect("a frame always has a scope").scope
+        self.scopes.last().map_or(&self.base, |slot| &slot.scope)
     }
 
     pub fn push_scope(&mut self, scope: ScopeRef, dynamic: bool) {
@@ -160,8 +212,8 @@ impl Frame {
     /// Leave `n` static scopes, dropping any shadowing levels above them.
     pub fn pop_scopes(&mut self, n: usize) {
         let mut left = n;
-        while left > 0 && self.scopes.len() > 1 {
-            let slot = self.scopes.pop().expect("scope");
+        while left > 0 {
+            let Some(slot) = self.scopes.pop() else { break };
             if !slot.dynamic {
                 left -= 1;
             }
@@ -273,6 +325,11 @@ pub struct Task {
     pub id: TaskId,
     pub frames: Vec<Frame>,
     pub stack: Vec<Value>,
+    /// Every frame's slots, each frame's starting at its `locals`.
+    pub locals: Vec<Local>,
+    /// Where a builtin's arguments are bound, kept between calls so that
+    /// binding them allocates nothing.
+    pub args: Vec<Option<Value>>,
     pub cancel: Arc<CancelFlag>,
     /// The block this trail belongs to, if it is one.
     pub block: Option<BlockId>,

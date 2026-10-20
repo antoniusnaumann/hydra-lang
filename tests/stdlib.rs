@@ -28,7 +28,7 @@ fn expr(src: &str) -> String {
 }
 
 fn crash_of(src: &str) -> String {
-    run(src).crash.map(|c| c.message).unwrap_or_else(|| "<no crash>".into())
+    run(src).crash.map(|c| c.into_message()).unwrap_or_else(|| "<no crash>".into())
 }
 
 // --- parameters -------------------------------------------------------------
@@ -397,7 +397,53 @@ x := f()
     assert_eq!(eval(src, "x"), "1");
     // An unconsumed panic would stop the program; a consumed one does not.
     let result = run("do panic(\"boom\")\nx := 1\n");
-    assert!(result.crash.is_none(), "{:?}", result.crash.map(|c| c.message));
+    assert!(result.crash.is_none(), "{:?}", result.crash.map(|c| c.into_message()));
     let src = "xs := []\ndo push(&xs, 1)\nn := len(xs)\n";
     assert_eq!(eval(src, "n"), "1");
+}
+
+#[test]
+fn a_call_that_meant_a_builtin_follows_a_later_use() {
+    // Each call goes through one instruction twice: first it meets the
+    // builtin, then a `use` in between has changed what the name means.
+    let opts = || Options { threads: 1, step_budget: 1, ..Options::default() };
+    let src = "
+fn p(rows)
+	return(push(&rows, 1))
+end
+before := p([])
+use shadows as *
+after := p([])
+";
+    let result = run_source(src, "tests/fixtures/main.hy", opts()).expect("compiles");
+    assert!(result.crash.is_none(), "{:?}", result.crash);
+    let read =
+        |name: &str| to_text(&result.root_scope.lookup(name).expect("binding").read().unwrap().clone());
+    assert_eq!(read("before"), "1");
+    assert_eq!(read("after"), "pushed 1 to []");
+
+    let src = "
+fn up()
+	return(text::upper(\"a\"))
+end
+use text
+before := up()
+use shadows as text
+after := up()
+";
+    let result = run_source(src, "tests/fixtures/main.hy", opts()).expect("compiles");
+    let crash = result.crash.map(|c| c.into_message()).unwrap_or_default();
+    assert!(crash.contains("module `text` has no name `upper`"), "{crash}");
+}
+
+#[test]
+fn json_parse_reads_a_lone_number_by_the_json_grammar() {
+    let parse = |text: &str| eval(&format!("use json\nx := json::parse(\"{text}\")\n"), "x");
+    assert_eq!(parse(" -0.5e2 "), "-50");
+    assert_eq!(parse("0"), "0");
+    assert_eq!(parse("12345"), "12345");
+    for bad in ["01", "1.", ".5", "+1", "Infinity", "NaN", "1e", "--1", "1 2"] {
+        let src = format!("use json\nx := json::parse(\"{bad}\")\n");
+        assert!(crash_of(&src).contains("json::parse"), "{bad}: {}", crash_of(&src));
+    }
 }

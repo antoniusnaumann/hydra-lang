@@ -87,20 +87,45 @@ pub type Result<T> = std::result::Result<T, HydraError>;
 /// The trace is filled in as the crash unwinds through call frames so the
 /// diagnostic can point at the statement that failed as well as at the frame
 /// that raised it.
+///
+/// Boxed: nearly every step of the interpreter returns a `Result` with this
+/// as its error, and one pointer is what keeps those results small enough to
+/// stay in registers on the path that does not crash.
 #[derive(Clone, Debug)]
-pub struct Crash {
+pub struct Crash(Box<CrashInfo>);
+
+#[derive(Clone, Debug)]
+pub struct CrashInfo {
     pub message: String,
     pub site: Site,
     pub trace: Vec<Site>,
 }
 
+impl std::ops::Deref for Crash {
+    type Target = CrashInfo;
+
+    fn deref(&self) -> &CrashInfo {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Crash {
+    fn deref_mut(&mut self) -> &mut CrashInfo {
+        &mut self.0
+    }
+}
+
 impl Crash {
     pub fn new(message: impl Into<String>) -> Crash {
-        Crash { message: message.into(), site: Site::default(), trace: Vec::new() }
+        Crash(Box::new(CrashInfo { message: message.into(), site: Site::default(), trace: Vec::new() }))
+    }
+
+    pub fn into_message(self) -> String {
+        self.0.message
     }
 
     pub fn at(message: impl Into<String>, file: &str, pos: Pos) -> Crash {
-        Crash { message: message.into(), site: Site::new(file, pos), trace: Vec::new() }
+        Crash(Box::new(CrashInfo { message: message.into(), site: Site::new(file, pos), trace: Vec::new() }))
     }
 }
 

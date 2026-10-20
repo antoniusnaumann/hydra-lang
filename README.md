@@ -59,14 +59,16 @@ cargo run -- run examples/trails.hy --dump-scope
 | `src/lexer.rs` | §1–§2: longest-match operators, compound keywords, colon atoms and dot lookups |
 | `src/parser.rs` | §3–§4: the precedence table, and the column-wise `parallel` transposer |
 | `src/value.rs` | §5: copy-on-write values, `&` references, the two equalities |
+| `src/text.rs` | the string a value holds: one allocation, appended to in place |
 | `src/scope.rs` | §6: scopes as hash maps with parent pointers |
-| `src/compile.rs` | the tree lowered to instructions |
+| `src/compile.rs` | the tree lowered to instructions, and names resolved to frame slots |
 | `src/vm.rs` | §5–§8: the evaluator, crashes, and `use` |
 | `src/sched.rs` | §9: trails, cancel flags, the run queue, and the per-block mailboxes |
 | `src/check.rs` | §11 |
 | `src/format.rs` | §12 |
 | `src/editor.rs` | §13: token classes, TextMate grammar, colours |
 | `editor/` | the generated grammar and theme fragment |
+| `bench/` | the performance comparison against Python (`python3 bench/run.py`) |
 
 ## Implementation notes
 
@@ -89,27 +91,48 @@ cargo run -- run examples/trails.hy --dump-scope
   Suspension works at any depth, including inside a `parallel` block that a
   called function opened. This is the one place the implementation departs from
   the §10 checklist, which suggests a tree-walking evaluator: a tree-walker
-  cannot suspend a trail that is several Rust stack frames deep. Scopes are
-  still hash maps with parent pointers and names are still resolved
-  dynamically, so nothing about the language changes.
+  cannot suspend a trail that is several Rust stack frames deep. Nothing about
+  the language changes: names mean what §6 says they mean (see the slots note
+  below for where they are kept).
 
 - **Real threads are bought, not free.** §9.2 says writes to a parent binding
   are last-write-wins with no memory model. That stays true because every
-  binding and every value node has its own lock, so a write lands whole and
-  nothing is torn — the program cannot observe anything §9.2 does not describe.
+  binding another trail can reach and every value node has its own lock, so a
+  write lands whole and nothing is torn — the program cannot observe anything
+  §9.2 does not describe.
   Locks are taken root-to-leaf and never re-entered; a `&` that would send a
   walk back to another root unwinds first, so the one way to build a cycle
   cannot deadlock.
 
-  Scaling is real but not linear: every variable access goes through a lock and
-  a scope chain, so per-instruction overhead dominates before the cores do.
+  Scaling is real but not linear: a binding in a real scope is still a locked
+  cell, so per-instruction overhead dominates before the cores do.
 
 - **Copy-on-write is structural.** Lists and dicts are nodes carrying a `shared`
   mark. Assignment, argument passing and insertion clone the *handle* and set
   the mark; the first write through a marked handle clones the node and repoints
-  along the path. `===` compares node identity, which is exactly the
-  "identity may be the COW buffer, for now" simplification of §5.1 — an
-  untouched copy still reports identical to its source.
+  along the path — unless that handle is the only one left, in which case the
+  mark is cleared and the write goes in place. The mark alone is sticky, so
+  without that check `xs[i] = xs[i] + 1` would copy the whole list each time.
+  `===` compares node identity, which is exactly the "identity may be the COW
+  buffer, for now" simplification of §5.1 — an untouched copy still reports
+  identical to its source. Strings follow the same rule: `s += t` appends in
+  place when `s` holds the only handle, which keeps building a string linear.
+
+- **Scopes exist where something can see them.** §6 describes scopes as hash
+  maps with parent pointers, and that is still what a closure or a trail looks
+  names up in. A block that creates neither cannot be seen by anything but its
+  own code, so the compiler resolves its names to slots in the frame instead
+  (`src/compile.rs`, `captures`), and a function without either gets no scope
+  per call at all. Names a chunk declares into a real scope get a slot too,
+  holding the same cell, so that chunk reaches them without a search. A `&` to a
+  slot moves its value into a cell the reference shares, and a fresh `:=` puts
+  a plain value back, so a reference keeps the binding it was taken of.
+
+- **A call site remembers what its name meant.** Calling by name searches the
+  scope chain, the imports and the builtins (§3). A call that found only the
+  builtin keeps that answer while a counter of "something bound a builtin's
+  name, or a `use` ran" stays where it was, and `return(…)` in a function
+  returns straight away while `return` still means the builtin.
 
 - **`&` is a path, not a pointer.** A reference is `(root variable cell, path)`,
   so it survives the path copying COW does underneath it, and only the lvalues

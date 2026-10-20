@@ -8,8 +8,8 @@ use crate::value::{
     boolean, deref, dict_entries, list_items, new_dict, new_list, sym, to_text, Native, Value,
 };
 
-pub(crate) fn string(text: impl Into<String>) -> Value {
-    Value::Str(text.into().into())
+pub(crate) fn string(text: impl AsRef<str>) -> Value {
+    Value::Str(crate::text::Text::new(text.as_ref()))
 }
 pub(crate) fn text(value: &Value) -> Result<String, Crash> {
     match deref(value)? {
@@ -18,6 +18,16 @@ pub(crate) fn text(value: &Value) -> Result<String, Crash> {
             "expected a string, got {}",
             other.kind()
         ))),
+    }
+}
+/// [`text`] without the copy: the string itself, shared.
+pub(crate) fn shared_text(value: &Value) -> Result<crate::text::Text, Crash> {
+    match value {
+        Value::Str(s) => Ok(s.clone()),
+        other => match deref(other)? {
+            Value::Str(s) => Ok(s),
+            other => Err(Crash::new(format!("expected a string, got {}", other.kind()))),
+        },
     }
 }
 pub(crate) fn number(value: &Value) -> Result<f64, Crash> {
@@ -31,16 +41,16 @@ pub(crate) fn duration(value: &Value) -> Result<Duration, Crash> {
     Duration::try_from_secs_f64(number(value)?)
         .map_err(|_| Crash::new("duration must be finite, nonnegative, and representable"))
 }
-pub(crate) fn success(value: Value) -> Result<Vec<Value>, Crash> {
-    Ok(vec![value, Value::null()])
+pub(crate) fn success<T: From<Vec<Value>>>(value: Value) -> Result<T, Crash> {
+    Ok(vec![value, Value::null()].into())
 }
-pub(crate) fn failure(
+pub(crate) fn failure<T: From<Vec<Value>>>(
     fallback: Option<Value>,
     reason: &str,
     message: impl std::fmt::Display,
-) -> Result<Vec<Value>, Crash> {
+) -> Result<T, Crash> {
     match fallback {
-        Some(value) => Ok(vec![value, Value::Sym(sym(reason))]),
+        Some(value) => Ok(vec![value, Value::Sym(sym(reason))].into()),
         None => Err(Crash::new(message.to_string())),
     }
 }
@@ -72,14 +82,44 @@ pub(crate) fn blocking(native: Native) -> bool {
         )
 }
 
+/// What a builtin answered: most answer one value, and building a vector for
+/// it would be the costliest part of a cheap call.
+pub(crate) enum Answer {
+    One(Value),
+    Many(Vec<Value>),
+}
+
+impl From<Vec<Value>> for Answer {
+    fn from(values: Vec<Value>) -> Answer {
+        Answer::Many(values)
+    }
+}
+
+impl Answer {
+    pub(crate) fn into_vec(self) -> Vec<Value> {
+        match self {
+            Answer::One(value) => vec![value],
+            Answer::Many(values) => values,
+        }
+    }
+}
+
 pub(crate) fn call(
     native: Native,
     args: &[Option<Value>],
     script_args: &[String],
-) -> Result<Vec<Value>, Crash> {
+) -> Result<Answer, Crash> {
+    answer(native, args, script_args)
+}
+
+fn answer(
+    native: Native,
+    args: &[Option<Value>],
+    script_args: &[String],
+) -> Result<Answer, Crash> {
     let arg = |name: &str| argument(args, native, name);
-    let need = |name: &str| text(&arg(name).unwrap_or_else(Value::null));
-    let one = |v| Ok(vec![v]);
+    let need = |name: &str| shared_text(&arg(name).unwrap_or_else(Value::null));
+    let one = |v| Ok(Answer::One(v));
     match native {
         Native::EnvArgs => one(new_list(script_args.iter().cloned().map(string).collect())),
         Native::EnvPlatform => one(Value::Sym(sym(std::env::consts::OS))),
@@ -88,7 +128,7 @@ pub(crate) fn call(
             if name.is_empty() || name.contains(['=', '\0']) {
                 return Err(Crash::new("invalid environment variable name"));
             }
-            match std::env::var(&name) {
+            match std::env::var(name.as_str()) {
                 Ok(v) => success(string(v)),
                 Err(e) => failure(
                     arg("fallback"),
@@ -118,53 +158,84 @@ pub(crate) fn call(
                 .map(|v| deref(&v))
                 .transpose()?
                 .unwrap_or_else(Value::null);
-            let parts: Vec<String> = if matches!(&separator, Value::Sym(s) if s.name() == "null") {
-                value.split_whitespace().map(str::to_owned).collect()
+            let parts: Vec<Value> = if matches!(&separator, Value::Sym(s) if s.name() == "null") {
+                value.split_whitespace().map(string).collect()
             } else {
-                let separator = text(&separator)?;
-                if separator.is_empty() {
-                    value.chars().map(|c| c.to_string()).collect()
-                } else {
-                    value.split(&separator).map(str::to_owned).collect()
+                let separator = shared_text(&separator)?;
+                let mut chars = separator.chars();
+                match (chars.next(), chars.next()) {
+                    (None, _) => value.chars().map(|c| string(c.to_string())).collect(),
+                    // One character is the usual separator, and searching
+                    // for a character is cheaper than for a string.
+                    (Some(c), None) => {
+                        let mut parts = Vec::with_capacity(8);
+                        parts.extend(value.split(c).map(string));
+                        parts
+                    }
+                    _ => value.split(separator.as_str()).map(string).collect(),
                 }
             };
-            one(new_list(parts.into_iter().map(string).collect()))
+            one(new_list(parts))
         }
         Native::TextJoin => {
             let Value::List(list) = deref(&arg("parts").unwrap_or_else(Value::null))? else {
                 return Err(Crash::new("text::join expects a list of strings"));
             };
-            let parts: Result<Vec<_>, _> = list_items(&list).iter().map(text).collect();
-            let separator = arg("separator")
-                .map(|v| text(&v))
-                .transpose()?
-                .unwrap_or_default();
-            one(string(parts?.join(&separator)))
+            let separator = match arg("separator") {
+                Some(separator) => shared_text(&separator)?,
+                None => crate::text::Text::new(""),
+            };
+            // The parts are taken as handles, and the text copied once, into
+            // a string sized for it. No lock is held while a `&` among them
+            // is followed.
+            let parts = list_items(&list);
+            let mut length = separator.len() * parts.len().saturating_sub(1);
+            for part in &parts {
+                length += match part {
+                    Value::Str(s) => s.len(),
+                    _ => 0,
+                };
+            }
+            let mut joined = crate::text::Text::empty(length);
+            for (i, part) in parts.iter().enumerate() {
+                if i > 0 {
+                    joined.push_str(&separator);
+                }
+                match part {
+                    Value::Str(s) => joined.push_str(s),
+                    other => joined.push_str(&shared_text(other)?),
+                }
+            }
+            one(Value::Str(joined))
         }
         Native::TextTrim => one(string(need("text")?.trim())),
         Native::TextLower => one(string(need("text")?.to_lowercase())),
         Native::TextUpper => one(string(need("text")?.to_uppercase())),
-        Native::TextReplace => one(string(need("text")?.replace(&need("from")?, &need("to")?))),
+        Native::TextReplace => one(string(need("text")?.replace(need("from")?.as_str(), &need("to")?))),
         Native::TextFind => {
             let text = need("text")?;
             one(text
-                .find(&need("needle")?)
+                .find(need("needle")?.as_str())
                 .map(|i| Value::Num(text[..i].chars().count() as f64))
                 .unwrap_or_else(Value::null))
         }
-        Native::TextStartsWith => one(boolean(need("text")?.starts_with(&need("prefix")?))),
-        Native::TextEndsWith => one(boolean(need("text")?.ends_with(&need("suffix")?))),
+        Native::TextStartsWith => one(boolean(need("text")?.starts_with(need("prefix")?.as_str()))),
+        Native::TextEndsWith => one(boolean(need("text")?.ends_with(need("suffix")?.as_str()))),
         Native::JsonParse | Native::JsonParseOr => {
-            match serde_json::from_str::<serde_json::Value>(&need("text")?) {
-                Ok(v) => match from_json(v) {
-                    Ok(v) => success(v),
-                    Err(e) => failure(arg("fallback"), "invalid", e),
-                },
+            let source = need("text")?;
+            // A lone number is common enough — a field of a line of text —
+            // to read without building a JSON tree for it.
+            if let Some(n) = json_number(&source) {
+                return success(Value::Num(n));
+            }
+            match serde_json::from_str::<Json>(&source) {
+                Ok(Json(v)) => success(v),
                 Err(e) => failure(arg("fallback"), "invalid", format!("json::parse: {e}")),
             }
         }
         Native::JsonStringify => {
-            let v = to_json(&arg("value").unwrap_or_else(Value::null), 0)?;
+            let value = arg("value").unwrap_or_else(Value::null);
+            let v = JsonOut { value: &value, depth: 0 };
             let pretty = arg("pretty")
                 .map(|v| deref(&v).map(|v| v.truthy()))
                 .transpose()?
@@ -295,7 +366,7 @@ pub(crate) fn call(
                 _ => std::io::stdout().is_terminal(),
             }))
         }
-        other if other.module() == Some("http") => crate::http::call(other, args),
+        other if other.module() == Some("http") => crate::http::call(other, args).map(Answer::Many),
         _ => unreachable!("not a standard module native: {native:?}"),
     }
 }
@@ -317,61 +388,156 @@ fn stream(value: Option<Value>, default: &str, allowed: &[&str]) -> Result<Strin
     Ok(name)
 }
 
-fn from_json(v: serde_json::Value) -> Result<Value, Crash> {
-    use serde_json::Value as J;
-    Ok(match v {
-        J::Null => Value::null(),
-        J::Bool(b) => boolean(b),
-        J::String(s) => string(s),
-        J::Number(n) => Value::Num(
-            n.as_f64()
-                .filter(|v| v.is_finite())
-                .ok_or_else(|| Crash::new("JSON number outside Hydra's numeric range"))?,
-        ),
-        J::Array(v) => new_list(v.into_iter().map(from_json).collect::<Result<_, _>>()?),
-        J::Object(v) => new_dict(
-            v.into_iter()
-                .map(|(k, v)| Ok((sym(&k), from_json(v)?)))
-                .collect::<Result<_, Crash>>()?,
-        ),
-    })
+/// `text` as a number, if it is exactly one JSON number — optionally with
+/// whitespace around it — that a float holds finitely.
+fn json_number(text: &str) -> Option<f64> {
+    let text = text.trim_matches([' ', '\t', '\n', '\r']);
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let digits = |i: &mut usize| {
+        let start = *i;
+        while *i < bytes.len() && bytes[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        *i > start
+    };
+    if bytes.first() == Some(&b'-') {
+        i += 1;
+    }
+    match bytes.get(i) {
+        Some(b'0') => i += 1,
+        Some(b'1'..=b'9') => {
+            digits(&mut i);
+        }
+        _ => return None,
+    }
+    if bytes.get(i) == Some(&b'.') {
+        i += 1;
+        if !digits(&mut i) {
+            return None;
+        }
+    }
+    if matches!(bytes.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(bytes.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        if !digits(&mut i) {
+            return None;
+        }
+    }
+    if i != bytes.len() {
+        return None;
+    }
+    text.parse::<f64>().ok().filter(|n| n.is_finite())
 }
 
-fn to_json(value: &Value, depth: usize) -> Result<serde_json::Value, Crash> {
-    use serde_json::Value as J;
-    if depth > 128 {
-        return Err(Crash::new(
-            "json::stringify: value is cyclic or nested too deeply",
-        ));
+/// A Hydra value read straight from JSON text, with no JSON tree between.
+struct Json(Value);
+
+impl<'de> serde::Deserialize<'de> for Json {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Json, D::Error> {
+        deserializer.deserialize_any(JsonVisitor)
     }
-    Ok(match deref(value)? {
-        Value::Num(n) => J::Number(
-            serde_json::Number::from_f64(n)
-                .ok_or_else(|| Crash::new("JSON cannot represent non-finite numbers"))?,
-        ),
-        Value::Str(s) => J::String(s.to_string()),
-        Value::Sym(s) => match s.name() {
-            "null" => J::Null,
-            "true" => J::Bool(true),
-            "false" => J::Bool(false),
-            name => J::String(name.into()),
-        },
-        Value::List(v) => J::Array(
-            list_items(&v)
-                .iter()
-                .map(|v| to_json(v, depth + 1))
-                .collect::<Result<_, _>>()?,
-        ),
-        Value::Dict(v) => J::Object(
-            dict_entries(&v)
-                .into_iter()
-                .map(|(k, v)| Ok((k.name().into(), to_json(&v, depth + 1)?)))
-                .collect::<Result<_, Crash>>()?,
-        ),
-        _ => {
-            return Err(Crash::new(
-                "JSON cannot represent functions or unresolved references",
-            ))
+}
+
+struct JsonVisitor;
+
+impl<'de> serde::de::Visitor<'de> for JsonVisitor {
+    type Value = Json;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, b: bool) -> Result<Json, E> {
+        Ok(Json(boolean(b)))
+    }
+
+    fn visit_i64<E>(self, n: i64) -> Result<Json, E> {
+        Ok(Json(Value::Num(n as f64)))
+    }
+
+    fn visit_u64<E>(self, n: u64) -> Result<Json, E> {
+        Ok(Json(Value::Num(n as f64)))
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, n: f64) -> Result<Json, E> {
+        if !n.is_finite() {
+            return Err(E::custom("JSON number outside Hydra's numeric range"));
         }
-    })
+        Ok(Json(Value::Num(n)))
+    }
+
+    fn visit_str<E>(self, s: &str) -> Result<Json, E> {
+        Ok(Json(string(s)))
+    }
+
+    fn visit_unit<E>(self) -> Result<Json, E> {
+        Ok(Json(Value::null()))
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Json, A::Error> {
+        let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+        while let Some(Json(item)) = seq.next_element()? {
+            items.push(item);
+        }
+        Ok(Json(new_list(items)))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Json, A::Error> {
+        let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
+        while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+            let Json(value) = map.next_value()?;
+            entries.push((sym(&key), value));
+        }
+        // A key given twice keeps its first place and its last value, as a
+        // JSON object read into an ordered map does.
+        Ok(Json(new_dict(entries)))
+    }
+}
+
+/// A Hydra value written straight out as JSON.
+struct JsonOut<'a> {
+    value: &'a Value,
+    depth: usize,
+}
+
+impl serde::Serialize for JsonOut<'_> {
+    fn serialize<S: serde::Serializer>(&self, out: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{Error, SerializeMap, SerializeSeq};
+        if self.depth > 128 {
+            return Err(S::Error::custom("json::stringify: value is cyclic or nested too deeply"));
+        }
+        let value = deref(self.value).map_err(|crash| S::Error::custom(crash.into_message()))?;
+        let depth = self.depth + 1;
+        match &value {
+            Value::Num(n) if n.is_finite() => out.serialize_f64(*n),
+            Value::Num(_) => Err(S::Error::custom("JSON cannot represent non-finite numbers")),
+            Value::Str(s) => out.serialize_str(s),
+            Value::Sym(s) => match s.name() {
+                "null" => out.serialize_unit(),
+                "true" => out.serialize_bool(true),
+                "false" => out.serialize_bool(false),
+                name => out.serialize_str(name),
+            },
+            Value::List(list) => {
+                let items = list_items(list);
+                let mut seq = out.serialize_seq(Some(items.len()))?;
+                for item in &items {
+                    seq.serialize_element(&JsonOut { value: item, depth })?;
+                }
+                seq.end()
+            }
+            Value::Dict(dict) => {
+                let entries = dict_entries(dict);
+                let mut map = out.serialize_map(Some(entries.len()))?;
+                for (key, item) in &entries {
+                    map.serialize_entry(key.name(), &JsonOut { value: item, depth })?;
+                }
+                map.end()
+            }
+            _ => Err(S::Error::custom("JSON cannot represent functions or unresolved references")),
+        }
+    }
 }

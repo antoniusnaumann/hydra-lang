@@ -454,8 +454,8 @@ fn apply(a: &Arg, raw: &[String], values: &mut Value) -> Result<(), String> {
         "store_false" => boolean(false),
         "store_const" | "append_const" => copy_value(&a.constant),
         "count" => {
-            let current = field(values, &a.dest).map_err(|e| e.message)?;
-            Value::Num(number(&current).map_err(|e| e.message)? + 1.0)
+            let current = field(values, &a.dest).map_err(|e| e.into_message())?;
+            Value::Num(number(&current).map_err(|e| e.into_message())? + 1.0)
         }
         _ => {
             let converted = raw
@@ -476,13 +476,13 @@ fn apply(a: &Arg, raw: &[String], values: &mut Value) -> Result<(), String> {
         }
     };
     if matches!(a.action.as_str(), "append" | "append_const") {
-        let current = field(values, &a.dest).map_err(|e| e.message)?;
+        let current = field(values, &a.dest).map_err(|e| e.into_message())?;
         let mut values_list =
             list(&current).map_err(|_| format!("{}: append default must be a list", a.names[0]))?;
         values_list.push(result);
-        put(values, &a.dest, new_list(values_list)).map_err(|e| e.message)
+        put(values, &a.dest, new_list(values_list)).map_err(|e| e.into_message())
     } else {
-        put(values, &a.dest, result).map_err(|e| e.message)
+        put(values, &a.dest, result).map_err(|e| e.into_message())
     }
 }
 
@@ -496,7 +496,7 @@ fn parse(
     if depth > 32 {
         return Err("subcommands nested too deeply".to_owned().into());
     }
-    let crash = |e: Crash| ParseError::Input(e.message);
+    let crash = |e: Crash| ParseError::Input(e.into_message());
     let mut values = new_dict(Vec::new());
     for a in args {
         put(&mut values, &a.dest, a.initial()?).map_err(crash)?;

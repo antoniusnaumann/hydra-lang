@@ -667,7 +667,10 @@ against the function.
 
 Implementation: a scope is a hash map plus a parent pointer. A trail's scope's
 parent is the block's enclosing scope. Scopes themselves are never copied — it
-is the **values** flowing between bindings that copy (§5.1).
+is the **values** flowing between bindings that copy (§5.1). A block that
+creates no closure and opens no trail cannot be observed by anything but its
+own code, so an implementation may keep its names in fixed slots instead; the
+rules above are unchanged by it.
 
 ---
 
