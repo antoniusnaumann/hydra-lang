@@ -40,7 +40,7 @@
 use crate::hash::{FxBuild, FxHashMap};
 use crate::text::Text;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, RwLock, Weak};
 
 use crate::compile::{Chunk, ParamInfo};
@@ -181,12 +181,6 @@ pub fn is_null_sym(s: &Sym) -> bool {
 #[derive(Debug)]
 pub struct ListData {
     pub items: Vec<Value>,
-    /// Set when a handle to this node is copied. The next write clones.
-    ///
-    /// Atomic rather than a plain field so that marking a node shared never
-    /// needs the write lock: a deep comparison reads a structure while copying
-    /// every handle it passes.
-    pub shared: AtomicBool,
 }
 
 /// Entries are kept in insertion order: a dict is compared key by key (§5), and
@@ -197,7 +191,6 @@ pub type Entries = indexmap::IndexMap<Sym, Value, FxBuild>;
 #[derive(Debug)]
 pub struct DictData {
     pub entries: Entries,
-    pub shared: AtomicBool,
 }
 
 impl DictData {
@@ -224,12 +217,12 @@ pub type ListRef = Arc<RwLock<ListData>>;
 pub type DictRef = Arc<RwLock<DictData>>;
 
 pub fn new_list(items: Vec<Value>) -> Value {
-    Value::List(Arc::new(RwLock::new(ListData { items, shared: AtomicBool::new(false) })))
+    Value::List(Arc::new(RwLock::new(ListData { items })))
 }
 
 pub fn new_dict(entries: Vec<(Sym, Value)>) -> Value {
     let entries = entries.into_iter().collect();
-    Value::Dict(Arc::new(RwLock::new(DictData { entries, shared: AtomicBool::new(false) })))
+    Value::Dict(Arc::new(RwLock::new(DictData { entries })))
 }
 
 /// Snapshot a node so the lock can be released before anything walks further.
@@ -1224,55 +1217,45 @@ impl Value {
 
 /// The copy every binding, argument, insertion and return performs.
 ///
-/// Containers are not walked: the node is marked shared and the handle cloned,
-/// so the deep copy is paid for only if someone writes.
+/// Containers are not walked: the handle is cloned, so the deep copy is paid
+/// for only if someone writes. Whoever writes can tell a node has another
+/// holder from its reference count — a copy is exactly a second handle — so a
+/// copy needs to mark nothing.
 pub fn copy_value(v: &Value) -> Value {
-    match v {
-        Value::List(rc) => {
-            rc.read().unwrap_or_else(|e| e.into_inner()).shared.store(true, Ordering::Relaxed);
-            Value::List(rc.clone())
-        }
-        Value::Dict(rc) => {
-            rc.read().unwrap_or_else(|e| e.into_inner()).shared.store(true, Ordering::Relaxed);
-            Value::Dict(rc.clone())
-        }
-        other => other.clone(),
-    }
+    v.clone()
 }
 
-/// Give `slot` a node of its own if the one it holds is shared, marking the
-/// children shared in turn because they now have two parents.
+/// Whether `rc` is this slot's alone, so a write to it can be seen by nobody
+/// else. Every copy, every iteration and every argument kept for a retry holds
+/// a handle of its own, so one handle means no other holder.
+fn sole<T>(rc: &Arc<T>) -> bool {
+    if Arc::strong_count(rc) != 1 {
+        return false;
+    }
+    // Pairs with the release of whichever handle was dropped last, as
+    // `Arc::get_mut` does, so its reads finish before this write starts.
+    std::sync::atomic::fence(Ordering::Acquire);
+    true
+}
+
+/// Give `slot` a node of its own if another handle shares the one it holds.
+/// The children are cloned as handles, which gives each of them a second
+/// holder in turn.
 fn unshare(slot: &mut Value) {
     match slot {
         Value::List(rc) => {
-            let items = {
-                let data = rc.read().unwrap_or_else(|e| e.into_inner());
-                if !data.shared.load(Ordering::Relaxed) {
-                    return;
-                }
-                // The mark is sticky, but the copies it records may be gone.
-                // A node only this slot holds has nobody left to see a write.
-                if Arc::strong_count(rc) == 1 {
-                    data.shared.store(false, Ordering::Relaxed);
-                    return;
-                }
-                data.items.iter().map(copy_value).collect()
-            };
-            *rc = Arc::new(RwLock::new(ListData { items, shared: AtomicBool::new(false) }));
+            if sole(rc) {
+                return;
+            }
+            let items = rc.read().unwrap_or_else(|e| e.into_inner()).items.clone();
+            *rc = Arc::new(RwLock::new(ListData { items }));
         }
         Value::Dict(rc) => {
-            let entries = {
-                let data = rc.read().unwrap_or_else(|e| e.into_inner());
-                if !data.shared.load(Ordering::Relaxed) {
-                    return;
-                }
-                if Arc::strong_count(rc) == 1 {
-                    data.shared.store(false, Ordering::Relaxed);
-                    return;
-                }
-                data.entries.iter().map(|(k, v)| (k.clone(), copy_value(v))).collect::<Entries>()
-            };
-            *rc = Arc::new(RwLock::new(DictData { entries, shared: AtomicBool::new(false) }));
+            if sole(rc) {
+                return;
+            }
+            let entries = rc.read().unwrap_or_else(|e| e.into_inner()).entries.clone();
+            *rc = Arc::new(RwLock::new(DictData { entries }));
         }
         _ => {}
     }
@@ -1374,6 +1357,21 @@ pub fn get_member(container: &Value, key: &Value) -> Result<Value, Crash> {
     }
 }
 
+/// [`member_opt`] on a container and a key borrowed where they are.
+pub fn member_opt_in(container: &Value, key: &Value) -> Result<Option<Value>, Crash> {
+    if let Value::Ref(_) = container {
+        return member_opt(container, key);
+    }
+    let seg = match key {
+        Value::Ref(_) => path_segment(&deref(key)?)?,
+        key => path_segment(key)?,
+    };
+    match member_of(container, &seg)? {
+        Some(value) => read_through(&value).map(Some),
+        None => Ok(None),
+    }
+}
+
 /// [`get_member`] on a container that is borrowed where it lives rather
 /// than copied out first.
 pub fn get_member_in(container: &Value, key: &Value) -> Result<Value, Crash> {
@@ -1417,12 +1415,16 @@ pub fn deref(v: &Value) -> Result<Value, Crash> {
 }
 
 pub fn read_place(root: &Cell, path: &[PathSeg]) -> Result<Value, Crash> {
-    let mut root = root.clone();
-    let mut path = path.to_vec();
+    // Borrowed until a redirect hands over a root and a path of its own.
+    let mut at: Option<(Cell, Vec<PathSeg>)> = None;
     for _ in 0..MAX_REDIRECTS {
+        let (root, path) = match &at {
+            Some((root, path)) => (root, path.as_slice()),
+            None => (root, path),
+        };
         // The root's own lock is released before the walk begins.
         let mut current = root.read().unwrap_or_else(|e| e.into_inner()).clone();
-        let mut rest = path.as_slice();
+        let mut rest = path;
         let mut jump = None;
         loop {
             if let Value::Ref(r) = &current {
@@ -1437,10 +1439,7 @@ pub fn read_place(root: &Cell, path: &[PathSeg]) -> Result<Value, Crash> {
             rest = tail;
         }
         match jump {
-            Some(Walk::Redirect { root: next, path: rest }) => {
-                root = next;
-                path = rest;
-            }
+            Some(Walk::Redirect { root: next, path: rest }) => at = Some((next, rest)),
             _ => return Ok(copy_value(&current)),
         }
     }

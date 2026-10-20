@@ -32,7 +32,7 @@ use crate::sched::{
     Retry, RetryMore, Task, TaskId, TaskState, Waiter,
 };
 use crate::value::{
-    binary_op, boolean, cell, copy_value, deref, get_member, get_member_in, member_opt, new_dict,
+    binary_op, boolean, cell, copy_value, deref, get_member, get_member_in, member_opt, member_opt_in, new_dict,
     new_list,
     builtin_epoch, builtin_shadowed, path_segment, push_num, push_place, read_place, sym, is_null_sym, to_text, unary_op, update_local,
     update_place, write_local, write_place, Cell, Closure, Native, PathSeg, RefValue, Sym, Value,
@@ -439,10 +439,26 @@ impl Vm {
                             Err(crash) => Err(crash),
                         }
                     }
+                    // `"\(s)"` of one string is that string.
+                    Instr::Interpolate(1) if matches!(task.stack.last(), Some(Value::Str(_))) => continue,
+                    Instr::MakeSym if matches!(task.stack.last(), Some(Value::Str(_))) => {
+                        let Some(Value::Str(text)) = task.stack.last() else { unreachable!() };
+                        let symbol = sym(text);
+                        *task.stack.last_mut().expect("the name") = Value::Sym(symbol);
+                        continue;
+                    }
                     Instr::GetMemberLocal { slot, .. } => {
                         let at = frame.locals + *slot as usize;
-                        if let (Local::Val(container), Some(key)) = (&task.locals[at], task.stack.last()) {
-                            match get_member_in(container, key) {
+                        let found = match (&task.locals[at], task.stack.last()) {
+                            (Local::Val(container), Some(key)) => Some(get_member_in(container, key)),
+                            (Local::Boxed(cell), Some(key)) => {
+                                let container = cell.read().unwrap_or_else(|e| e.into_inner());
+                                Some(get_member_in(&container, key))
+                            }
+                            _ => None,
+                        };
+                        if let Some(found) = found {
+                            match found {
                                 Ok(value) => {
                                     task.rejection = None;
                                     *task.stack.last_mut().expect("the key") = value;
@@ -580,6 +596,16 @@ impl Vm {
                         match binary_op(*op, &left, &right) {
                             Ok(value) => {
                                 task.stack.push(value);
+                                continue;
+                            }
+                            Err(crash) => Err(crash),
+                        }
+                    }
+                    Instr::Unary(op) => {
+                        let value = task.stack.last_mut().expect("an operand");
+                        match unary_op(op, value) {
+                            Ok(result) => {
+                                *value = result;
                                 continue;
                             }
                             Err(crash) => Err(crash),
@@ -932,7 +958,7 @@ impl Vm {
                     },
                     None => self.cell_for(task, root)?,
                 };
-                let path = if path.is_empty() { EMPTY_PATH.clone() } else { Arc::new(path) };
+                let path = if path.is_empty() { EMPTY_PATH.clone() } else { Arc::new(path.to_vec()) };
                 task.push(Value::Ref(RefValue { root: cell, path }));
             }
             Instr::GetMember => {
@@ -1190,7 +1216,8 @@ impl Vm {
             }
             Instr::Return(count) => return self.return_values(task, *count),
             Instr::ReturnNull => {
-                return self.pop_frame(task, vec![Value::null()]);
+                task.push(Value::null());
+                return self.return_values(task, 1);
             }
 
             Instr::PushScope => {
@@ -1202,11 +1229,9 @@ impl Vm {
             Instr::IterStart => {
                 let value = deref(&task.pop())?;
                 match value {
+                    // The iterator's handle is what keeps a write in the body
+                    // from changing the list being walked.
                     Value::List(list) => {
-                        list.read()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .shared
-                            .store(true, Ordering::Relaxed);
                         task.frame_mut().iters.push(IterState { list, index: 0 });
                     }
                     other => {
@@ -1649,8 +1674,8 @@ impl Vm {
                 one(Value::null())
             }
             Native::Do => one(Value::null()),
-            Native::Has => one(boolean(member_opt(&arg(0), &arg(1))?.is_some())),
-            Native::Get => one(member_opt(&arg(0), &arg(1))?.unwrap_or_else(|| arg(2))),
+            Native::Has => one(boolean(member_opt_in(arg_ref(args, 0), arg_ref(args, 1))?.is_some())),
+            Native::Get => one(member_opt_in(arg_ref(args, 0), arg_ref(args, 1))?.unwrap_or_else(|| arg(2))),
             Native::Len => {
                 let value = deref(&arg(0))?;
                 let len = match &value {
@@ -1985,11 +2010,15 @@ impl Vm {
 
     // --- places -------------------------------------------------------------
 
-    fn take_path(&self, task: &mut Task, segs: usize) -> Result<Vec<PathSeg>, Crash> {
+    fn take_path(&self, task: &mut Task, segs: usize) -> Result<PlacePath, Crash> {
         let at = task.stack.len() - segs;
-        let path = task.stack[at..].iter().map(path_segment).collect();
+        let path = match &task.stack[at..] {
+            [] => PlacePath::One(None),
+            [seg] => PlacePath::One(Some(path_segment(seg)?)),
+            segs => PlacePath::Many(segs.iter().map(path_segment).collect::<Result<_, _>>()?),
+        };
         task.stack.truncate(at);
-        path
+        Ok(path)
     }
 
     /// `place = value`, into a slot or into the binding a search finds.
@@ -2688,6 +2717,12 @@ fn check_refs(callee: &Value, specs: &[ParamInfo], bound: &[Option<Value>]) -> R
     Ok(())
 }
 
+/// A builtin's argument where it was bound, `:null` where none was given.
+fn arg_ref(args: &[Option<Value>], i: usize) -> &Value {
+    static NULL: LazyLock<Value> = LazyLock::new(Value::null);
+    args.get(i).and_then(Option::as_ref).unwrap_or(&NULL)
+}
+
 /// Push what a builtin answered: the first value, with the rest held for a
 /// binding site that names them (channels §6.2).
 fn answer(task: &mut Task, out: NativeOut) -> Flow {
@@ -2740,7 +2775,8 @@ static NATIVE_SHAPES: LazyLock<Vec<NativeShape>> = LazyLock::new(|| {
                         | Native::Receive
                         | Native::Channel
                 ) && !crate::stdlib::blocking(native)
-                    && !matches!(native.module(), Some("list" | "cli"))
+                    && native.module() != Some("cli")
+                    && !crate::list::scripted(native)
                     && !specs.iter().any(|s| s.variadic)
             });
             NativeShape {
@@ -2754,6 +2790,24 @@ static NATIVE_SHAPES: LazyLock<Vec<NativeShape>> = LazyLock::new(|| {
 });
 
 static EMPTY_PATH: LazyLock<Arc<Vec<PathSeg>>> = LazyLock::new(|| Arc::new(Vec::new()));
+
+/// A place's path off the stack. Most have one segment or none — `x = v`,
+/// `d[k] = v` — and those need no vector.
+enum PlacePath {
+    One(Option<PathSeg>),
+    Many(Vec<PathSeg>),
+}
+
+impl std::ops::Deref for PlacePath {
+    type Target = [PathSeg];
+
+    fn deref(&self) -> &[PathSeg] {
+        match self {
+            PlacePath::One(seg) => seg.as_slice(),
+            PlacePath::Many(segs) => segs,
+        }
+    }
+}
 
 /// What a callee's parameters expect, for a closure or a builtin alike.
 /// Borrowed: a call asks this several times, and neither kind ever changes.

@@ -1028,6 +1028,11 @@ impl Compiler {
                     }
                 }
             }
+            // `-1` is a number, not a negation to perform on every visit.
+            Expr::Unary { op: "-", operand, pos } if matches!(operand.as_ref(), Expr::Num { .. }) => {
+                let Expr::Num { value, .. } = operand.as_ref() else { unreachable!() };
+                self.emit(Instr::PushNum(-*value), *pos);
+            }
             Expr::Unary { op, operand, pos } => {
                 self.expr(operand)?;
                 self.emit(Instr::Unary(op), *pos);

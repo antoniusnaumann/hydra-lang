@@ -39,21 +39,49 @@ fn compare(a: &Value, b: &Value, depth: usize) -> Result<Ordering, Crash> {
     if depth > 128 {
         return Err(Crash::new("list comparison nested too deeply"));
     }
-    match (deref(a)?, deref(b)?) {
+    // A reference is followed; anything else is compared where it is.
+    if matches!(a, Value::Ref(_)) || matches!(b, Value::Ref(_)) {
+        return compare(&deref(a)?, &deref(b)?, depth);
+    }
+    match (a, b) {
         (Value::Num(a), Value::Num(b)) => a
-            .partial_cmp(&b)
+            .partial_cmp(b)
             .ok_or_else(|| Crash::new("cannot order NaN")),
-        (Value::Str(a), Value::Str(b)) => Ok(a.cmp(&b)),
+        (Value::Str(a), Value::Str(b)) => Ok(a.cmp(b)),
         (Value::Sym(a), Value::Sym(b)) => Ok(a.name().cmp(b.name())),
         (Value::List(a), Value::List(b)) => {
-            let (a, b) = (list_items(&a), list_items(&b));
-            for (a, b) in a.iter().zip(&b) {
+            let flat = |list: &crate::value::ListRef| {
+                list.read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .items
+                    .iter()
+                    .all(|v| matches!(v, Value::Num(_) | Value::Str(_) | Value::Sym(_)))
+            };
+            // Numbers, strings and atoms are compared in place, under read
+            // locks that nothing else is taken under. Anything that nests —
+            // or both sides being one list, which would be locked twice — is
+            // copied out first, so no lock is held while a `&` is followed.
+            if Arc::ptr_eq(a, b) || !flat(a) || !flat(b) {
+                let (a, b) = (list_items(a), list_items(b));
+                for (a, b) in a.iter().zip(&b) {
+                    let cmp = compare(a, b, depth + 1)?;
+                    if cmp != Ordering::Equal {
+                        return Ok(cmp);
+                    }
+                }
+                return Ok(a.len().cmp(&b.len()));
+            }
+            let (a, b) = (
+                a.read().unwrap_or_else(|e| e.into_inner()),
+                b.read().unwrap_or_else(|e| e.into_inner()),
+            );
+            for (a, b) in a.items.iter().zip(&b.items) {
                 let cmp = compare(a, b, depth + 1)?;
                 if cmp != Ordering::Equal {
                     return Ok(cmp);
                 }
             }
-            Ok(a.len().cmp(&b.len()))
+            Ok(a.items.len().cmp(&b.items.len()))
         }
         _ => Err(Crash::new(
             "ordering requires matching numbers, strings, atoms, or lists",
@@ -87,10 +115,10 @@ fn sorted(mut values: Vec<Value>) -> Result<Vec<Value>, Crash> {
     }
 }
 
-/// Compile once, then enter a fresh closure in the caller's task, never a nested VM.
-pub(crate) fn script(native: Native, args: &[Option<Value>]) -> Result<Option<Value>, Crash> {
+/// The operations written in Hydra (`list.hy`), compiled once.
+fn chunks() -> &'static Result<HashMap<String, Arc<Chunk>>, Crash> {
     static CHUNKS: OnceLock<Result<HashMap<String, Arc<Chunk>>, Crash>> = OnceLock::new();
-    let chunks = CHUNKS.get_or_init(|| {
+    CHUNKS.get_or_init(|| {
         let program = crate::parser::parse(include_str!("list.hy"), "<stdlib/list.hy>")
             .map_err(|e| Crash::new(e.to_string()))?;
         let main = compile_program(&program).map_err(|e| Crash::new(e.to_string()))?;
@@ -102,8 +130,19 @@ pub(crate) fn script(native: Native, args: &[Option<Value>]) -> Result<Option<Va
                 _ => None,
             })
             .collect())
-    });
-    let chunks = chunks.as_ref().map_err(Clone::clone)?;
+    })
+}
+
+/// Whether `native` is one of the operations written in Hydra, which run as
+/// a frame rather than as a call into Rust.
+pub(crate) fn scripted(native: Native) -> bool {
+    native.module() == Some("list")
+        && chunks().as_ref().map_or(true, |chunks| chunks.contains_key(native.name()))
+}
+
+/// Compile once, then enter a fresh closure in the caller's task, never a nested VM.
+pub(crate) fn script(native: Native, args: &[Option<Value>]) -> Result<Option<Value>, Crash> {
+    let chunks = chunks().as_ref().map_err(Clone::clone)?;
     let Some(chunk) = chunks.get(native.name()) else {
         return Ok(None);
     };
