@@ -1067,7 +1067,29 @@ maybe-list would be enormous and would be ignored within a week.
 4. Preserve line breaks and continuation boundaries. Insert a blank line after
    a completed block’s `end` before the next statement or branch, except before
    another `end`. Keep existing blank lines; do not add trailing blanks at EOF
-   or split closure continuations or parallel rows.
+   or split closure continuations or parallel rows. A line continuing an
+   expression from an earlier line is indented one level past the line its
+   statement starts on, and a multi-line closure's body one level past the
+   line its `fn` is on, with its `end` at that line's level. An argument or
+   list item that starts on a later line than its call's `(` or its list's
+   `[` is indented one level past that line:
+
+   ```hydra
+   lines := csv
+   	.split("\n")
+   	.flat_map(fn(s)
+   		s.split(",")
+   	end)
+
+   lines := csv
+   	.split("\n")
+   	.flat_map(
+   		fn(s)
+   			cells := s.split(",")
+   			cells[0] = cells[0]
+   		end)
+   	.join()
+   ```
 5. Inside a `parallel` block:
    - split each row on top-level `||`;
    - pad every cell to the widest in its column, then join with ` || `;

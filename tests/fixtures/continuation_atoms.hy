@@ -15,10 +15,10 @@ print(atoms) // [:a.b, :trailing-, :x*y]
 // A lookup still uses an identifier; its minus sign is subtraction.
 counter := { :total : 10 }
 value := counter
-.total - 1
+	.total - 1
 print(value) // 9
 
 // Quote a lookup key when punctuation should belong to its name.
 value = record
-."some-other-prop+interesting_added_info"
+	."some-other-prop+interesting_added_info"
 print(value) // 17

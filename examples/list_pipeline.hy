@@ -2,8 +2,8 @@
 use list
 
 squares := list::range(8)
-.list::map(fn(n) n * n)
-.list::filter(fn(n) n > 10)
+	.list::map(fn(n) n * n)
+	.list::filter(fn(n) n > 10)
 print squares
 
 // Partition and unzip return two values.

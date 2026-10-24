@@ -212,9 +212,9 @@ fn a_multi_value_binding_is_spaced_like_any_other_comma_list() {
 #[test]
 fn continued_lookups_keep_lookup_boundaries_and_quotes() {
     for (source, expected) in [
-        ("foo\n.bar-baz", "foo\n.bar - baz\n"),
-        ("foo\n.\"a-b\"", "foo\n.\"a-b\"\n"),
-        ("foo\n.\"name\"", "foo\n.name\n"),
+        ("foo\n.bar-baz", "foo\n\t.bar - baz\n"),
+        ("foo\n.\"a-b\"", "foo\n\t.\"a-b\"\n"),
+        ("foo\n.\"name\"", "foo\n\t.name\n"),
         ("32\n\n-a", "32\n\n-a\n"),
         (":\"some-other+info\"", ":some-other+info\n"),
         ("{:a+b::c*d}", "{ :a+b : :c*d }\n"),
@@ -228,7 +228,7 @@ fn continued_lookups_keep_lookup_boundaries_and_quotes() {
 fn formatting_does_not_merge_an_atom_with_its_lookup() {
     assert_eq!(fmt_idempotent(":\"a\".key"), ":\"a\".key\n");
     assert_eq!(fmt_idempotent(":a .key"), ":\"a\".key\n");
-    assert_eq!(fmt_idempotent(":a\n.key"), ":a\n.key\n");
+    assert_eq!(fmt_idempotent(":a\n.key"), ":a\n\t.key\n");
     assert_eq!(fmt_idempotent("\"\\(:a .key)\""), "\"\\(:\"a\".key)\"\n");
 }
 
@@ -249,7 +249,7 @@ fn completed_blocks_are_separated_without_splitting_consecutive_ends() {
 #[test]
 fn spacing_after_end_preserves_closure_continuations() {
     for suffix in ["()", ".field", "[0]", "+ 1"] {
-        let src = format!("f := fn()\n\treturn 1\nend\n{suffix}\n");
+        let src = format!("f := fn()\n\treturn 1\nend\n\t{suffix}\n");
         assert_eq!(fmt_idempotent(&src), src);
     }
 }
@@ -304,4 +304,27 @@ fn import_spacing_preserves_continuations_in_other_parallel_columns() {
     let source = "parallel\nuse fs || x := foo\nf() || .bar\nend\n";
     let formatted = fmt_idempotent(source);
     assert!(!formatted.contains("\n\n"), "{formatted}");
+}
+
+#[test]
+fn continuation_lines_and_their_closures_sit_one_level_in() {
+    assert_eq!(
+        fmt_idempotent("lines := csv\n.split(\"\\n\")\n.flat_map(fn(s)\n    s.split(\",\")\nend)\n"),
+        "lines := csv\n\t.split(\"\\n\")\n\t.flat_map(fn(s)\n\t\ts.split(\",\")\n\tend)\n"
+    );
+    // Inside a block, relative to the statement; a closure opened on the
+    // statement's own line keeps its `end` there, and what follows `end` on
+    // that line does not move it.
+    assert_eq!(
+        fmt_idempotent("fn f(xs)\nys := xs.list::map(fn(x)\nx * 2\nend).list::rev()\ntotal := 1 +\n2\nreturn ys\nend\n"),
+        "fn f(xs)\n\tys := xs.list::map(fn(x)\n\t\tx * 2\n\tend).list::rev()\n\ttotal := 1 +\n\t\t2\n\treturn ys\nend\n"
+    );
+    // An argument on a later line than its call's `(` sits one level in from
+    // that line, and so does an item of a list split over lines.
+    assert_eq!(
+        fmt_idempotent("lines := csv\n.split(\"\\n\")\n.flat_map(\nfn(s)\ncells := s.split(\",\")\ncells[0] = cells[0]\nend)\n.join()\n"),
+        "lines := csv\n\t.split(\"\\n\")\n\t.flat_map(\n\t\tfn(s)\n\t\t\tcells := s.split(\",\")\n\t\t\tcells[0] = cells[0]\n\t\tend)\n\t.join()\n"
+    );
+    assert_eq!(fmt_idempotent("xs := [\n1,\n2]\n"), "xs := [\n\t1,\n\t2]\n");
+    assert_eq!(fmt_idempotent("print(f(a,\nb), c)\n"), "print(f(a,\n\tb), c)\n");
 }

@@ -41,6 +41,7 @@ pub fn format_source(src: &str, file: &str) -> Result<String> {
         rows: HashMap::new(),
         statement_starts: HashSet::new(),
         command_arguments: HashSet::new(),
+        closure_ends: HashSet::new(),
     };
     f.statements(&program.body, 0);
 
@@ -122,6 +123,8 @@ struct Formatter {
     /// Lines starting independent statements or branches, safe to separate.
     statement_starts: HashSet<u32>,
     command_arguments: HashSet<(u32, u32)>,
+    /// Lines a closure's `end` decided, which a continuation must not move.
+    closure_ends: HashSet<u32>,
 }
 
 impl Formatter {
@@ -164,26 +167,26 @@ impl Formatter {
                     self.statements(&branch.body, depth + 1);
                     self.set(branch.pos.line, depth);
                     if let Some(cond) = &branch.cond {
-                        self.expr(cond, depth);
+                        self.expr(cond, depth, branch.pos.line);
                     }
                 }
                 self.set(end_pos.line, depth);
             }
             Stmt::For { iterable, body, pos, end_pos, .. } => {
                 self.block(body, *pos, *end_pos, depth);
-                self.expr(iterable, depth);
+                self.expr(iterable, depth, pos.line);
             }
             Stmt::While { cond, body, pos, end_pos, .. } => {
                 self.block(body, *pos, *end_pos, depth);
-                self.expr(cond, depth);
+                self.expr(cond, depth, pos.line);
             }
             Stmt::ParallelFor { iterable, body, pos, end_pos, .. } => {
                 self.block(body, *pos, *end_pos, depth);
-                self.expr(iterable, depth);
+                self.expr(iterable, depth, pos.line);
             }
             Stmt::ParallelWhile { cond, body, pos, end_pos, .. } => {
                 self.block(body, *pos, *end_pos, depth);
-                self.expr(cond, depth);
+                self.expr(cond, depth, pos.line);
             }
             Stmt::FnDecl { def, pos, .. } => {
                 self.fill(pos.line + 1, def.end_pos.line.saturating_sub(1), depth + 1);
@@ -202,16 +205,20 @@ impl Formatter {
                 self.set(end_pos.line, depth);
                 self.pad_rows(rows);
             }
-            Stmt::Decl { value, .. } => self.expr(value, depth),
-            Stmt::Assign { targets, value, .. } => {
+            Stmt::Decl { value, pos, .. } => self.expr(value, depth, pos.line),
+            Stmt::Assign { targets, value, pos, .. } => {
                 for target in targets {
-                    self.expr(target, depth);
+                    self.expr(target, depth, pos.line);
                 }
-                self.expr(value, depth);
+                self.expr(value, depth, pos.line);
             }
-            Stmt::Expr { expr, .. } => self.expr(expr, depth),
+            Stmt::Expr { expr, pos } => self.expr(expr, depth, pos.line),
             _ => {}
         }
+    }
+
+    fn depth_of(&self, line: u32) -> usize {
+        self.indent.get(line as usize).copied().unwrap_or(0)
     }
 
     fn block(&mut self, body: &[Stmt], pos: crate::errors::Pos, end_pos: crate::errors::Pos, depth: usize) {
@@ -220,33 +227,45 @@ impl Formatter {
         self.set(end_pos.line, depth);
     }
 
-    /// A multi-line closure opens a block wherever it appears in an expression.
-    fn expr(&mut self, expr: &Expr, depth: usize) {
+    /// A line that continues the statement starting on `base` sits one level
+    /// in — `.split(…)` under `lines := csv`. An argument or item starting on
+    /// a later line than its call's `(` or its list's `[` sits one level in
+    /// from that line, and a multi-line closure opens a block one level in
+    /// from the line its `fn` is on.
+    fn expr(&mut self, expr: &Expr, depth: usize, base: u32) {
+        let line = expr.pos().line;
+        let here = if line > base { depth + 1 } else { depth };
+        if line > base && !self.closure_ends.contains(&line) {
+            self.set(line, here);
+        }
         match expr {
             Expr::Closure(def) => {
                 if let ClosureBody::Block(body) = &def.body {
-                    self.fill(def.pos.line + 1, def.end_pos.line.saturating_sub(1), depth + 1);
-                    self.statements(body, depth + 1);
-                    self.set(def.end_pos.line, depth);
+                    self.fill(def.pos.line + 1, def.end_pos.line.saturating_sub(1), here + 1);
+                    self.statements(body, here + 1);
+                    self.set(def.end_pos.line, here);
+                    self.closure_ends.insert(def.end_pos.line);
                 }
                 if let ClosureBody::Expr(inner) = &def.body {
-                    self.expr(inner, depth);
+                    self.expr(inner, depth, base);
                 }
             }
             Expr::List { items, .. } => {
+                let inner = self.depth_of(line);
                 for item in items {
-                    self.expr(item, depth);
+                    self.expr(item, inner, line);
                 }
             }
             Expr::Dict { entries, .. } => {
+                let inner = self.depth_of(line);
                 for (_, value) in entries {
-                    self.expr(value, depth);
+                    self.expr(value, inner, line);
                 }
             }
-            Expr::Key { obj, .. } => self.expr(obj, depth),
+            Expr::Key { obj, .. } | Expr::Method { obj, .. } => self.expr(obj, depth, base),
             Expr::Index { obj, index, .. } => {
-                self.expr(obj, depth);
-                self.expr(index, depth);
+                self.expr(obj, depth, base);
+                self.expr(index, depth, base);
             }
             Expr::Call { callee, args, bare, .. } => {
                 if *bare {
@@ -254,16 +273,20 @@ impl Formatter {
                         self.command_arguments.insert((arg.pos.line, arg.pos.col));
                     }
                 }
-                self.expr(callee, depth);
+                self.expr(callee, depth, base);
+                // The `(` is on the line the callee's name is on, which the
+                // callee has just been placed on.
+                let open = callee.pos().line;
+                let inner = self.depth_of(open);
                 for arg in args {
-                    self.expr(&arg.value, depth);
+                    self.expr(&arg.value, inner, open);
                 }
             }
-            Expr::Unary { operand, .. } => self.expr(operand, depth),
-            Expr::Ref { target, .. } => self.expr(target, depth),
+            Expr::Unary { operand, .. } => self.expr(operand, depth, base),
+            Expr::Ref { target, .. } => self.expr(target, depth, base),
             Expr::Binary { left, right, .. } => {
-                self.expr(left, depth);
-                self.expr(right, depth);
+                self.expr(left, depth, base);
+                self.expr(right, depth, base);
             }
             _ => {}
         }

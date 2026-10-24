@@ -37,16 +37,19 @@
 <span class="syntax-keyword-control">end</span>
 
 <span class="syntax-variable">total</span> := <span class="syntax-entity-function">add</span> <span class="syntax-constant-numeric">20</span>, <span class="syntax-entity-function">len</span>([<span class="syntax-constant-numeric">1</span>, <span class="syntax-constant-numeric">2</span>])
-<span class="syntax-entity-function">print</span> <span class="syntax-variable">total</span></code></pre><h2 id="formatting">Formatting<a class="anchor" href="#formatting" aria-label="Link to Formatting">#</a></h2><p>The formatter inserts a blank line after a group of consecutive use lines. It also separates end from a following non-end statement. Existing blank lines remain; expression continuations and shared parallel rows are preserved.</p><pre><code><span class="syntax-keyword-other">use</span> <span class="syntax-variable">fs</span>
+<span class="syntax-entity-function">print</span> <span class="syntax-variable">total</span></code></pre><h2 id="formatting">Formatting<a class="anchor" href="#formatting" aria-label="Link to Formatting">#</a></h2><p>The formatter inserts a blank line after a group of consecutive use lines. It also separates end from a following non-end statement. Existing blank lines remain; expression continuations and shared parallel rows are preserved. A continuation line is indented one level past its statement; an argument on a later line than its call&#x27;s <code>(</code>, one level past that line; a closure body, one level past the line its <code>fn</code> is on.</p><pre><code><span class="syntax-keyword-other">use</span> <span class="syntax-variable">list</span>
 <span class="syntax-keyword-other">use</span> <span class="syntax-variable">text</span>
 
-<span class="syntax-variable">name</span> := <span class="syntax-entity-namespace">text</span>::<span class="syntax-entity-function">trim</span> <span class="syntax-string">&quot; Hydra &quot;</span>
-<span class="syntax-entity-function">print</span> <span class="syntax-variable">name</span></code></pre><h2 id="spacing">Significant spacing<a class="anchor" href="#spacing" aria-label="Link to Significant spacing">#</a></h2><p><code>f -1</code> calls with a negative argument; <code>f - 1</code> subtracts. <code>f [1]</code> calls with a list; <code>f[1]</code> indexes. <code>f &amp;x</code> passes a reference; <code>f &amp; x</code> is bitwise AND. The formatter preserves these distinctions.</p><h2 id="continuation">Continuation<a class="anchor" href="#continuation" aria-label="Link to Continuation">#</a></h2><p>A single newline continues an expression whenever syntax permits. A blank or whitespace-only line stops it. Comment-only lines are transparent. Precedence stays unchanged.</p><pre><code><span class="syntax-variable">foo</span>
-.<span class="syntax-variable-property">bar</span>
-.<span class="syntax-variable-property">baz</span>  <span class="syntax-comment">// foo.bar.baz</span>
+<span class="syntax-variable">words</span> := <span class="syntax-entity-namespace">text</span>::<span class="syntax-entity-function">split</span>(<span class="syntax-string">&quot; a,b c &quot;</span>, <span class="syntax-string">&quot;,&quot;</span>)
+	.<span class="syntax-entity-namespace">list</span>::<span class="syntax-entity-function">map</span>(<span class="syntax-keyword-other">fn</span>(<span class="syntax-variable">w</span>)
+		<span class="syntax-keyword-control">return</span> <span class="syntax-entity-namespace">text</span>::<span class="syntax-entity-function">trim</span>(<span class="syntax-variable">w</span>)
+	<span class="syntax-keyword-control">end</span>)
+<span class="syntax-entity-function">print</span> <span class="syntax-variable">words</span></code></pre><h2 id="spacing">Significant spacing<a class="anchor" href="#spacing" aria-label="Link to Significant spacing">#</a></h2><p><code>f -1</code> calls with a negative argument; <code>f - 1</code> subtracts. <code>f [1]</code> calls with a list; <code>f[1]</code> indexes. <code>f &amp;x</code> passes a reference; <code>f &amp; x</code> is bitwise AND. The formatter preserves these distinctions.</p><h2 id="continuation">Continuation<a class="anchor" href="#continuation" aria-label="Link to Continuation">#</a></h2><p>A single newline continues an expression whenever syntax permits. A blank or whitespace-only line stops it. Comment-only lines are transparent. Precedence stays unchanged.</p><pre><code><span class="syntax-variable">foo</span>
+	.<span class="syntax-variable-property">bar</span>
+	.<span class="syntax-variable-property">baz</span>  <span class="syntax-comment">// foo.bar.baz</span>
 
 <span class="syntax-constant-numeric">32</span>
--<span class="syntax-variable">a</span>    <span class="syntax-comment">// 32 - a</span>
+	-<span class="syntax-variable">a</span>    <span class="syntax-comment">// 32 - a</span>
 
 <span class="syntax-constant-numeric">32</span>
 
