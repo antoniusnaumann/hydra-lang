@@ -73,6 +73,11 @@ lower := text::lower("ÄBC")
 upper := text::upper("straße")
 prefix := text::starts_with("éx", "é")
 suffix := text::ends_with("éx", "x")
+blank := text::is_whitespace(" \t\n　")
+space := text::is_whitespace(" ")
+letter := text::is_whitespace("a")
+mixed := text::is_whitespace(" a ")
+empty := text::is_whitespace("")
 "#);
     for (name, expected) in [
         ("parts", "[a, β, 😀]"),
@@ -87,10 +92,16 @@ suffix := text::ends_with("éx", "x")
         ("upper", "STRASSE"),
         ("prefix", ":true"),
         ("suffix", ":true"),
+        ("blank", ":true"),
+        ("space", ":true"),
+        ("letter", ":false"),
+        ("mixed", ":false"),
+        ("empty", ":false"),
     ] {
         assert_eq!(value(&r, name), expected, "{name}");
     }
     assert!(run("use text\nx := text::join([1])").crash.is_some());
+    assert!(run("use text\nx := text::is_whitespace(1)").crash.is_some());
 }
 
 #[test]

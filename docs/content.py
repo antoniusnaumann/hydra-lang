@@ -118,6 +118,7 @@ MODULES = {
         "ends_with": ("Strings", "boolean", "Whether text ends with the literal suffix."),
         "lower": ("Strings", "string", "Unicode lowercase conversion, independent of locale."),
         "upper": ("Strings", "string", "Unicode uppercase conversion, independent of locale. May change character count."),
+        "is_whitespace": ("Strings", "boolean", "Whether text is nonempty and every character is Unicode whitespace. A character is a one-character string, so this tests characters too. `\"\"` gives `:false`."),
     }, "These functions require strings; they do not silently render other values.",
         'use text\nwords := text::split "  hello   Hydra  "\nprint text::join(words, " ")'),
     "json": ("Convert between JSON text and Hydra values.", {

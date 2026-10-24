@@ -222,6 +222,10 @@
     "upper": {
      "result": "string",
      "doc": "Unicode uppercase conversion, independent of locale. May change character count."
+    },
+    "is_whitespace": {
+     "result": "boolean",
+     "doc": "Whether text is nonempty and every character is Unicode whitespace. A character is a one-character string, so this tests characters too. `\"\"` gives `:false`."
     }
    }
   },

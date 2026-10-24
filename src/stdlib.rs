@@ -211,6 +211,10 @@ fn answer(
         Native::TextTrim => one(string(need("text")?.trim())),
         Native::TextLower => one(string(need("text")?.to_lowercase())),
         Native::TextUpper => one(string(need("text")?.to_uppercase())),
+        Native::TextIsWhitespace => {
+            let text = need("text")?;
+            one(boolean(!text.is_empty() && text.chars().all(char::is_whitespace)))
+        }
         Native::TextReplace => one(string(need("text")?.replace(need("from")?.as_str(), &need("to")?))),
         Native::TextFind => {
             let text = need("text")?;
