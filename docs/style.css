@@ -108,12 +108,13 @@ footer { margin-top: 25px; padding-top: 10px; border-top: 1px solid var(--line);
 .syntax-string { color: #39762b; }
 .syntax-constant, .syntax-constant-numeric { color: #a45a20; }
 .syntax-entity-function { color: #216bc0; }
-.syntax-entity-namespace { color: var(--muted); }
+.syntax-entity-namespace, .syntax-entity-namespace + .syntax-punctuation-delimiter { color: #888; }
 .syntax-comment { color: var(--muted); font-style: italic; }
 .syntax-punctuation-delimiter, .syntax-punctuation-trail { color: var(--muted); }
 @media (prefers-color-scheme: dark) {
   .syntax-keyword-control, .syntax-keyword-other, .syntax-keyword-concurrency { color: #d29ade; }
   .syntax-string { color: #9bca82; }
   .syntax-entity-function { color: #80b8f2; }
+  .syntax-entity-namespace, .syntax-entity-namespace + .syntax-punctuation-delimiter { color: #777; }
   .syntax-constant, .syntax-constant-numeric { color: #e5ad6d; }
 }
