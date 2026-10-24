@@ -25,6 +25,10 @@ usage:
                                   hands it
   hydra tokens FILE.hy            print token classes for editor tooling (§13)
   hydra grammar [--theme]         print a TextMate grammar, or its colours
+  hydra language-server           speak the Language Server Protocol on
+                                  stdin/stdout: completion, hover, signature
+                                  help, definitions, check diagnostics and
+                                  formatting
 
 run options:
   --strict            a crash in a dead trail is fatal, so tests fail on bugs
@@ -70,6 +74,13 @@ fn main() -> ExitCode {
         "fmt" if args[1..].iter().any(|a| a == "-") => fmt_stdin(&args[1..]),
         "fmt" => command(&args[1..], fmt),
         "tokens" => command(&args[1..], tokens),
+        "language-server" | "lsp" => match hydra::lsp::serve() {
+            Ok(code) => ExitCode::from(code as u8),
+            Err(e) => {
+                eprintln!("hydra language-server: {e}");
+                ExitCode::from(1)
+            }
+        },
         "grammar" => {
             if flag(&args[1..], "--theme") {
                 print!("{}", hydra::editor::theme_json());

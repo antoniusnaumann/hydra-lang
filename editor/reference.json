@@ -1,0 +1,773 @@
+{
+ "builtins": {
+  "print": {
+   "result": ":null",
+   "doc": "Write one value as text, followed by `terminator`. Use `\"\"` to omit the newline."
+  },
+  "len": {
+   "result": "number",
+   "doc": "Count list elements, dict entries, or Unicode characters in a string."
+  },
+  "has": {
+   "result": "boolean",
+   "doc": "Test for a dict key or list index. Negative indices count from the end."
+  },
+  "get": {
+   "result": "value",
+   "doc": "Read a dict key or list index, returning `fallback` when absent. Does not insert anything."
+  },
+  "do": {
+   "result": ":null",
+   "doc": "Discard a value. Passing it consumes it, so `do push(&xs, 1)` prints nothing at the top level and `do reject()` rejects nothing."
+  },
+  "push": {
+   "result": "number",
+   "doc": "Append a copied value to a list; return its new length. The list argument must use `&`."
+  },
+  "return": {
+   "result": "[:return, …values]",
+   "doc": "Construct a return request. Unconsumed, return its payload from the current function; an empty request returns `:null`."
+  },
+  "break": {
+   "result": ":break",
+   "doc": "Construct a loop-stop request. Unconsumed, stop the nearest loop in this function; a parallel loop stops as a whole."
+  },
+  "continue": {
+   "result": ":continue",
+   "doc": "Construct an iteration-stop request. Unconsumed, skip the rest of this iteration; a parallel iteration ends its trail."
+  },
+  "reject": {
+   "result": "[:reject, msg]",
+   "doc": "Construct a rejection. Unconsumed in a function, try its next overload. Unhandled exhaustion reports all refusal messages and fails."
+  },
+  "exit": {
+   "result": "[:exit, code]",
+   "doc": "Construct an exit request. Unconsumed, stop the program with an integer status from 0 through 255."
+  },
+  "panic": {
+   "result": "[:panic, msg]",
+   "doc": "Construct a panic request. Unconsumed, stop the program with a rendered message, call trace, and status 1."
+  },
+  "alive": {
+   "result": "boolean",
+   "doc": "Whether the current trail is still live. Returns `:true` outside a trail."
+  },
+  "channel": {
+   "result": "number",
+   "doc": "The current trail’s zero-based index in its block. Requires a trail."
+  },
+  "send": {
+   "result": "boolean",
+   "doc": "Send to sibling trails; omit destinations for any sibling. Default `:wait` waits for receipt; `:detach` queues one message; `:broadcast` queues a copy per eligible sibling. False if none remain. Requires a trail."
+  },
+  "receive": {
+   "result": "value, channel",
+   "doc": "Wait for a sibling’s message and its sender index. Omit sources for any sibling. Returns `:null, :null` once none can send. Requires a trail."
+  }
+ },
+ "modules": {
+  "fs": {
+   "summary": "Filesystem paths, inspection, reading, and writing.",
+   "functions": {
+    "join": {
+     "result": "string",
+     "doc": "Join and normalize path components. `join(\"a\", \"/b\")` yields `\"a/b\"`. Removes `.`; preserves `..`."
+    },
+    "parent": {
+     "result": "string",
+     "doc": "Parent directory; `\".\"` if the path has no directory component."
+    },
+    "name": {
+     "result": "string",
+     "doc": "Final path component, including its extension."
+    },
+    "stem": {
+     "result": "string",
+     "doc": "Final component without its last extension."
+    },
+    "extension": {
+     "result": "string",
+     "doc": "Last extension without its dot; `\"\"` if absent."
+    },
+    "absolute": {
+     "result": "string",
+     "doc": "Resolve against `dir`, itself resolved against the working directory. Does not require existence or resolve symlinks."
+    },
+    "relative": {
+     "result": "string",
+     "doc": "Express `path` relative to `dir`, after making both absolute. Lexical: `relative(\"/x/y/z\", \"/x/q\")` yields `\"../y/z\"`."
+    },
+    "cwd": {
+     "result": "string",
+     "doc": "Current working directory."
+    },
+    "home": {
+     "result": "string",
+     "doc": "Current user’s home directory. Crashes if unavailable."
+    },
+    "temp": {
+     "result": "string",
+     "doc": "System temporary directory. Does not create a file or directory."
+    },
+    "exists": {
+     "result": "boolean",
+     "doc": "Whether the path exists and can be inspected. Follows symlinks."
+    },
+    "is_file": {
+     "result": "boolean",
+     "doc": "Whether the path is a regular file. False if absent or inaccessible."
+    },
+    "is_dir": {
+     "result": "boolean",
+     "doc": "Whether the path is a directory. False if absent or inaccessible."
+    },
+    "size": {
+     "result": "bytes, reason",
+     "doc": "Size from filesystem metadata, in bytes. Without a fallback, errors crash."
+    },
+    "modified": {
+     "result": "seconds, reason",
+     "doc": "Modification time as Unix seconds, including fractions. Without a fallback, errors crash."
+    },
+    "read": {
+     "result": "string, reason",
+     "doc": "Read the whole file as UTF-8. Without a fallback, read and encoding errors crash."
+    },
+    "lines": {
+     "result": "list, reason",
+     "doc": "Read UTF-8 lines, without line endings. Without a fallback, errors crash."
+    },
+    "list": {
+     "result": "list, reason",
+     "doc": "List matching entries as paths relative to `dir`, or absolute with `absolute = :true`. `dir` defaults to the working directory. Sort within each directory; recurse depth-first when requested. Patterns support `*` and `?`. Without a fallback, errors crash."
+    },
+    "write": {
+     "result": "path, bytes",
+     "doc": "Write text; return the path and UTF-8 byte count. `:replace` truncates, `:append` appends, `:new` requires a new file. Creates parent directories by default."
+    },
+    "copy": {
+     "result": "target",
+     "doc": "Copy a file or directory tree. Overwrite and create parent directories by default. Other failures crash."
+    },
+    "move": {
+     "result": "target",
+     "doc": "Rename a file or directory. Create parents by default; existing targets require `overwrite = :true`. Cross-filesystem moves may fail."
+    },
+    "remove": {
+     "result": "boolean",
+     "doc": "Remove a file or empty directory; `recursive = :true` removes a directory tree. False if absent; other failures crash."
+    },
+    "make_dir": {
+     "result": "path",
+     "doc": "Create a directory and, by default, its parents. An existing directory is fine; other failures crash."
+    }
+   }
+  },
+  "env": {
+   "summary": "Script arguments, environment variables, and the host platform.",
+   "functions": {
+    "args": {
+     "result": "list",
+     "doc": "Arguments after `--`, excluding the script name. Embedding hosts supply these in VM options."
+    },
+    "get": {
+     "result": "string, reason",
+     "doc": "Read a variable. Missing names return `fallback, :not_found`; non-Unicode values return `fallback, :encoding`. Without a fallback, failures crash. Invalid names always crash."
+    },
+    "all": {
+     "result": "dict",
+     "doc": "Snapshot Unicode environment variables, sorted by name. Keys are atoms; variables with non-Unicode names or values are omitted."
+    },
+    "platform": {
+     "result": "atom",
+     "doc": "Host OS, such as `:macos`, `:linux`, or `:windows`."
+    }
+   }
+  },
+  "text": {
+   "summary": "Unicode string operations. Positions count characters, not bytes.",
+   "functions": {
+    "split": {
+     "result": "list",
+     "doc": "With `:null`, split on Unicode whitespace and discard empty fields. An explicit separator preserves empty fields; an empty separator splits into characters."
+    },
+    "join": {
+     "result": "string",
+     "doc": "Join a list of strings with the separator. An empty list produces an empty string."
+    },
+    "trim": {
+     "result": "string",
+     "doc": "Remove leading and trailing Unicode whitespace."
+    },
+    "replace": {
+     "result": "string",
+     "doc": "Replace every non-overlapping literal match. An empty `from` inserts at character boundaries, including both ends."
+    },
+    "find": {
+     "result": "number or :null",
+     "doc": "Zero-based character position of the first literal match; `:null` if absent. An empty needle matches at zero."
+    },
+    "starts_with": {
+     "result": "boolean",
+     "doc": "Whether text begins with the literal prefix."
+    },
+    "ends_with": {
+     "result": "boolean",
+     "doc": "Whether text ends with the literal suffix."
+    },
+    "lower": {
+     "result": "string",
+     "doc": "Unicode lowercase conversion, independent of locale."
+    },
+    "upper": {
+     "result": "string",
+     "doc": "Unicode uppercase conversion, independent of locale. May change character count."
+    }
+   }
+  },
+  "json": {
+   "summary": "Convert between JSON text and Hydra values.",
+   "functions": {
+    "parse": {
+     "result": "value, reason",
+     "doc": "Objects become dicts with atom keys; arrays become lists; booleans and null become `:true`, `:false`, and `:null`. Invalid input gives `fallback, :invalid`, or crashes without a fallback."
+    },
+    "stringify": {
+     "result": "string",
+     "doc": "Encode values, preserving dict order. Other atoms become JSON strings. `pretty = :true` indents. Functions, non-finite numbers, cycles, and excessive nesting crash."
+    }
+   }
+  },
+  "io": {
+   "summary": "UTF-8 standard input, output, and error streams.",
+   "functions": {
+    "read": {
+     "result": "string, reason",
+     "doc": "Read stdin to EOF, preserving line endings. Empty input produces an empty string."
+    },
+    "read_line": {
+     "result": "string or :null, reason",
+     "doc": "Read one line, removing its LF or CRLF ending. EOF produces `:null`; an empty line produces an empty string."
+    },
+    "lines": {
+     "result": "list, reason",
+     "doc": "Read stdin to EOF as a list of lines, without line endings. This collects the entire input."
+    },
+    "write": {
+     "result": "bytes",
+     "doc": "Render one value without a newline to `:stdout` or `:stderr`, flush, and return its UTF-8 byte count. Failures crash."
+    },
+    "flush": {
+     "result": ":null",
+     "doc": "Flush `:stdout` or `:stderr`. Failures crash."
+    },
+    "is_terminal": {
+     "result": "boolean",
+     "doc": "Whether `:stdin`, `:stdout`, or `:stderr` is connected to a terminal."
+    }
+   }
+  },
+  "time": {
+   "summary": "Clocks, sleeping, and timestamp conversion. All durations use seconds.",
+   "functions": {
+    "now": {
+     "result": "seconds",
+     "doc": "Unix timestamp with fractional seconds. The system clock can jump."
+    },
+    "monotonic": {
+     "result": "seconds",
+     "doc": "Elapsed seconds from the host process’s first call. Use differences to measure durations; unrelated to calendar time."
+    },
+    "sleep": {
+     "result": ":null",
+     "doc": "Wait a finite, nonnegative number of seconds while other trails run. Scheduling can make the actual wait longer."
+    },
+    "parse": {
+     "result": "seconds, reason",
+     "doc": "Parse an RFC 3339 timestamp with an explicit offset or Z. Return Unix seconds; invalid input gives `fallback, :invalid`, or crashes without a fallback."
+    },
+    "format": {
+     "result": "string",
+     "doc": "Format Unix seconds in UTC using strftime directives such as `%Y-%m-%d %H:%M:%S`. Default `%+` produces RFC 3339. Invalid formats or dates crash."
+    }
+   }
+  },
+  "http": {
+   "summary": "HTTP and HTTPS requests, text responses, and binary downloads.",
+   "functions": {
+    "request": {
+     "result": "response, reason",
+     "doc": "Send a method string or atom, with an optional UTF-8 body. Response fields are `.status`, `.headers`, `.body`, and final `.url`. HTTP error statuses remain ordinary responses."
+    },
+    "get": {
+     "result": "response, reason",
+     "doc": "GET shorthand for `request`. Response body must be UTF-8."
+    },
+    "post": {
+     "result": "response, reason",
+     "doc": "POST a UTF-8 string. Set content-type explicitly; use `json::stringify` for JSON payloads."
+    },
+    "head": {
+     "result": "response, reason",
+     "doc": "HEAD shorthand. Return status and headers with an empty `.body`, even when content-length describes a nonempty resource."
+    },
+    "put": {
+     "result": "response, reason",
+     "doc": "PUT a UTF-8 string. Set content-type explicitly; use `json::stringify` for JSON payloads."
+    },
+    "patch": {
+     "result": "response, reason",
+     "doc": "PATCH with a UTF-8 string. Set the content-type required by the server’s patch format."
+    },
+    "delete": {
+     "result": "response, reason",
+     "doc": "DELETE shorthand, with an optional named `body`."
+    },
+    "options": {
+     "result": "response, reason",
+     "doc": "OPTIONS shorthand, with an optional named `body`. Inspect response headers for supported operations."
+    },
+    "connect": {
+     "result": "response, reason",
+     "doc": "Send CONNECT using the URL’s authority as the request target. Return the handshake response and close the connection; tunnel streams are not exposed."
+    },
+    "trace": {
+     "result": "response, reason",
+     "doc": "TRACE shorthand. Return the server’s diagnostic response."
+    },
+    "download": {
+     "result": "path, reason",
+     "doc": "GET binary data to a file. Require a 2xx status, create parent directories, and replace the target only after the complete bounded download succeeds. Failure leaves an existing target intact."
+    }
+   }
+  },
+  "list": {
+   "summary": "Eager list operations, with Rust-style callbacks and itertools conveniences.",
+   "functions": {
+    "range": {
+     "result": "list",
+     "doc": "Exclusive integer range. One positional argument is end; two are start, end. Use range(end, step = 2) for a zero-based range with a custom step. Negative steps count down. Step must be nonzero; bounds and step must be exactly representable integers."
+    },
+    "repeat": {
+     "result": "list",
+     "doc": "Copy value count times."
+    },
+    "map": {
+     "result": "list",
+     "doc": "Apply f(item) to each item."
+    },
+    "filter": {
+     "result": "list",
+     "doc": "Keep items whose f(item) is truthy."
+    },
+    "filter_map": {
+     "result": "list",
+     "doc": "Map and omit only :null; retain :false and zero."
+    },
+    "flat_map": {
+     "result": "list",
+     "doc": "Map each item to a list, then flatten one level."
+    },
+    "flatten": {
+     "result": "list",
+     "doc": "Concatenate one level of nested lists."
+    },
+    "enumerate": {
+     "result": "list",
+     "doc": "Produce [index, value] pairs, starting at zero."
+    },
+    "rev": {
+     "result": "list",
+     "doc": "Reverse item order."
+    },
+    "chain": {
+     "result": "list",
+     "doc": "Concatenate two lists."
+    },
+    "zip": {
+     "result": "list",
+     "doc": "Pair corresponding items; stop at the shorter list."
+    },
+    "unzip": {
+     "result": "left, right",
+     "doc": "Split a list of two-element pairs into two returned lists."
+    },
+    "interleave": {
+     "result": "list",
+     "doc": "Alternate left and right items, retaining the longer list’s remainder."
+    },
+    "cartesian_product": {
+     "result": "list",
+     "doc": "Every [left, right] pair, in left-major order."
+    },
+    "intersperse": {
+     "result": "list",
+     "doc": "Insert separator between adjacent items."
+    },
+    "take": {
+     "result": "list",
+     "doc": "Keep at most count leading items."
+    },
+    "skip": {
+     "result": "list",
+     "doc": "Omit at most count leading items."
+    },
+    "step_by": {
+     "result": "list",
+     "doc": "Keep every step-th item, starting with the first. Step must be positive."
+    },
+    "take_while": {
+     "result": "list",
+     "doc": "Keep the leading items satisfying f; stop at the first failure."
+    },
+    "skip_while": {
+     "result": "list",
+     "doc": "Skip the leading items satisfying f, then keep everything else."
+    },
+    "map_while": {
+     "result": "list",
+     "doc": "Map until f first returns :null; omit that result."
+    },
+    "chunks": {
+     "result": "list",
+     "doc": "Non-overlapping lists of positive size; include the final partial chunk."
+    },
+    "windows": {
+     "result": "list",
+     "doc": "Overlapping lists of positive size; include complete windows only."
+    },
+    "first": {
+     "result": "value or :null",
+     "doc": "First item, or :null for an empty list."
+    },
+    "last": {
+     "result": "value or :null",
+     "doc": "Last item, or :null for an empty list."
+    },
+    "nth": {
+     "result": "value or :null",
+     "doc": "Item at a nonnegative zero-based index, or :null if absent."
+    },
+    "find": {
+     "result": "value or :null",
+     "doc": "First item satisfying f, or :null."
+    },
+    "find_map": {
+     "result": "value or :null",
+     "doc": "First non-null f(item), stopping immediately."
+    },
+    "position": {
+     "result": "index or :null",
+     "doc": "First zero-based index satisfying f."
+    },
+    "rposition": {
+     "result": "index or :null",
+     "doc": "Last zero-based index satisfying f; search backwards."
+    },
+    "any": {
+     "result": "boolean",
+     "doc": "Whether any item satisfies f; short-circuit. False for an empty list."
+    },
+    "all": {
+     "result": "boolean",
+     "doc": "Whether every item satisfies f; short-circuit. True for an empty list."
+    },
+    "count": {
+     "result": "number",
+     "doc": "Number of items; equivalent to len(items)."
+    },
+    "fold": {
+     "result": "value",
+     "doc": "Apply f(accumulator, item) from left to right, starting with initial."
+    },
+    "reduce": {
+     "result": "value or :null",
+     "doc": "Fold using the first item as accumulator; :null for an empty list."
+    },
+    "sum": {
+     "result": "number",
+     "doc": "Sum numeric items; zero for an empty list."
+    },
+    "product": {
+     "result": "number",
+     "doc": "Multiply numeric items; one for an empty list."
+    },
+    "join": {
+     "result": "string",
+     "doc": "Render items as text and join with separator."
+    },
+    "for_each": {
+     "result": ":null",
+     "doc": "Call f(item) in order, consuming and discarding each result."
+    },
+    "inspect": {
+     "result": "list",
+     "doc": "Call f(item) in order for side effects; return the original list."
+    },
+    "partition": {
+     "result": "matching, other",
+     "doc": "Return two lists, preserving order, partitioned by f(item)."
+    },
+    "unique": {
+     "result": "list",
+     "doc": "Keep the first occurrence of each deeply equal value."
+    },
+    "unique_by": {
+     "result": "list",
+     "doc": "Keep the first item for each deeply equal f(item) key."
+    },
+    "dedup": {
+     "result": "list",
+     "doc": "Remove consecutive duplicate values."
+    },
+    "dedup_by": {
+     "result": "list",
+     "doc": "Remove an item when f(last_retained, item) is truthy."
+    },
+    "dedup_by_key": {
+     "result": "list",
+     "doc": "Remove consecutive items with equal f(item) keys."
+    },
+    "counts": {
+     "result": "list",
+     "doc": "Return [value, count] pairs in first-occurrence order."
+    },
+    "group_by": {
+     "result": "list",
+     "doc": "Group all equal f(item) keys as [key, items] pairs, in first-key order."
+    },
+    "chunk_by": {
+     "result": "list",
+     "doc": "Group consecutive equal f(item) keys as [key, items] pairs."
+    },
+    "sorted": {
+     "result": "list",
+     "doc": "Stable ascending sort. Supports matching numbers, strings, atoms, or recursively ordered lists."
+    },
+    "sorted_by": {
+     "result": "list",
+     "doc": "Stable sort using compare(a, b): negative, zero, or positive for less, equal, or greater."
+    },
+    "sorted_by_key": {
+     "result": "list",
+     "doc": "Stable ascending sort by f(item), evaluated once per item."
+    },
+    "min": {
+     "result": "value or :null",
+     "doc": "Smallest ordered item; first wins ties. Empty gives :null."
+    },
+    "max": {
+     "result": "value or :null",
+     "doc": "Largest ordered item; last wins ties. Empty gives :null."
+    },
+    "min_by": {
+     "result": "value or :null",
+     "doc": "Minimum by numeric comparator; first wins ties. Empty gives :null."
+    },
+    "max_by": {
+     "result": "value or :null",
+     "doc": "Maximum by numeric comparator; last wins ties. Empty gives :null."
+    },
+    "min_by_key": {
+     "result": "value or :null",
+     "doc": "Minimum by f(item), evaluated once per item; first wins ties. Empty gives :null."
+    },
+    "max_by_key": {
+     "result": "value or :null",
+     "doc": "Maximum by f(item), evaluated once per item; last wins ties. Empty gives :null."
+    },
+    "combinations": {
+     "result": "list",
+     "doc": "Size-item selections in input order, without replacement. Equal values at different positions remain distinct."
+    },
+    "permutations": {
+     "result": "list",
+     "doc": "Size-item ordered selections without replacement, in input-index order."
+    }
+   }
+  },
+  "cli": {
+   "summary": "Argument parsers with generated help, typed options, and subcommands.",
+   "functions": {
+    "parser": {
+     "result": "parser",
+     "doc": "Create a copyable parser. prog defaults to the script filename; add_help registers -h and --help."
+    },
+    "add_argument": {
+     "result": ":null",
+     "doc": "Add one positional name or option aliases through &parser. Return fields use atom keys; default dest strips leading dashes and changes hyphens to underscores."
+    },
+    "add_subparser": {
+     "result": ":null",
+     "doc": "Attach a copy of a configured child parser. The chosen command name goes in dest; child fields merge into the result. Commands are required by default."
+    },
+    "parse_args": {
+     "result": "dict, extras",
+     "doc": "Parse explicit string arguments, or script arguments after -- when omitted. With strict = :true, reject unknown arguments and return [] as extras on success; strict = :false returns unknown arguments in extras. Print help/version to stdout and stop with status 0; print input errors to stderr and stop with status 2."
+    },
+    "format_help": {
+     "result": "string",
+     "doc": "Render usage, description, arguments, choices, commands, and epilog without printing."
+    },
+    "format_usage": {
+     "result": "string",
+     "doc": "Render the compact usage line without printing."
+    }
+   }
+  }
+ },
+ "atoms": [
+  {
+   "atom": ":true",
+   "doc": "Boolean true. Also returned by successful predicates."
+  },
+  {
+   "atom": ":false",
+   "doc": "Boolean false; falsy."
+  },
+  {
+   "atom": ":null",
+   "doc": "Absence or an empty result; falsy. Everything else is truthy, including 0 and empty collections."
+  },
+  {
+   "atom": ":wait",
+   "doc": "Wait until a sibling receives the message. Default for `send`."
+  },
+  {
+   "atom": ":detach",
+   "doc": "Queue for one eligible sibling and continue immediately."
+  },
+  {
+   "atom": ":broadcast",
+   "doc": "Queue one copy for each eligible sibling already spawned."
+  },
+  {
+   "atom": ":replace",
+   "doc": "Create or truncate a file. Default for `fs::write`."
+  },
+  {
+   "atom": ":append",
+   "doc": "Append to a file; in cli, collect repeated argument values."
+  },
+  {
+   "atom": ":new",
+   "doc": "Create a new file; fail if it already exists."
+  },
+  {
+   "atom": ":not_found",
+   "doc": "Path does not exist."
+  },
+  {
+   "atom": ":denied",
+   "doc": "Permission denied."
+  },
+  {
+   "atom": ":exists",
+   "doc": "Path already exists."
+  },
+  {
+   "atom": ":is_dir",
+   "doc": "A file operation encountered a directory."
+  },
+  {
+   "atom": ":not_dir",
+   "doc": "A directory operation encountered a non-directory."
+  },
+  {
+   "atom": ":encoding",
+   "doc": "Invalid data, including non-UTF-8 text."
+  },
+  {
+   "atom": ":io",
+   "doc": "Other I/O failure."
+  },
+  {
+   "atom": ":stdin",
+   "doc": "Input stream for `io` readers and `is_terminal`."
+  },
+  {
+   "atom": ":stdout",
+   "doc": "Default stream for `io::write`, `flush`, and `is_terminal`."
+  },
+  {
+   "atom": ":stderr",
+   "doc": "Error output stream for `io::write`, `flush`, and `is_terminal`."
+  },
+  {
+   "atom": ":invalid",
+   "doc": "Malformed JSON or timestamp."
+  },
+  {
+   "atom": ":timeout",
+   "doc": "HTTP operation exceeded its time limit."
+  },
+  {
+   "atom": ":dns",
+   "doc": "HTTP hostname could not be resolved."
+  },
+  {
+   "atom": ":tls",
+   "doc": "TLS negotiation or certificate verification failed."
+  },
+  {
+   "atom": ":network",
+   "doc": "Other HTTP connection or protocol failure."
+  },
+  {
+   "atom": ":redirect",
+   "doc": "HTTP redirect limit or redirect failure."
+  },
+  {
+   "atom": ":too_large",
+   "doc": "HTTP response exceeded `max_bytes`."
+  },
+  {
+   "atom": ":http_status",
+   "doc": "A download received a non-2xx response. Other HTTP functions return the response normally."
+  },
+  {
+   "atom": ":string",
+   "doc": "Parse a command-line value as text; default type."
+  },
+  {
+   "atom": ":int",
+   "doc": "Parse a command-line value as an exactly representable integer."
+  },
+  {
+   "atom": ":float",
+   "doc": "Parse a command-line value as a finite number."
+  },
+  {
+   "atom": ":store",
+   "doc": "Store an argument value; default action."
+  },
+  {
+   "atom": ":store_true",
+   "doc": "A present flag stores :true; absent defaults to :false."
+  },
+  {
+   "atom": ":store_false",
+   "doc": "A present flag stores :false; absent defaults to :true."
+  },
+  {
+   "atom": ":store_const",
+   "doc": "A present flag stores const."
+  },
+  {
+   "atom": ":append_const",
+   "doc": "Each occurrence appends const to a list."
+  },
+  {
+   "atom": ":count",
+   "doc": "Count occurrences of an option."
+  },
+  {
+   "atom": ":help",
+   "doc": "Show parser help and exit successfully."
+  },
+  {
+   "atom": ":version",
+   "doc": "Show the configured version text."
+  }
+ ]
+}

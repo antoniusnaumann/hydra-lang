@@ -23,7 +23,10 @@ python3 -m http.server 8765 --directory docs
 Edit `content.py` for descriptions; `build.py` for page structure; `style.css`
 for presentation. Function signatures come from `src/value.rs`. The builder
 checks that every registered builtin has a description. Commit the generated
-HTML and search index alongside their sources.
+HTML and search index alongside their sources. The build also writes
+`editor/reference.json`, the descriptions `hydra language-server` embeds for
+completion and hover; a description change therefore needs a rebuild of the
+binary as well.
 
 `--check` does not write files. CI runs it on every push and pull request: stale
 output, missing builtin descriptions, invalid examples, and broken local links

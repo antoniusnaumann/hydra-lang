@@ -134,6 +134,20 @@ def reference(name, title, intro, entries, signatures, note):
     page(name, title, intro, body, sections)
 
 
+def editor_reference():
+    """Descriptions for `hydra language-server`, which embeds this file.
+
+    Signatures are not repeated: the server reads them from the interpreter."""
+    def functions(entries):
+        return {name: {'result': result, 'doc': description} for name, (_, result, description) in entries.items()}
+    reference = {
+        'builtins': functions(BUILTINS),
+        'modules': {name: {'summary': data[0], 'functions': functions(data[1])} for name, data in MODULES.items()},
+        'atoms': [{'atom': atom, 'doc': meaning} for _, _, items in ATOM_GROUPS for atom, meaning in items],
+    }
+    return json.dumps(reference, ensure_ascii=False, indent=1) + '\n'
+
+
 def validate_links():
     class Links(HTMLParser):
         def __init__(self, text):
@@ -234,6 +248,7 @@ def main():
             body += code(example)
         search('language', anchor, title, 'Language', description)
     page('language', 'Language', 'The rules you need to read and write Hydra.', body, sections)
+    OUTPUT['../editor/reference.json'] = editor_reference()
     OUTPUT['search-index.js'] = 'window.HYDRA_SEARCH = ' + json.dumps(SEARCH, ensure_ascii=False, separators=(',', ':')) + ';\n'
     validate_links()
     stale = []
