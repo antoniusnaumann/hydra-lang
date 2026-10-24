@@ -132,8 +132,9 @@ fn a_reference_through_a_call_that_has_no_receiver_is_an_error() {
     let error = run_source("x := &f(1)\n", "t.hy", opts()).expect_err("rejected").to_string();
     assert!(error.contains("no receiver to mark"), "{error}");
     // And a plain non-lvalue is still the old error.
+    // `&(…)` is not a reference: only a name may follow the marker.
     let error = run_source("x := &(a + b)\n", "t.hy", opts()).expect_err("rejected").to_string();
-    assert!(error.contains("`&` takes a variable"), "{error}");
+    assert!(error.contains("directly in front of a name"), "{error}");
 }
 
 #[test]

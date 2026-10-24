@@ -360,7 +360,11 @@ fn mark_prefixes(tokens: &[Token]) -> Vec<bool> {
     let mut prefix = vec![false; tokens.len()];
     for (i, tok) in tokens.iter().enumerate() {
         if let Tok::Op(op) = &tok.kind {
-            if matches!(*op, "-" | "~" | "&") {
+            // `&` in front of a name is always the reference marker; the
+            // lexer has already told it apart from AND.
+            if *op == "&" {
+                prefix[i] = true;
+            } else if matches!(*op, "-" | "~") {
                 let after_operand = i > 0 && is_operand_end(&tokens[i - 1]);
                 prefix[i] = !after_operand;
             }

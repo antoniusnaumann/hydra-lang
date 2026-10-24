@@ -31,14 +31,16 @@ aggressive: a single newline is whitespace whenever the current expression or
 statement can continue. This includes leading or trailing binary operators,
 lookup dots, calls, indexing, namespace selectors, assignments, commas, and
 unfinished expressions or delimited lists. Precedence is unchanged.
-`foo\n.bar\n.baz` means `foo.bar.baz`; `32\n-a` means `32 - a`.
+`foo\n.bar\n.baz` means `foo.bar.baz`; `32\n-a` means `32 - a`. A line
+starting with a reference, `&cells.push(x)`, is a new statement: the marker
+is not an operator that could continue the line before (§2).
 If the next token cannot continue the current statement, a new statement begins.
 Block headers end after their condition or iterable. Calls, including `return`,
 follow the ordinary continuation rules.
 
 A **blank line** (including a whitespace-only line) always stops continuation.
 Thus `32\n\n-a` is two statements; use the same separation before a standalone
-list, parenthesized expression, reference, or `::builtin()` when its first
+list, parenthesized expression, or `::builtin()` when its first
 token would otherwise continue the preceding expression. An unfinished
 expression followed by a blank line is an error. Comment-only lines are
 transparent and do not count as blank lines. Strings and their interpolations
@@ -71,6 +73,14 @@ formatter, `check`'s name resolution) must operate on **tokens**, not text.
 ::                                   // namespace selector
 ( ) [ ] { } , . :
 ```
+
+**[D] `&` is two tokens, told apart by what follows it.** `&` directly in
+front of a name, with no whitespace between, is always the reference marker
+(§5.1): `&a`, `&rows.push(x)`. Any other `&` is bitwise AND, which therefore
+needs whitespace (or a non-name) after it: `a & b`, `6&3`. So `a&b` is `a`
+followed by a reference to `b` — a call `a(&b)` at a statement's edge, an
+error anywhere else — and never an AND. Because the marker is not a binary
+operator, a line starting with `&name` never continues the line before it.
 
 `:` separates key from value in a dict literal.
 
@@ -231,7 +241,7 @@ Arguments may continue according to §1 after that.
 
 Whitespace before the first argument is significant: `f -1` means `f(-1)` and
 `f [1]` means `f([1])`; `f - 1` remains subtraction and `f[1]` remains indexing.
-Likewise `f &x` passes a reference and `f & x` is bitwise AND. Newline
+Likewise `f &x` passes a reference and `f & x` is bitwise AND (§2). Newline
 continuations retain their meaning. Qualified calls and receiver calls also
 support this form: `module::f x`, `x.f y`, and `&items.push value`.
 Bare function names remain values. Zero-argument calls require `()`, except
@@ -491,7 +501,9 @@ list := [&a, &b]
 ```
 
 **[D]** Only an **lvalue** may be referenced: a variable, a dict key, a list
-element. `&(a + b)` and `&f()` are errors.
+element. `&(a + b)` and `&f()` are errors. The marker sits directly in front
+of the name it binds to: `& a` is not a reference but a bitwise AND missing
+its left operand (§2).
 
 **[D] A parameter may require it.** `fn push(&list, value)` says the call must
 mark the argument; `push(rows, x)` **crashes**. This does not move the marking

@@ -33,7 +33,7 @@ fn spacing_around_operators_and_after_commas() {
     assert_eq!(fmt_idempotent("x := a . b\n"), "x := a.b\n");
     assert_eq!(fmt_idempotent("x := json :: decode(b)\n"), "x := json::decode(b)\n");
     // A leading `::` is the builtin namespace and stays tight too (§7).
-    assert_eq!(fmt_idempotent(":: push(& rows,1)\n"), "::push(&rows, 1)\n");
+    assert_eq!(fmt_idempotent(":: push(&rows,1)\n"), "::push(&rows, 1)\n");
     assert_eq!(fmt_idempotent("x := a==b\n"), "x := a == b\n");
     assert_eq!(fmt_idempotent("x := not a and b\n"), "x := not a and b\n");
     assert_eq!(fmt_idempotent("x := a>>>b\n"), "x := a >>> b\n");
@@ -47,13 +47,21 @@ fn spacing_around_operators_and_after_commas() {
 
 #[test]
 fn no_space_between_a_reference_and_its_lvalue() {
-    // `&a`, never `& a` (rule 2).
-    assert_eq!(fmt_idempotent("f(& a)\n"), "f(&a)\n");
-    assert_eq!(fmt_idempotent("x := & a\n"), "x := &a\n");
-    assert_eq!(fmt_idempotent("d := { :x : & a }\n"), "d := { :x : &a }\n");
-    assert_eq!(fmt_idempotent("list := [& a, & b]\n"), "list := [&a, &b]\n");
-    // Binary `&` keeps its spaces.
-    assert_eq!(fmt_idempotent("x := flags&MASK\n"), "x := flags & MASK\n");
+    // `&a`, and `& a` is not a reference at all (§5.1): with a space after
+    // it, `&` is bitwise AND.
+    assert_eq!(fmt_idempotent("f(&a)\n"), "f(&a)\n");
+    assert_eq!(fmt_idempotent("x := &a\n"), "x := &a\n");
+    assert_eq!(fmt_idempotent("d := { :x : &a }\n"), "d := { :x : &a }\n");
+    assert_eq!(fmt_idempotent("list := [&a,&b]\n"), "list := [&a, &b]\n");
+    for src in ["f(& a)\n", "x := & a\n", "list := [& a]\n"] {
+        let error = format_source(src, "t.hy").expect_err("a spaced reference").to_string();
+        assert!(error.contains("directly in front of a name"), "{error}");
+    }
+    // Binary `&` gets its spaces, and needs one after it.
+    assert_eq!(fmt_idempotent("x := flags&  MASK\n"), "x := flags & MASK\n");
+    assert_eq!(fmt_idempotent("x := 6&3\n"), "x := 6 & 3\n");
+    let error = format_source("x := flags&MASK\n", "t.hy").expect_err("a reference to MASK").to_string();
+    assert!(error.contains("bitwise AND needs a space after it"), "{error}");
     // As does a prefix minus after a binary one.
     assert_eq!(fmt_idempotent("x := a - -b\n"), "x := a - -b\n");
     assert_eq!(fmt_idempotent("x := -a\n"), "x := -a\n");

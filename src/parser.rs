@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::ast::*;
 use crate::errors::{HydraError, Pos, Result};
-use crate::lexer::{
+use crate::lexer::{BIT_AND, 
     compound_assign, static_text, tokenize, StrPiece, Tok, Token, TRAIL_SEP,
 };
 
@@ -154,7 +154,7 @@ impl<'a> Parser<'a> {
         if self.peek().is_op(op) {
             Ok(self.advance())
         } else {
-            self.err(format!("expected `{op}`, found {}", self.peek()), self.pos())
+            self.err(format!("expected `{op}`, found {}{}", self.peek(), self.reference_hint()), self.pos())
         }
     }
 
@@ -188,7 +188,17 @@ impl<'a> Parser<'a> {
         if self.peek().is_eof() {
             return Ok(());
         }
-        self.err(format!("expected end of line, found {}", self.peek()), self.pos())
+        self.err(format!("expected end of line, found {}{}", self.peek(), self.reference_hint()), self.pos())
+    }
+
+    /// `a&b` lexes as `a` and a reference to `b`: say so where the `&` is
+    /// what stopped the parse.
+    fn reference_hint(&self) -> &'static str {
+        if self.peek().is_op("&") {
+            "; `&` directly in front of a name is a reference, so bitwise AND needs a space after it: `a & b`"
+        } else {
+            ""
+        }
     }
 
     fn skip_newlines(&mut self) {
@@ -846,7 +856,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_bit_and(&mut self) -> Result<Expr> {
-        self.parse_left_assoc(&["&"], Parser::parse_shift)
+        self.parse_left_assoc(&[BIT_AND], Parser::parse_shift)
     }
 
     fn parse_shift(&mut self) -> Result<Expr> {
@@ -874,6 +884,7 @@ impl<'a> Parser<'a> {
             }
             let pos = self.advance().pos;
             let right = next(self)?;
+            let op = if op == BIT_AND { "&" } else { op };
             left = Expr::Binary { op, left: Box::new(left), right: Box::new(right), pos };
             self.continue_before(|t| matches!(t.kind, Tok::Op(op) if ops.contains(&op)));
         }
@@ -897,6 +908,12 @@ impl<'a> Parser<'a> {
             self.advance();
             let target = self.parse_unary()?;
             return self.reference(target, pos);
+        }
+        if self.peek().is_op(BIT_AND) {
+            return self.err(
+                "a reference is `&` directly in front of a name, `&x`; with a space after it, `&` is bitwise AND",
+                pos,
+            );
         }
         self.parse_postfix()
     }

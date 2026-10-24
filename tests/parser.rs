@@ -542,3 +542,14 @@ fn whitespace_distinguishes_unary_arguments_and_indexing() {
         assert_eq!(first_expr(source), expected, "{source}");
     }
 }
+
+#[test]
+fn a_line_starting_with_a_reference_does_not_continue_an_and() {
+    // `&` directly in front of a name is always the reference marker, so it
+    // never continues the line before it as a bitwise AND (§1, §5.1).
+    let program = hydra::parser::parse("cells := [\"a\"]\n&cells.push(\"0\")\n", "t.hy").expect("parses");
+    assert_eq!(program.body.len(), 2);
+    // With a space after it, `&` is AND and does continue.
+    let program = hydra::parser::parse("x := 6\n& 3\n", "t.hy").expect("parses");
+    assert_eq!(program.body.len(), 1);
+}

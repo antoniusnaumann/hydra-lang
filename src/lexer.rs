@@ -50,6 +50,13 @@ pub const OPERATORS: &[&str] = &[
     "(", ")", "[", "]", "{", "}", ",", ".", ":",
 ];
 
+/// Bitwise AND: an `&` that is not directly followed by a name. A `&`
+/// directly followed by one is always the reference marker (§5.1), so the
+/// lexer gives the two different tokens and a line starting with `&name`
+/// never continues the line before it as an AND. Spelled `&` in source; the
+/// space only tells the tokens apart.
+pub const BIT_AND: &str = "& ";
+
 /// The compound assignments, each paired with the binary operator it applies.
 ///
 /// One per arithmetic and bitwise operator of §3's table, and none for the
@@ -201,6 +208,7 @@ impl Token {
                 }
             }
             Tok::Kw(k) => (*k).to_string(),
+            Tok::Op(o) if *o == BIT_AND => "&".into(),
             Tok::Op(o) => (*o).to_string(),
         }
     }
@@ -455,6 +463,9 @@ impl<'a> Lexer<'a> {
         for op in OPERATORS {
             if self.starts_with(op) {
                 self.bump_n(op.chars().count());
+                if *op == "&" && !self.peek().is_some_and(is_ident_start) {
+                    return Some(BIT_AND);
+                }
                 return Some(op);
             }
         }

@@ -244,7 +244,7 @@ fn unterminated_string_is_an_error() {
 fn no_bang_operator() {
     // There is no `!` operator and no `&&`; logic is and / or / not (§2).
     assert!(tokenize("!a", "t.hy").is_err());
-    assert_eq!(ops("a && b"), vec!["&", "&"]);
+    assert_eq!(ops("a && b"), vec![hydra::lexer::BIT_AND, hydra::lexer::BIT_AND]);
 }
 
 #[test]
