@@ -1692,6 +1692,21 @@ impl Vm {
                 };
                 one(Value::Num(len as f64))
             }
+            Native::IsEmpty => {
+                let value = deref(&arg(0))?;
+                let empty = match &value {
+                    Value::List(rc) => rc.read().unwrap_or_else(|e| e.into_inner()).items.is_empty(),
+                    Value::Dict(rc) => rc.read().unwrap_or_else(|e| e.into_inner()).entries.is_empty(),
+                    Value::Str(text) => text.is_empty(),
+                    other => {
+                        return Err(Crash::new(format!(
+                            "`is_empty` takes a list, a dict or a string, got a {}",
+                            other.kind()
+                        )))
+                    }
+                };
+                one(boolean(empty))
+            }
             Native::Send | Native::Receive | Native::Channel => {
                 unreachable!("the channel calls are dispatched before this")
             }

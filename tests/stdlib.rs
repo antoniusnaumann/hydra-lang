@@ -447,3 +447,22 @@ fn json_parse_reads_a_lone_number_by_the_json_grammar() {
         assert!(crash_of(&src).contains("json::parse"), "{bad}: {}", crash_of(&src));
     }
 }
+
+#[test]
+fn is_empty_asks_len_value_eq_zero_of_lists_dicts_and_strings() {
+    for (src, expected) in [
+        ("[]", ":true"),
+        ("[1]", ":false"),
+        ("{}", ":true"),
+        ("{ :a : 1 }", ":false"),
+        ("\"\"", ":true"),
+        ("\" \"", ":false"),
+    ] {
+        assert_eq!(eval(&format!("x := is_empty({src})\n"), "x"), expected, "{src}");
+    }
+    // Method-style, and through a reference.
+    assert_eq!(eval("s := \"\"\nx := s.is_empty()\n", "x"), ":true");
+    assert_eq!(eval("xs := [1]\nr := &xs\nx := is_empty(r)\n", "x"), ":false");
+    let crash = run_source("x := is_empty(1)\n", "t.hy", Options::default()).expect("runs").crash.expect("crashes");
+    assert!(crash.to_string().contains("`is_empty` takes a list, a dict or a string"), "{crash}");
+}

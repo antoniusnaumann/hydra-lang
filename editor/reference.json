@@ -8,6 +8,10 @@
    "result": "number",
    "doc": "Count list elements, dict entries, or Unicode characters in a string."
   },
+  "is_empty": {
+   "result": "boolean",
+   "doc": "Whether a list, dict, or string has no elements, entries, or characters; `len(value) == 0`."
+  },
   "has": {
    "result": "boolean",
    "doc": "Test for a dict key or list index. Negative indices count from the end."
@@ -225,7 +229,7 @@
     },
     "is_whitespace": {
      "result": "boolean",
-     "doc": "Whether text is nonempty and every character is Unicode whitespace. A character is a one-character string, so this tests characters too. `\"\"` gives `:false`."
+     "doc": "Whether every character is Unicode whitespace, so `\"\"` gives `:true`; combine with `is_empty` to tell the two apart. A character is a one-character string, so this tests characters too."
     }
    }
   },

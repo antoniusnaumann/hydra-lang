@@ -319,6 +319,7 @@ pub enum Native {
     Has,
     Get,
     Len,
+    IsEmpty,
     Push,
     Send,
     Receive,
@@ -619,6 +620,7 @@ pub const NATIVES: &[Native] = &[
     Native::Has,
     Native::Get,
     Native::Len,
+    Native::IsEmpty,
     Native::Push,
     Native::Send,
     Native::Receive,
@@ -844,6 +846,7 @@ impl Native {
                 &[("container", Plain), ("key", Plain), ("fallback", Plain)]
             ),
             Native::Len => info!(None, "len", "len(value)", &[("value", Plain)]),
+            Native::IsEmpty => info!(None, "is_empty", "is_empty(value)", &[("value", Plain)]),
             Native::Push => {
                 info!(None, "push", "push(&list, value)", &[("list", Ref), ("value", Plain)])
             }

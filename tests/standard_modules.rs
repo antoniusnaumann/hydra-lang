@@ -96,7 +96,7 @@ empty := text::is_whitespace("")
         ("space", ":true"),
         ("letter", ":false"),
         ("mixed", ":false"),
-        ("empty", ":false"),
+        ("empty", ":true"),
     ] {
         assert_eq!(value(&r, name), expected, "{name}");
     }

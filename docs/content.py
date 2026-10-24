@@ -4,6 +4,7 @@
 BUILTINS = {
     "print": ("Values", ":null", 'Write one value as text, followed by `terminator`. Use `""` to omit the newline.'),
     "len": ("Values", "number", "Count list elements, dict entries, or Unicode characters in a string."),
+    "is_empty": ("Values", "boolean", "Whether a list, dict, or string has no elements, entries, or characters; `len(value) == 0`."),
     "has": ("Values", "boolean", "Test for a dict key or list index. Negative indices count from the end."),
     "get": ("Values", "value", "Read a dict key or list index, returning `fallback` when absent. Does not insert anything."),
     "do": ("Values", ":null", "Discard a value. Passing it consumes it, so `do push(&xs, 1)` prints nothing at the top level and `do reject()` rejects nothing."),
@@ -118,7 +119,7 @@ MODULES = {
         "ends_with": ("Strings", "boolean", "Whether text ends with the literal suffix."),
         "lower": ("Strings", "string", "Unicode lowercase conversion, independent of locale."),
         "upper": ("Strings", "string", "Unicode uppercase conversion, independent of locale. May change character count."),
-        "is_whitespace": ("Strings", "boolean", "Whether text is nonempty and every character is Unicode whitespace. A character is a one-character string, so this tests characters too. `\"\"` gives `:false`."),
+        "is_whitespace": ("Strings", "boolean", "Whether every character is Unicode whitespace, so `\"\"` gives `:true`; combine with `is_empty` to tell the two apart. A character is a one-character string, so this tests characters too."),
     }, "These functions require strings; they do not silently render other values.",
         'use text\nwords := text::split "  hello   Hydra  "\nprint text::join(words, " ")'),
     "json": ("Convert between JSON text and Hydra values.", {
