@@ -76,6 +76,8 @@ pub fn class_of(tok: &Token, prev: Option<&Token>, next: Option<&Token>) -> Opti
         Tok::Op(op) => {
             if *op == "||" {
                 Some("punctuation.trail")
+            } else if *op == "::" {
+                Some("punctuation.delimiter")
             } else {
                 None
             }

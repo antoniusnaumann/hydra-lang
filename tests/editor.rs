@@ -56,6 +56,7 @@ fn identifiers_are_classified_by_context() {
     assert_eq!(class_at("x := called()\n", 1, 6), "entity.function");
     assert_eq!(class_at("x := d.field\n", 1, 8), "variable.property");
     assert_eq!(class_at("x := json::decode\n", 1, 6), "entity.namespace");
+    assert_eq!(class_at("x := json::decode\n", 1, 10), "punctuation.delimiter");
     assert_eq!(class_at("x := ALL_CAPS\n", 1, 6), "constant");
     // ALL_CAPS is convention only (§2), but §13 gives it a colour.
     assert_eq!(class_at("x := Mixed_Caps\n", 1, 6), "variable");
